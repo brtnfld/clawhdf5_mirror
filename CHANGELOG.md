@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Bug Fixes
+- `clawhdf5-format`: read datasets written by modern HDF5 (1.14+/2.0, i.e.
+  `libver=latest`). Compound (class 6) and array (class 10) datatype **version 5**
+  messages and data layout **version 5** messages were rejected as invalid; they
+  reuse the v3/v4 binary structure, so they are now accepted. This unblocks
+  reading compound types and — critically — every chunked/compressed dataset
+  written by HDF5 2.0. Found by running the h5py interop tests against
+  h5py 3.16 / HDF5 2.0.
+
 ### Performance
 - `clawhdf5-format`: chunked writes now compress all chunks up front via
   `compress_all_chunks`, running across rayon threads under the `parallel`
