@@ -60,6 +60,22 @@ pub fn hybrid_search(
     };
     let kw_scores = bm25_index.search(query_text, vectors.len());
 
+    merge_vector_keyword(vec_scores, kw_scores, vector_weight, keyword_weight, k)
+}
+
+/// Merge pre-computed vector-similarity and keyword scores into a single ranking.
+///
+/// Both score sets are independently min-max normalized to [0, 1] and combined
+/// with the given weights. This is the shared core of [`hybrid_search`]; it is
+/// also used by the optional HNSW path, which supplies vector scores from an
+/// approximate-nearest-neighbour index instead of a full linear scan.
+pub fn merge_vector_keyword(
+    vec_scores: Vec<(usize, f32)>,
+    kw_scores: Vec<(usize, f32)>,
+    vector_weight: f32,
+    keyword_weight: f32,
+    k: usize,
+) -> Vec<(usize, f32)> {
     // Normalize each set to [0, 1].
     let vec_normalized = normalize_scores(&vec_scores);
     let kw_normalized = normalize_scores(&kw_scores);

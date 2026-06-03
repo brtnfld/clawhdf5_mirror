@@ -114,7 +114,7 @@ pub(crate) fn py_to_attr_value(val: &Bound<'_, PyAny>) -> PyResult<OwnedAttrValu
 }
 
 /// Convert an `AttrValue` (from the Rust lib) to a Python object.
-pub(crate) fn attr_value_to_py(py: Python<'_>, val: &clawhdf5_rs::AttrValue) -> PyObject {
+pub(crate) fn attr_value_to_py(py: Python<'_>, val: &clawhdf5_rs::AttrValue) -> Py<PyAny> {
     match val {
         clawhdf5_rs::AttrValue::F64(v) => v.into_pyobject(py).unwrap().into_any().unbind(),
         clawhdf5_rs::AttrValue::I64(v) => v.into_pyobject(py).unwrap().into_any().unbind(),

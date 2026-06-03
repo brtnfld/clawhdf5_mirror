@@ -44,7 +44,7 @@ impl PyAttrs {
 
 #[pymethods]
 impl PyAttrs {
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         match &self.inner {
             AttrsInner::Read(map) => match map.get(key) {
                 Some(val) => Ok(attr_value_to_py(py, val)),
@@ -100,7 +100,7 @@ impl PyAttrs {
         }
     }
 
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let keys = self.keys(py)?;
         let iter = keys.call_method0(py, "__iter__")?;
         Ok(iter)
@@ -112,7 +112,7 @@ impl PyAttrs {
     }
 
     /// Return attribute names as a list.
-    fn keys(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let names: Vec<String> = match &self.inner {
             AttrsInner::Read(map) => map.keys().cloned().collect(),
             AttrsInner::Write(store) => store
@@ -127,8 +127,8 @@ impl PyAttrs {
     }
 
     /// Return attribute values as a list.
-    fn values(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let vals: Vec<PyObject> = match &self.inner {
+    fn values(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let vals: Vec<Py<PyAny>> = match &self.inner {
             AttrsInner::Read(map) => map.values().map(|v| attr_value_to_py(py, v)).collect(),
             AttrsInner::Write(store) => store
                 .lock()
@@ -145,8 +145,8 @@ impl PyAttrs {
     }
 
     /// Return attribute (key, value) pairs as a list of tuples.
-    fn items(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let pairs: Vec<(String, PyObject)> = match &self.inner {
+    fn items(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let pairs: Vec<(String, Py<PyAny>)> = match &self.inner {
             AttrsInner::Read(map) => map
                 .iter()
                 .map(|(k, v)| (k.clone(), attr_value_to_py(py, v)))

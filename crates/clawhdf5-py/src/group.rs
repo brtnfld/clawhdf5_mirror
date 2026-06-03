@@ -57,7 +57,7 @@ impl PyGroup {
 #[pymethods]
 impl PyGroup {
     /// Get a child object (dataset or subgroup) by name or path.
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         match &self.inner {
             GroupInner::Read { file, path } => {
                 let full_path = if path.is_empty() {
@@ -96,7 +96,7 @@ impl PyGroup {
     }
 
     /// List the names of all children (datasets and subgroups).
-    fn keys(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &self.inner {
             GroupInner::Read { file, path } => {
                 let group = if path.is_empty() {

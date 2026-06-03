@@ -65,7 +65,7 @@ fn dtype_to_numpy_str(dt: &DType) -> &'static str {
 impl PyDataset {
     /// The shape of the dataset as a tuple.
     #[getter]
-    fn shape(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn shape(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let tuple = pyo3::types::PyTuple::new(py, self.cached_shape.iter().map(|&d| d as usize))?;
         Ok(tuple.into_any().unbind())
     }
@@ -88,7 +88,7 @@ impl PyDataset {
     ///
     /// The full dataset is always read from the underlying file; the index
     /// is then applied on the resulting numpy array.
-    fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<PyObject> {
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
         let arr = self.read_as_numpy(py)?;
         let indexed = arr.get_item(key)?;
         Ok(indexed.unbind())
@@ -112,7 +112,7 @@ impl PyDataset {
     /// Read the full dataset and return it as a numpy array (or list for strings).
     ///
     /// For numeric types, the Rust I/O (file reading + decompression) is
-    /// performed inside `py.allow_threads()` so that the GIL is released
+    /// performed inside `py.detach()` so that the GIL is released
     /// during the potentially expensive operation.  The numpy array
     /// construction still happens with the GIL held.
     fn read_as_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -123,7 +123,7 @@ impl PyDataset {
         match &self.cached_dtype {
             DType::F64 => {
                 let data = py
-                    .allow_threads(|| file.dataset(path).and_then(|ds| ds.read_f64()))
+                    .detach(|| file.dataset(path).and_then(|ds| ds.read_f64()))
                     .map_err(to_py_err)?;
                 let nd = ArrayD::from_shape_vec(IxDyn(&shape), data)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
@@ -132,7 +132,7 @@ impl PyDataset {
             }
             DType::F32 => {
                 let data = py
-                    .allow_threads(|| file.dataset(path).and_then(|ds| ds.read_f32()))
+                    .detach(|| file.dataset(path).and_then(|ds| ds.read_f32()))
                     .map_err(to_py_err)?;
                 let nd = ArrayD::from_shape_vec(IxDyn(&shape), data)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
@@ -141,7 +141,7 @@ impl PyDataset {
             }
             DType::I32 => {
                 let data = py
-                    .allow_threads(|| file.dataset(path).and_then(|ds| ds.read_i32()))
+                    .detach(|| file.dataset(path).and_then(|ds| ds.read_i32()))
                     .map_err(to_py_err)?;
                 let nd = ArrayD::from_shape_vec(IxDyn(&shape), data)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
@@ -150,7 +150,7 @@ impl PyDataset {
             }
             DType::I64 => {
                 let data = py
-                    .allow_threads(|| file.dataset(path).and_then(|ds| ds.read_i64()))
+                    .detach(|| file.dataset(path).and_then(|ds| ds.read_i64()))
                     .map_err(to_py_err)?;
                 let nd = ArrayD::from_shape_vec(IxDyn(&shape), data)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
@@ -161,7 +161,7 @@ impl PyDataset {
                 // Try zero-copy first (contiguous layout), fall back to
                 // read_u64 + cast for chunked/compact datasets.
                 let data: Vec<u8> = py
-                    .allow_threads(|| {
+                    .detach(|| {
                         let ds = file.dataset(path)?;
                         match ds.read_u8_zerocopy() {
                             Ok(slice) => Ok(slice.to_vec()),
@@ -179,7 +179,7 @@ impl PyDataset {
             }
             DType::U64 => {
                 let data = py
-                    .allow_threads(|| file.dataset(path).and_then(|ds| ds.read_u64()))
+                    .detach(|| file.dataset(path).and_then(|ds| ds.read_u64()))
                     .map_err(to_py_err)?;
                 let nd = ArrayD::from_shape_vec(IxDyn(&shape), data)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
@@ -190,7 +190,7 @@ impl PyDataset {
                 // String reads need the GIL for PyList construction, but we
                 // release it during the Rust I/O portion.
                 let data = py
-                    .allow_threads(|| file.dataset(path).and_then(|ds| ds.read_string()))
+                    .detach(|| file.dataset(path).and_then(|ds| ds.read_string()))
                     .map_err(to_py_err)?;
                 let list = PyList::new(py, &data)?;
                 Ok(list.into_any())

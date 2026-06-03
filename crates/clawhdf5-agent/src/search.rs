@@ -7,6 +7,76 @@ use crate::hybrid;
 use crate::{HDF5Memory, MemoryError, Result, SearchResult};
 
 impl HDF5Memory {
+    /// Vector + keyword scoring stage of [`HDF5Memory::hybrid_search`].
+    ///
+    /// Without the `hnsw` feature this is a full linear cosine scan (the exact
+    /// previous behaviour, also used as the correctness oracle in tests). With
+    /// `hnsw` enabled and an index available, the vector candidates come from an
+    /// approximate-nearest-neighbour search over an over-fetched pool, then merge
+    /// with BM25 via the shared [`hybrid::merge_vector_keyword`].
+    #[cfg(feature = "hnsw")]
+    fn vector_keyword_search(
+        &mut self,
+        query_embedding: &[f32],
+        query_text: &str,
+        bm25: &bm25::BM25Index,
+        vector_weight: f32,
+        keyword_weight: f32,
+        k: usize,
+    ) -> Vec<(usize, f32)> {
+        self.ensure_hnsw_fresh();
+        match self.hnsw.as_ref() {
+            Some(index)
+                if !index.is_empty() && index.dimension() == query_embedding.len() =>
+            {
+                // Over-fetch so the merge sees a useful vector pool; cosine
+                // distance from the index converts back to similarity (1 - d).
+                let pool = (k * 8).max(64);
+                let vec_scores: Vec<(usize, f32)> = index
+                    .search(query_embedding, pool, pool)
+                    .into_iter()
+                    .map(|(id, dist)| (id, 1.0 - dist))
+                    .collect();
+                let kw_scores = bm25.search(query_text, self.cache.len());
+                hybrid::merge_vector_keyword(vec_scores, kw_scores, vector_weight, keyword_weight, k)
+            }
+            _ => hybrid::hybrid_search(
+                query_embedding,
+                query_text,
+                &self.cache.embeddings,
+                &self.cache.chunks,
+                &self.cache.tombstones,
+                bm25,
+                vector_weight,
+                keyword_weight,
+                k,
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "hnsw"))]
+    fn vector_keyword_search(
+        &mut self,
+        query_embedding: &[f32],
+        query_text: &str,
+        bm25: &bm25::BM25Index,
+        vector_weight: f32,
+        keyword_weight: f32,
+        k: usize,
+    ) -> Vec<(usize, f32)> {
+        hybrid::hybrid_search(
+            query_embedding,
+            query_text,
+            &self.cache.embeddings,
+            &self.cache.chunks,
+            &self.cache.tombstones,
+            bm25,
+            vector_weight,
+            keyword_weight,
+            k,
+        )
+    }
+
     /// Perform hybrid search combining cosine vector similarity and BM25 keyword search.
     pub fn hybrid_search(
         &mut self,
@@ -17,12 +87,9 @@ impl HDF5Memory {
         k: usize,
     ) -> Vec<SearchResult> {
         let bm25 = bm25::BM25Index::build(&self.cache.chunks, &self.cache.tombstones);
-        let scored = hybrid::hybrid_search(
+        let scored = self.vector_keyword_search(
             query_embedding,
             query_text,
-            &self.cache.embeddings,
-            &self.cache.chunks,
-            &self.cache.tombstones,
             &bm25,
             vector_weight,
             keyword_weight,

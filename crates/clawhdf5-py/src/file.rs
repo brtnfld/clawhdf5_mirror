@@ -102,7 +102,7 @@ impl PyFile {
     }
 
     /// Get a child object (dataset or group) by path.
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         let file = self.read_file()?;
         // Try dataset first
         match file.dataset(key) {
@@ -130,7 +130,7 @@ impl PyFile {
     }
 
     /// List the names of all children in the root group.
-    fn keys(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let file = self.read_file()?;
         let root = file.root();
         let mut names = root.datasets().map_err(to_py_err)?;
@@ -175,7 +175,7 @@ impl PyFile {
     }
 
     /// Create a group (write mode only). Returns a `Group` handle.
-    fn create_group(&mut self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+    fn create_group(&mut self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         let state = self.write_state_mut()?;
         let group_state = Arc::new(Mutex::new(WriteGroupState {
             name: name.to_string(),

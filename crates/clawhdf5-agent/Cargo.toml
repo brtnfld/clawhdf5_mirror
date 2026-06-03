@@ -14,6 +14,7 @@ clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0", features = [
 clawhdf5 = { path = "../clawhdf5", version = "2.0.0" }
 clawhdf5-io = { path = "../clawhdf5-io", version = "2.0.0", features = ["mmap"] }
 clawhdf5-accel = { path = "../clawhdf5-accel", version = "2.0.0" }
+clawhdf5-ann = { path = "../clawhdf5-ann", version = "2.0.0", optional = true }
 clawhdf5-gpu = { path = "../clawhdf5-gpu", version = "2.0.0", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 byteorder = "1"
@@ -44,9 +45,15 @@ name = "memory_bench"
 harness = false
 
 [features]
-default = ["float16"]
+default = ["float16", "hnsw"]
 float16 = ["half"]
 parallel = ["rayon"]
+# HNSW approximate-nearest-neighbour acceleration for the vector stage of
+# hybrid_search. On by default; the index is rebuilt from the cache on demand
+# and stays self-consistent with the persisted memory store. Disable with
+# `--no-default-features` (plus re-enabling other defaults) to force the exact
+# linear cosine scan.
+hnsw = ["clawhdf5-ann"]
 agent = []
 gpu = ["clawhdf5-gpu/gpu-wgpu"]
 fast-math = ["matrixmultiply"]

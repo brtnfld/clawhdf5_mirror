@@ -153,16 +153,30 @@ impl Ord for FarCandidate {
     }
 }
 
+/// On-disk format version for the serialized HNSW index.
+///
+/// - Version 1: original layout (`vectors`, `graph_layer_*`, `config`), no
+///   deletion support and no explicit version tag.
+/// - Version 2: adds a `format_version` attribute and a `deleted` bitset dataset
+///   so live insert/delete state survives a save/load round-trip.
+///
+/// Files written before this constant existed are treated as version 1 on load.
+pub const HNSW_FORMAT_VERSION: i64 = 2;
+
 /// HNSW (Hierarchical Navigable Small World) approximate nearest neighbor index.
 ///
-/// Supports building an index from vectors, searching for nearest neighbors,
-/// and serializing/deserializing to HDF5 format.
+/// Supports building an index from vectors, incremental insertion and soft
+/// deletion, searching for nearest neighbors, and serializing/deserializing to
+/// HDF5 format.
 #[derive(Debug, Clone)]
 pub struct HnswIndex {
     /// All vectors in the index.
     vectors: Vec<Vec<f32>>,
     /// Adjacency lists per layer. `graph[layer][node]` = list of neighbor IDs.
     graph: Vec<Vec<Vec<usize>>>,
+    /// Soft-deletion flags, one per node. Deleted nodes remain in the graph for
+    /// connectivity but are never returned from [`HnswIndex::search`].
+    deleted: Vec<bool>,
     /// Entry point node ID.
     entry_point: usize,
     /// Maximum number of connections per node (per layer).
@@ -291,6 +305,7 @@ impl HnswIndex {
         Self {
             vectors: vectors.to_vec(),
             graph,
+            deleted: vec![false; n],
             entry_point,
             m,
             m_max0,
@@ -298,6 +313,163 @@ impl HnswIndex {
             node_levels,
             metric,
         }
+    }
+
+    /// Create an empty index with the given parameters. Used as the starting
+    /// point for incremental [`HnswIndex::insert`] and as the result of
+    /// [`HnswIndex::compact`] when every vector has been deleted.
+    pub fn new(m: usize, ef_construction: usize, metric: DistanceMetric) -> Self {
+        assert!(m >= 2, "m must be at least 2");
+        Self {
+            vectors: Vec::new(),
+            graph: Vec::new(),
+            deleted: Vec::new(),
+            entry_point: 0,
+            m,
+            m_max0: m * 2,
+            ef_construction,
+            node_levels: Vec::new(),
+            metric,
+        }
+    }
+
+    /// Insert a single vector into the index incrementally and return its id.
+    ///
+    /// The id is the vector's position in insertion order and is stable for the
+    /// life of the index (until [`HnswIndex::compact`] renumbers survivors).
+    /// Inserting into an empty index seeds the entry point.
+    ///
+    /// # Panics
+    /// Panics if `vector`'s dimension does not match the existing vectors.
+    pub fn insert(&mut self, vector: Vec<f32>) -> usize {
+        let id = self.vectors.len();
+
+        // Seed an empty index.
+        if id == 0 {
+            let node_level = assign_level(0, self.m);
+            self.vectors.push(vector);
+            self.deleted.push(false);
+            self.node_levels.push(node_level);
+            self.graph = (0..=node_level).map(|_| vec![Vec::new(); 1]).collect();
+            self.entry_point = 0;
+            return 0;
+        }
+
+        assert_eq!(
+            vector.len(),
+            self.vectors[0].len(),
+            "insert dimension mismatch"
+        );
+
+        let node_level = assign_level(id, self.m);
+        self.vectors.push(vector);
+        self.deleted.push(false);
+        self.node_levels.push(node_level);
+
+        // Grow every existing layer with an empty adjacency slot for `id`, and
+        // add any brand-new top layers this node introduces.
+        for layer in self.graph.iter_mut() {
+            layer.push(Vec::new());
+        }
+        while self.graph.len() <= node_level {
+            self.graph.push(vec![Vec::new(); id + 1]);
+        }
+
+        let ep_level = self.node_levels[self.entry_point];
+        let mut ep = self.entry_point;
+
+        // Phase 1: greedy descent from the top down to node_level + 1.
+        for layer in (node_level + 1..=ep_level).rev() {
+            ep = greedy_closest(&self.vectors, &self.graph[layer], &self.vectors[id], ep, self.metric);
+        }
+
+        // Phase 2: search and connect from min(node_level, ep_level) down to 0.
+        let bottom = node_level.min(ep_level);
+        for layer in (0..=bottom).rev() {
+            let max_conn = if layer == 0 { self.m_max0 } else { self.m };
+            let neighbors = search_layer(
+                &self.vectors,
+                &self.graph[layer],
+                &self.vectors[id],
+                ep,
+                self.ef_construction,
+                self.metric,
+            );
+            let selected: Vec<usize> = neighbors.iter().take(max_conn).map(|c| c.id).collect();
+            self.graph[layer][id] = selected.clone();
+            for &neighbor in &selected {
+                self.graph[layer][neighbor].push(id);
+                if self.graph[layer][neighbor].len() > max_conn {
+                    prune_connections(
+                        &self.vectors,
+                        &mut self.graph[layer][neighbor],
+                        neighbor,
+                        max_conn,
+                        self.metric,
+                    );
+                }
+            }
+            if !selected.is_empty() {
+                ep = selected[0];
+            }
+        }
+
+        // Promote the entry point if this node sits on a higher layer.
+        if node_level > ep_level {
+            self.entry_point = id;
+        }
+
+        id
+    }
+
+    /// Soft-delete the vector with the given id. The node stays in the graph so
+    /// traversal/connectivity is preserved, but it will never be returned from
+    /// [`HnswIndex::search`]. Idempotent; out-of-range ids are ignored.
+    ///
+    /// Returns `true` if the id existed and was not already deleted.
+    pub fn mark_deleted(&mut self, id: usize) -> bool {
+        if id >= self.deleted.len() || self.deleted[id] {
+            return false;
+        }
+        self.deleted[id] = true;
+        true
+    }
+
+    /// Returns whether the vector with the given id is soft-deleted.
+    pub fn is_deleted(&self, id: usize) -> bool {
+        self.deleted.get(id).copied().unwrap_or(false)
+    }
+
+    /// Number of soft-deleted vectors still occupying the index.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.iter().filter(|&&d| d).count()
+    }
+
+    /// Number of live (non-deleted) vectors.
+    pub fn active_len(&self) -> usize {
+        self.vectors.len() - self.deleted_count()
+    }
+
+    /// Rebuild the index from scratch, dropping all soft-deleted vectors and
+    /// renumbering the survivors into a compact `0..active_len` id space.
+    ///
+    /// Returns a mapping from old id to new id (`None` for dropped vectors) so
+    /// callers can rewrite any external id references they keep.
+    pub fn compact(&mut self) -> Vec<Option<usize>> {
+        let mut mapping = vec![None; self.vectors.len()];
+        let mut surviving: Vec<Vec<f32>> = Vec::with_capacity(self.active_len());
+        for (old, v) in self.vectors.iter().enumerate() {
+            if !self.deleted[old] {
+                mapping[old] = Some(surviving.len());
+                surviving.push(v.clone());
+            }
+        }
+        *self = if surviving.is_empty() {
+            Self::new(self.m, self.ef_construction, self.metric)
+        } else {
+            Self::build_with_metric(&surviving, self.m, self.ef_construction, self.metric)
+        };
+        mapping
     }
 
     /// Search the index for the `k` nearest neighbors to the query vector.
@@ -328,11 +500,13 @@ impl HnswIndex {
             ep = greedy_closest(&self.vectors, &self.graph[layer], query, ep, self.metric);
         }
 
-        // Search layer 0 with ef candidates
+        // Search layer 0 with ef candidates. Deleted nodes are still traversed
+        // (they remain valid graph waypoints) but are filtered from the result.
         let candidates = search_layer(&self.vectors, &self.graph[0], query, ep, ef, self.metric);
 
         candidates
             .into_iter()
+            .filter(|c| !self.deleted[c.id])
             .take(k)
             .map(|c| (c.id, c.distance))
             .collect()
@@ -388,11 +562,16 @@ impl HnswIndex {
                 .set_attr("layer", AttrValue::I64(layer_idx as i64));
         }
 
+        // Soft-deletion bitset (format version 2+): 0 = live, 1 = deleted.
+        let deleted_i32: Vec<i32> = self.deleted.iter().map(|&d| d as i32).collect();
+        group.create_dataset("deleted").with_i32_data(&deleted_i32);
+
         // Store config as attributes on a small dataset
         let node_levels_i32: Vec<i32> = self.node_levels.iter().map(|&l| l as i32).collect();
         group
             .create_dataset("config")
             .with_i32_data(&node_levels_i32)
+            .set_attr("format_version", AttrValue::I64(HNSW_FORMAT_VERSION))
             .set_attr("m", AttrValue::I64(self.m as i64))
             .set_attr(
                 "ef_construction",
@@ -425,6 +604,15 @@ impl HnswIndex {
         let config_raw = read_dataset_raw(data, &sb, "ann/config")?;
         let config_dt = read_dataset_datatype(data, &sb, "ann/config")?;
         let node_levels_i32 = read_as_i32(&config_raw, &config_dt)?;
+
+        // Files written before format version 2 have no version attribute; treat
+        // them as version 1. Reject anything newer than we understand.
+        let format_version = get_attr_i64_opt(&config_attrs, "format_version").unwrap_or(1);
+        if format_version > HNSW_FORMAT_VERSION {
+            return Err(FormatError::SerializationError(format!(
+                "unsupported HNSW format version {format_version} (this build understands up to {HNSW_FORMAT_VERSION})"
+            )));
+        }
 
         let m = get_attr_i64(&config_attrs, "m")? as usize;
         let ef_construction = get_attr_i64(&config_attrs, "ef_construction")? as usize;
@@ -488,9 +676,22 @@ impl HnswIndex {
             graph.push(layer_graph);
         }
 
+        // Deleted bitset (version 2+). Older files default every node to live.
+        let deleted = if format_version >= 2 {
+            let deleted_raw = read_dataset_raw(data, &sb, "ann/deleted")?;
+            let deleted_dt = read_dataset_datatype(data, &sb, "ann/deleted")?;
+            let deleted_i32 = read_as_i32(&deleted_raw, &deleted_dt)?;
+            let mut deleted: Vec<bool> = deleted_i32.iter().map(|&d| d != 0).collect();
+            deleted.resize(n, false);
+            deleted
+        } else {
+            vec![false; n]
+        };
+
         Ok(Self {
             vectors,
             graph,
+            deleted,
             entry_point,
             m,
             m_max0: m * 2,
@@ -809,6 +1010,16 @@ fn get_attr_i64(attrs: &[(String, AttrValue)], name: &str) -> Result<i64, Format
     )))
 }
 
+/// Like [`get_attr_i64`] but returns `None` when the attribute is absent or not
+/// an integer, instead of erroring. Used for optional/back-compat attributes.
+fn get_attr_i64_opt(attrs: &[(String, AttrValue)], name: &str) -> Option<i64> {
+    attrs.iter().find(|(n, _)| n == name).and_then(|(_, v)| match v {
+        AttrValue::I64(val) => Some(*val),
+        AttrValue::U64(val) => Some(*val as i64),
+        _ => None,
+    })
+}
+
 fn get_attr_string(attrs: &[(String, AttrValue)], name: &str) -> Result<String, FormatError> {
     for (n, v) in attrs {
         if n == name {
@@ -1088,5 +1299,140 @@ mod tests {
         let b = vec![1.0, 0.0];
         let d = compute_distance(&a, &b, DistanceMetric::Cosine);
         assert!((d - 1.0).abs() < 1e-6); // zero vector -> distance 1
+    }
+
+    #[test]
+    fn insert_into_empty_index() {
+        let mut index = HnswIndex::new(4, 16, DistanceMetric::L2);
+        assert!(index.is_empty());
+        let id = index.insert(vec![1.0, 0.0, 0.0]);
+        assert_eq!(id, 0);
+        assert_eq!(index.len(), 1);
+        let results = index.search(&[1.0, 0.0, 0.0], 1, 16);
+        assert_eq!(results, vec![(0, 0.0)]);
+    }
+
+    #[test]
+    fn incremental_insert_matches_batch_recall() {
+        // Build one index incrementally and one in batch from the same vectors,
+        // then confirm the incremental index has acceptable recall vs brute force.
+        let vectors = make_random_vectors(120, 8, 2024);
+        let mut incremental = HnswIndex::new(16, 64, DistanceMetric::L2);
+        for v in &vectors {
+            incremental.insert(v.clone());
+        }
+        assert_eq!(incremental.len(), vectors.len());
+
+        let query = &vectors[60];
+        let k = 10;
+        let results = incremental.search(query, k, 64);
+
+        let mut brute: Vec<(usize, f32)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, compute_distance(query, v, DistanceMetric::L2)))
+            .collect();
+        brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        brute.truncate(k);
+
+        let hnsw_ids: HashSet<usize> = results.iter().map(|r| r.0).collect();
+        let brute_ids: HashSet<usize> = brute.iter().map(|r| r.0).collect();
+        let overlap = hnsw_ids.intersection(&brute_ids).count();
+        assert!(
+            overlap >= k * 8 / 10,
+            "incremental HNSW recall too low: {overlap}/{k}"
+        );
+    }
+
+    #[test]
+    fn mark_deleted_excludes_from_search() {
+        let vectors = vec![
+            vec![1.0, 0.0],
+            vec![0.9, 0.1],
+            vec![0.0, 1.0],
+            vec![0.1, 0.9],
+        ];
+        let mut index = HnswIndex::build(&vectors, 4, 16);
+
+        // Exact match on vector 0 before deletion.
+        let before = index.search(&[1.0, 0.0], 1, 16);
+        assert_eq!(before[0].0, 0);
+
+        assert!(index.mark_deleted(0));
+        assert!(index.is_deleted(0));
+        assert!(!index.mark_deleted(0)); // idempotent
+        assert_eq!(index.deleted_count(), 1);
+        assert_eq!(index.active_len(), 3);
+
+        // Vector 0 must no longer be returned; nearest is now vector 1.
+        let after = index.search(&[1.0, 0.0], 2, 16);
+        assert!(after.iter().all(|(id, _)| *id != 0));
+        assert_eq!(after[0].0, 1);
+    }
+
+    #[test]
+    fn compact_drops_deleted_and_renumbers() {
+        let vectors = make_random_vectors(20, 4, 4242);
+        let mut index = HnswIndex::build(&vectors, 8, 32);
+        index.mark_deleted(3);
+        index.mark_deleted(7);
+        index.mark_deleted(11);
+
+        let mapping = index.compact();
+        assert_eq!(mapping.len(), 20);
+        assert_eq!(index.len(), 17);
+        assert_eq!(index.deleted_count(), 0);
+        // Deleted ids map to None; survivors map to a dense 0..17 range.
+        assert!(mapping[3].is_none() && mapping[7].is_none() && mapping[11].is_none());
+        let mut new_ids: Vec<usize> = mapping.iter().filter_map(|m| *m).collect();
+        new_ids.sort_unstable();
+        assert_eq!(new_ids, (0..17).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn compact_all_deleted_yields_empty_index() {
+        let vectors = make_random_vectors(5, 3, 1);
+        let mut index = HnswIndex::build(&vectors, 4, 16);
+        for i in 0..5 {
+            index.mark_deleted(i);
+        }
+        index.compact();
+        assert!(index.is_empty());
+        assert!(index.search(&[0.0, 0.0, 0.0], 3, 16).is_empty());
+    }
+
+    #[test]
+    fn versioned_roundtrip_preserves_deletions() {
+        let vectors = make_random_vectors(30, 4, 8080);
+        let mut index = HnswIndex::build(&vectors, 6, 24);
+        index.mark_deleted(5);
+        index.mark_deleted(12);
+
+        let bytes = index.to_hdf5_bytes().unwrap();
+        let loaded = HnswIndex::load_from_hdf5(&bytes).unwrap();
+
+        assert_eq!(loaded.len(), index.len());
+        assert!(loaded.is_deleted(5));
+        assert!(loaded.is_deleted(12));
+        assert_eq!(loaded.deleted_count(), 2);
+        // A deleted vector is not returned even after a round-trip.
+        let results = loaded.search(&vectors[5], 5, 24);
+        assert!(results.iter().all(|(id, _)| *id != 5));
+    }
+
+    #[test]
+    fn insert_then_save_load_search() {
+        let mut index = HnswIndex::new(8, 32, DistanceMetric::Cosine);
+        let vectors = make_random_vectors(25, 5, 31337);
+        for v in &vectors {
+            index.insert(v.clone());
+        }
+        let bytes = index.to_hdf5_bytes().unwrap();
+        let loaded = HnswIndex::load_from_hdf5(&bytes).unwrap();
+        assert_eq!(loaded.len(), 25);
+        assert_eq!(loaded.metric(), DistanceMetric::Cosine);
+        let results = loaded.search(&vectors[0], 3, 32);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 0);
     }
 }

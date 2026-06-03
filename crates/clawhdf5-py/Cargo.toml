@@ -16,8 +16,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 clawhdf5_rs = { path = "../clawhdf5", version = "2.0.0", package = "clawhdf5" }
 clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
-pyo3 = "0.23"
-numpy = "0.23"
+pyo3 = "0.28"
+numpy = "0.28"
 
 [features]
 extension-module = ["pyo3/extension-module"]

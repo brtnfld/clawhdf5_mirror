@@ -60,7 +60,16 @@ pub fn cosine_similarity_prenorm(
 use std::path::{Path, PathBuf};
 
 use cache::MemoryCache;
+#[cfg(feature = "hnsw")]
+use clawhdf5_ann::{DistanceMetric, HnswIndex};
 use ephemeral::{EphemeralConfig, EphemeralStore};
+
+/// HNSW construction parameters used for the agent's vector index. Cosine is the
+/// agent's similarity metric, so the index is built with cosine distance.
+#[cfg(feature = "hnsw")]
+const HNSW_M: usize = 16;
+#[cfg(feature = "hnsw")]
+const HNSW_EF_CONSTRUCTION: usize = 64;
 // EphemeralEntry and EphemeralStats are part of the crate public API via
 // the `ephemeral` module; they are not needed directly in lib.rs internals.
 #[allow(unused_imports)]
@@ -202,6 +211,22 @@ pub struct HDF5Memory {
     wal: Option<wal::WalFile>,
     strategy: Option<Box<dyn MemoryStrategy>>,
     pub ephemeral: Option<EphemeralStore>,
+    /// Optional HNSW index accelerating the vector stage of `hybrid_search`.
+    /// `None` when the store isn't indexable (no/zero-dim/mixed-dim embeddings);
+    /// rebuilt from the cache whenever it drifts out of sync (see
+    /// [`HDF5Memory::ensure_hnsw_fresh`]).
+    #[cfg(feature = "hnsw")]
+    hnsw: Option<HnswIndex>,
+    /// Set when an in-place update/compaction may have invalidated `hnsw`,
+    /// forcing a rebuild before the next search.
+    #[cfg(feature = "hnsw")]
+    hnsw_dirty: bool,
+    /// Cache length the current `hnsw` value reflects. A mismatch with the live
+    /// cache length triggers a rebuild — this both picks up unhooked cache
+    /// pushes and avoids re-attempting to build an unindexable store every
+    /// search.
+    #[cfg(feature = "hnsw")]
+    hnsw_synced_len: usize,
 }
 
 impl std::fmt::Debug for HDF5Memory {
@@ -235,6 +260,12 @@ impl HDF5Memory {
             wal,
             strategy: None,
             ephemeral: None,
+            #[cfg(feature = "hnsw")]
+            hnsw: None,
+            #[cfg(feature = "hnsw")]
+            hnsw_dirty: false,
+            #[cfg(feature = "hnsw")]
+            hnsw_synced_len: 0,
         })
     }
 
@@ -262,6 +293,14 @@ impl HDF5Memory {
             wal,
             strategy: None,
             ephemeral: None,
+            // Existing data is loaded from disk + WAL replay; mark the index
+            // dirty so it is (re)built from the cache on the first search.
+            #[cfg(feature = "hnsw")]
+            hnsw: None,
+            #[cfg(feature = "hnsw")]
+            hnsw_dirty: true,
+            #[cfg(feature = "hnsw")]
+            hnsw_synced_len: 0,
         })
     }
 
@@ -283,6 +322,108 @@ impl HDF5Memory {
         }
         Ok(())
     }
+
+    // ---- HNSW index maintenance --------------------------------------------
+    //
+    // The index mirrors the cache: HNSW node id == cache index, kept aligned by
+    // appending to both in lock-step and mirroring deletes. The incremental
+    // hooks below are an optimization for the hot path; correctness is
+    // guaranteed by `ensure_hnsw_fresh`, which rebuilds from the cache whenever
+    // the index length drifts from the cache length (covering any mutation path
+    // that doesn't call a hook, e.g. consolidation pushes).
+
+    /// Build an HNSW index over the entire cache, re-applying tombstones as
+    /// soft-deletions so node ids stay aligned with cache indices.
+    ///
+    /// Returns `None` for stores that aren't usefully indexable: no embeddings,
+    /// a zero embedding dimension, or embeddings of mixed dimension (in which
+    /// case `hybrid_search` keeps using the linear scan).
+    #[cfg(feature = "hnsw")]
+    fn build_hnsw_from_cache(&self) -> Option<HnswIndex> {
+        let dim = self.cache.embedding_dim;
+        if dim == 0 || self.cache.embeddings.is_empty() {
+            return None;
+        }
+        if self.cache.embeddings.iter().any(|e| e.len() != dim) {
+            return None;
+        }
+        let mut index = HnswIndex::build_with_metric(
+            &self.cache.embeddings,
+            HNSW_M,
+            HNSW_EF_CONSTRUCTION,
+            DistanceMetric::Cosine,
+        );
+        for (i, &t) in self.cache.tombstones.iter().enumerate() {
+            if t != 0 {
+                index.mark_deleted(i);
+            }
+        }
+        Some(index)
+    }
+
+    /// Ensure the HNSW index reflects the current cache. Rebuilds when marked
+    /// dirty or when the cache length no longer matches what the index reflects.
+    #[cfg(feature = "hnsw")]
+    fn ensure_hnsw_fresh(&mut self) {
+        let n = self.cache.embeddings.len();
+        if self.hnsw_dirty || self.hnsw_synced_len != n {
+            self.hnsw = self.build_hnsw_from_cache();
+            self.hnsw_synced_len = n;
+            self.hnsw_dirty = false;
+        }
+    }
+
+    /// Incrementally index the embedding just pushed at `idx`. Falls back to a
+    /// rebuild (via the dirty flag) for the first vector, dimension mismatches,
+    /// or id drift.
+    #[cfg(feature = "hnsw")]
+    fn hnsw_on_insert(&mut self, idx: usize) {
+        if self.hnsw_dirty {
+            return; // a rebuild is already pending; it will pick this up
+        }
+        let emb_len = self.cache.embeddings[idx].len();
+        match self.hnsw.as_mut() {
+            Some(index) if emb_len == index.dimension() => {
+                let id = index.insert(self.cache.embeddings[idx].clone());
+                if id == idx {
+                    self.hnsw_synced_len = self.cache.embeddings.len();
+                } else {
+                    self.hnsw_dirty = true;
+                }
+            }
+            // Dimension mismatch, first-ever vector, or no index yet: defer to a
+            // rebuild, which decides indexability uniformly.
+            _ => self.hnsw_dirty = true,
+        }
+    }
+
+    #[cfg(not(feature = "hnsw"))]
+    #[inline]
+    fn hnsw_on_insert(&mut self, _idx: usize) {}
+
+    /// Mirror a cache deletion into the index.
+    #[cfg(feature = "hnsw")]
+    fn hnsw_on_delete(&mut self, id: usize) {
+        if let Some(index) = self.hnsw.as_mut() {
+            index.mark_deleted(id);
+        }
+    }
+
+    #[cfg(not(feature = "hnsw"))]
+    #[inline]
+    fn hnsw_on_delete(&mut self, _id: usize) {}
+
+    /// Mark the index for rebuild after a mutation that may have changed
+    /// existing embeddings or renumbered ids (in-place update, compaction).
+    #[cfg(feature = "hnsw")]
+    #[inline]
+    fn hnsw_mark_dirty(&mut self) {
+        self.hnsw_dirty = true;
+    }
+
+    #[cfg(not(feature = "hnsw"))]
+    #[inline]
+    fn hnsw_mark_dirty(&mut self) {}
 
     /// Get a reference to the config.
     pub fn config(&self) -> &MemoryConfig {
@@ -374,6 +515,8 @@ impl HDF5Memory {
                 entry.timestamp,
                 entry.session_id,
             );
+            // In-place embedding change: the index node is stale, force rebuild.
+            self.hnsw_mark_dirty();
             let needs_flush = self
                 .wal
                 .as_ref()
@@ -414,6 +557,7 @@ impl AgentMemory for HDF5Memory {
             entry.session_id,
             entry.tags,
         );
+        self.hnsw_on_insert(idx);
         let needs_flush = self
             .wal
             .as_ref()
@@ -440,6 +584,8 @@ impl AgentMemory for HDF5Memory {
             );
             indices.push(idx);
         }
+        // Batch inserts rebuild the index once rather than node-by-node.
+        self.hnsw_mark_dirty();
         self.flush()?;
         Ok(indices)
     }
@@ -450,6 +596,7 @@ impl AgentMemory for HDF5Memory {
                 "entry {id} not found or already deleted"
             )));
         }
+        self.hnsw_on_delete(id);
         self.flush()?;
 
         // Auto-compact if threshold exceeded
@@ -465,6 +612,8 @@ impl AgentMemory for HDF5Memory {
     fn compact(&mut self) -> Result<usize> {
         let (removed, _index_map) = self.cache.compact();
         if removed > 0 {
+            // Compaction renumbers cache indices; rebuild the index to match.
+            self.hnsw_mark_dirty();
             self.flush()?;
         }
         Ok(removed)
