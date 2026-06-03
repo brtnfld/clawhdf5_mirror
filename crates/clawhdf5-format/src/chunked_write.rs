@@ -238,11 +238,15 @@ pub fn split_into_chunks(
 }
 
 /// Parallel compression threshold: use rayon when chunk count exceeds this.
-#[allow(dead_code)]
+#[cfg(feature = "parallel")]
 const PARALLEL_COMPRESS_THRESHOLD: usize = 4;
 
 /// Compress all chunks, using parallel compression when beneficial.
-#[allow(dead_code)]
+///
+/// With the `parallel` feature and more than [`PARALLEL_COMPRESS_THRESHOLD`]
+/// filtered chunks, compression runs across rayon threads; otherwise it is
+/// sequential. Output order matches input order, so per-chunk bytes are
+/// identical to the sequential path.
 fn compress_all_chunks(
     chunks: &[(Vec<u64>, Vec<u8>)],
     pipeline: &Option<FilterPipeline>,
@@ -578,17 +582,16 @@ pub fn build_chunked_data_at_ext(
     let num_chunks = chunks.len();
     let has_filters = pipeline.is_some();
 
-    // Compress each chunk, padding to cache-line boundaries for aligned access
+    // Compress all chunks up front (parallel under the `parallel` feature),
+    // then lay them out sequentially with cache-line padding for aligned access.
+    // Compression order matches chunk order, so the on-disk layout is identical
+    // to the previous per-chunk sequential path.
+    let compressed_chunks = compress_all_chunks(&chunks, &pipeline, element_size as u32)?;
+
     let mut data_buf = Vec::new();
     let mut written_chunks = Vec::with_capacity(num_chunks);
 
-    for (_offsets, chunk_bytes) in &chunks {
-        let compressed = if let Some(pl) = pipeline.as_ref() {
-            compress_chunk(chunk_bytes, pl, element_size as u32)?
-        } else {
-            chunk_bytes.clone()
-        };
-
+    for ((_offsets, chunk_bytes), compressed) in chunks.iter().zip(compressed_chunks.iter()) {
         // Pad current position to cache-line boundary
         let aligned_offset = align_to_cache_line(data_buf.len());
         if aligned_offset > data_buf.len() {
@@ -599,7 +602,7 @@ pub fn build_chunked_data_at_ext(
         let compressed_size = compressed.len() as u64;
         let raw_size = chunk_bytes.len() as u64;
 
-        data_buf.extend_from_slice(&compressed);
+        data_buf.extend_from_slice(compressed);
 
         written_chunks.push(WrittenChunk {
             address,
