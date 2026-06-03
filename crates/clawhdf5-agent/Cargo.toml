@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-agent"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "HDF5-backed persistent memory store for on-device AI agents"
 license = "MIT"
