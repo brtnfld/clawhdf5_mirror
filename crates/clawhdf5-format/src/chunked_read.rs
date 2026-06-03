@@ -593,6 +593,10 @@ pub fn read_chunked_data_cached(
         )));
     }
 
+    // The per-file cache is shared across datasets; bind it to this one so a
+    // different dataset's chunk index is never reused for this read.
+    cache.ensure_dataset(addr);
+
     // Populate chunk index on first access
     if !cache.has_index() {
         let chunks = match (version, chunk_index_type) {
@@ -946,6 +950,10 @@ pub fn read_chunked_data_sweep(
         )));
     }
 
+    // The per-file cache is shared across datasets; bind it to this one so a
+    // different dataset's chunk index is never reused for this read.
+    cache.ensure_dataset(addr);
+
     // Populate chunk index on first access
     if !cache.has_index() {
         let chunks = match (version, chunk_index_type) {
@@ -1168,6 +1176,10 @@ pub fn read_chunked_data_indexed(
             rank
         )));
     }
+
+    // The per-file cache is shared across datasets; bind it to this one so a
+    // different dataset's chunk index is never reused for this read.
+    cache.ensure_dataset(addr);
 
     // Build chunk index on first access
     if !cache.has_chunk_index() {

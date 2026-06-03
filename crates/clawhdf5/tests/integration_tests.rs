@@ -707,6 +707,58 @@ fn fletcher32_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn multiple_chunked_datasets_share_file_cache() {
+    // The per-file ChunkCache is shared across datasets. Two chunked datasets
+    // of *different rank* must each read correctly: a 1-D dataset's chunk index
+    // (rank 1) must not be reused for a 2-D dataset (rank 2). Read the 1-D one
+    // first so it seeds the shared cache, then the 2-D one.
+    use clawhdf5_format::datatype::{CharacterSet, Datatype, StringPadding};
+
+    // 1-D chunked + compressed fixed-length strings (payload > compress threshold).
+    let strings: Vec<String> = (0..64).map(|i| format!("entry-{i:06}-{}", "x".repeat(80))).collect();
+    let max_len = strings.iter().map(|s| s.len()).max().unwrap();
+    let mut sraw = Vec::new();
+    for s in &strings {
+        let mut b = s.as_bytes().to_vec();
+        b.resize(max_len, 0);
+        sraw.extend_from_slice(&b);
+    }
+    let sdt = Datatype::String {
+        size: max_len as u32,
+        padding: StringPadding::NullPad,
+        charset: CharacterSet::Utf8,
+    };
+
+    // 2-D chunked + compressed f32 matrix.
+    let (n, d) = (40usize, 8usize);
+    let mat: Vec<f32> = (0..n * d).map(|i| i as f32).collect();
+
+    let mut b = FileBuilder::new();
+    {
+        let ds = b.create_dataset("strs");
+        ds.with_compound_data(sdt, sraw, strings.len() as u64);
+        ds.with_chunks(&[16]);
+        ds.with_deflate(6);
+    }
+    {
+        let ds = b.create_dataset("mat");
+        ds.with_f32_data(&mat).with_shape(&[n as u64, d as u64]);
+        ds.with_chunks(&[10, d as u64]).with_shuffle().with_deflate(6);
+    }
+    let bytes = b.finish().unwrap();
+    let file = File::from_bytes(bytes).unwrap();
+
+    // Read the 1-D dataset first (seeds the shared cache with a rank-1 index),
+    // then the 2-D dataset through the same File/cache.
+    let got_strs = file.dataset("strs").unwrap().read_string().unwrap();
+    assert_eq!(got_strs, strings);
+    let got_mat = file.dataset("mat").unwrap().read_f32().unwrap();
+    assert_eq!(got_mat, mat);
+    // Read the 1-D one again to confirm the cache rebinds back correctly.
+    assert_eq!(file.dataset("strs").unwrap().read_string().unwrap(), strings);
+}
+
+#[test]
 fn virtual_dataset_external_file_auto_resolved() {
     // The facade resolves external Virtual Dataset sources relative to the
     // opened file's directory automatically. Drop both files side by side in a

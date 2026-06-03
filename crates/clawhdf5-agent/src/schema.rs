@@ -65,7 +65,7 @@ fn build_memory_group(
     let mut group = builder.create_group("memory");
 
     // chunks: fixed-length string array
-    write_string_dataset(&mut group, "chunks", &cache.chunks, false);
+    write_string_dataset(&mut group, "chunks", &cache.chunks);
 
     // embeddings: f32 [N x D]
     let n = cache.embeddings.len() as u64;
@@ -101,7 +101,7 @@ fn build_memory_group(
     }
 
     // source_channel: fixed-length string array
-    write_string_dataset(&mut group, "source_channel", &cache.source_channels, false);
+    write_string_dataset(&mut group, "source_channel", &cache.source_channels);
 
     // timestamps: f64 array
     group
@@ -109,11 +109,11 @@ fn build_memory_group(
         .with_f64_data(&cache.timestamps)
         .fill_time(FillTime::Never);
 
-    // session_ids: fixed-length string array (no compression — chunked compound not yet supported)
-    write_string_dataset(&mut group, "session_ids", &cache.session_ids, false);
+    // session_ids: fixed-length string array (auto-compressed when large)
+    write_string_dataset(&mut group, "session_ids", &cache.session_ids);
 
-    // tags: fixed-length string array (no compression — chunked compound not yet supported)
-    write_string_dataset(&mut group, "tags", &cache.tags, false);
+    // tags: fixed-length string array (auto-compressed when large)
+    write_string_dataset(&mut group, "tags", &cache.tags);
 
     // tombstones: u8 array — use compact if small
     {
@@ -150,7 +150,7 @@ fn build_sessions_group(
     let mut group = builder.create_group("sessions");
 
     let ids: Vec<String> = sessions.entries.iter().map(|e| e.id.clone()).collect();
-    write_string_dataset(&mut group, "ids", &ids, false);
+    write_string_dataset(&mut group, "ids", &ids);
 
     let start_idxs: Vec<i64> = sessions
         .entries
@@ -165,14 +165,14 @@ fn build_sessions_group(
     group.create_dataset("end_idxs").with_i64_data(&end_idxs);
 
     let channels: Vec<String> = sessions.entries.iter().map(|e| e.channel.clone()).collect();
-    write_string_dataset(&mut group, "channels", &channels, false);
+    write_string_dataset(&mut group, "channels", &channels);
 
     let timestamps: Vec<f64> = sessions.entries.iter().map(|e| e.ts).collect();
     group
         .create_dataset("timestamps")
         .with_f64_data(&timestamps);
 
-    write_string_dataset(&mut group, "summaries", &sessions.summaries, false);
+    write_string_dataset(&mut group, "summaries", &sessions.summaries);
 
     let finished = group.finish();
     builder.add_group(finished);
@@ -192,14 +192,14 @@ fn build_knowledge_group(
         .with_i64_data(&entity_ids);
 
     let entity_names: Vec<String> = knowledge.entities.iter().map(|e| e.name.clone()).collect();
-    write_string_dataset(&mut group, "entity_names", &entity_names, false);
+    write_string_dataset(&mut group, "entity_names", &entity_names);
 
     let entity_types: Vec<String> = knowledge
         .entities
         .iter()
         .map(|e| e.entity_type.clone())
         .collect();
-    write_string_dataset(&mut group, "entity_types", &entity_types, false);
+    write_string_dataset(&mut group, "entity_types", &entity_types);
 
     let emb_idxs: Vec<i64> = knowledge.entities.iter().map(|e| e.embedding_idx).collect();
     group
@@ -222,7 +222,7 @@ fn build_knowledge_group(
         .iter()
         .map(|r| r.relation.clone())
         .collect();
-    write_string_dataset(&mut group, "relation_types", &rel_types, false);
+    write_string_dataset(&mut group, "relation_types", &rel_types);
 
     let rel_weights: Vec<f32> = knowledge.relations.iter().map(|r| r.weight).collect();
     group
@@ -234,7 +234,7 @@ fn build_knowledge_group(
 
     // Aliases
     if !knowledge.alias_strings.is_empty() {
-        write_string_dataset(&mut group, "alias_strings", &knowledge.alias_strings, false);
+        write_string_dataset(&mut group, "alias_strings", &knowledge.alias_strings);
         group
             .create_dataset("alias_entity_ids")
             .with_i64_data(&knowledge.alias_entity_ids);
@@ -252,11 +252,15 @@ fn build_knowledge_group(
 ///
 /// When `compress` is true, uses chunked storage with deflate(6) —
 /// NullPad strings have high redundancy and compress very well.
+/// Payload size (bytes) at or above which a fixed-length string dataset is
+/// stored chunked + deflate-compressed. Below this, the chunk B-tree/heap
+/// overhead outweighs the savings, so the data is left contiguous.
+const STRING_COMPRESS_THRESHOLD: usize = 4096;
+
 fn write_string_dataset(
     group: &mut clawhdf5_format::type_builders::GroupBuilder,
     name: &str,
     strings: &[String],
-    compress: bool,
 ) {
     if strings.is_empty() {
         // Empty dataset: use 1-byte string type with no data
@@ -278,6 +282,7 @@ fn write_string_dataset(
         bytes.resize(max_len, 0);
         raw.extend_from_slice(&bytes);
     }
+    let raw_len = raw.len();
 
     let dtype = Datatype::String {
         size: max_len as u32,
@@ -288,9 +293,12 @@ fn write_string_dataset(
         .create_dataset(name)
         .with_compound_data(dtype, raw, strings.len() as u64);
 
-    // Deflate compression for string datasets — NullPad has high redundancy
-    if compress && strings.len() > 1 {
-        // Chunk size: target ~64KB chunks for string data
+    // Fixed-length NullPad strings have high redundancy (padding + repeated
+    // content), so deflate pays off once the payload is large enough to absorb
+    // the chunking overhead. Fixed-length string datasets are chunkable like
+    // any other fixed-size datatype.
+    if strings.len() > 1 && raw_len >= STRING_COMPRESS_THRESHOLD {
+        // Target ~64KB chunks for string data.
         let elem_size = max_len as u64;
         let target_chunk = 64 * 1024;
         let rows_per_chunk = (target_chunk / elem_size).max(1).min(strings.len() as u64);

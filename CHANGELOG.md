@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### New Features
+- `clawhdf5-agent`: **compress fixed-length string datasets** (memory text
+  chunks, session summaries, ids, tags, entity/relation names, …). These were
+  always stored uncompressed with a "chunked compound not yet supported" note
+  that was simply stale — chunked writes work for fixed-size string/compound
+  datatypes like any other. `write_string_dataset` now chunks + deflates a
+  string dataset once its payload reaches 4 KiB, so large, highly-redundant
+  NullPad content shrinks substantially while tiny metadata stays contiguous
+  (no chunk-overhead bloat).
 - `clawhdf5-format`: decode the **scale-offset filter** (id 6) — both the
   integer variant (`H5Z_SO_INT`) and the floating-point **D-scale** variant
   (`H5Z_SO_FLOAT_DSCALE`). Handles signed/unsigned int sizes, f32/f64, negative
@@ -48,6 +56,16 @@
   fixture produced via the HDF5 low-level API; no E-scale decoder is needed.
 
 ### Bug Fixes
+- `clawhdf5-format`: scope the per-file **chunk cache by dataset**. The shared
+  `ChunkCache` built its chunk index once and reused it for every chunked
+  dataset in the file, keyed only by chunk coordinate with no dataset
+  discrimination. With a single chunked dataset per file this was latent; once a
+  file holds two chunked datasets of different rank (e.g. a 1-D compressed
+  string array and the 2-D embeddings matrix), the first dataset's index was
+  reused for the second, panicking with an out-of-bounds chunk coordinate. The
+  cache now rebinds (dropping its index, chunk-index map, layout, and
+  decompressed slots) whenever the dataset being read changes, while still
+  caching repeated/sequential access to the same dataset.
 - `clawhdf5-format`: read **paged Fixed Array** chunk indexes. A filtered,
   fixed-dimension dataset with more than one data-block page (>1024 chunks by
   default) previously failed with "paged Fixed Array data blocks not yet

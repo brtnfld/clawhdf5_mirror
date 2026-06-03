@@ -256,6 +256,14 @@ struct CacheInner {
     /// Populated once per dataset on first access.
     index: Option<HashMap<ChunkCoord, ChunkInfo>>,
 
+    /// Address of the dataset (its chunk-index base address) that the cached
+    /// index, chunk index, layout, and decompressed slots currently belong to.
+    /// The cache is shared per file across datasets, so every cached-read entry
+    /// checks this and resets the per-dataset state when the dataset changes —
+    /// otherwise one dataset's chunk index (with its own rank) would be reused
+    /// for another, corrupting reads.
+    index_addr: Option<u64>,
+
     /// LRU cache of decompressed chunk data.
     slots: Vec<CachedChunk>,
 
@@ -334,6 +342,7 @@ impl ChunkCache {
         Self {
             inner: std::sync::Mutex::new(CacheInner {
                 index: None,
+                index_addr: None,
                 slots: Vec::with_capacity(max_slots.min(64)),
                 current_bytes: 0,
                 max_bytes,
@@ -348,6 +357,29 @@ impl ChunkCache {
     }
 
     // ----- Index operations -----
+
+    /// Bind the cache to the dataset at chunk-index address `addr`.
+    ///
+    /// The cache is shared per file across all of its datasets. If the cache
+    /// currently holds state for a different dataset, all per-dataset state
+    /// (chunk index, chunk-index map, layout, and decompressed slots) is
+    /// dropped so the next access rebuilds it for this dataset. Reading the
+    /// same dataset again is a no-op, preserving the cache's benefit for
+    /// repeated/sequential access. Returns `true` if a reset occurred.
+    pub fn ensure_dataset(&self, addr: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.index_addr == Some(addr) {
+            return false;
+        }
+        inner.index = None;
+        inner.chunk_index = None;
+        inner.chunk_layout = None;
+        inner.slots.clear();
+        inner.current_bytes = 0;
+        inner.last_coord = None;
+        inner.index_addr = Some(addr);
+        true
+    }
 
     /// Returns `true` if the chunk index has been built.
     pub fn has_index(&self) -> bool {
@@ -565,6 +597,7 @@ impl ChunkCache {
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.index = None;
+        inner.index_addr = None;
         inner.slots.clear();
         inner.current_bytes = 0;
         inner.tick = 0;
