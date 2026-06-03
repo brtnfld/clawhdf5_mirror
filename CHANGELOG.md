@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+- `clawhdf5-format`: chunked writes now compress all chunks up front via
+  `compress_all_chunks`, running across rayon threads under the `parallel`
+  feature when there are more than 4 filtered chunks. On-disk layout is
+  unchanged. Speeds up compressed embedding writes in `clawhdf5-agent` (which
+  enables `parallel`).
+
+### Documentation
+- Fix stale package names across all 13 per-crate READMEs (`rustyhdf5-*` /
+  `edgehdf5-*` → `clawhdf5-*`, usage versions → 2.1.0).
+- Correct README workspace/test/crate stats and the CLAUDE.md CLI subcommand
+  list; document the `hnsw` and format compression/checksum feature flags and
+  the `entity_extract` / `async_memory` modules.
+
 ## v2.1.0 (2026-06-03)
 
 ### New Features
