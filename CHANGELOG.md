@@ -15,6 +15,10 @@
   float members all read end-to-end, validated against HDF5 2.0.
 
 ### Bug Fixes
+- `clawhdf5-format`: read **array-typed datatypes** (e.g. an array-typed
+  compound member) via `read_as_i32/i64/u64/f32/f64` — previously a
+  `TypeMismatch`. The array is read as a flat sequence of its base elements
+  (recursing for nested arrays), applying base-type precision rules.
 - `clawhdf5-format`: **sign-extend reduced-precision fixed-point integers** on
   read. A signed integer whose datatype precision is smaller than its storage
   size is stored zero-filled, so e.g. a 16-bit-precision `-1` previously read as
