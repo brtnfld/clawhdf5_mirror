@@ -676,14 +676,21 @@ fn convert_to_f64(
                 actual: *size as usize,
             }),
         },
-        Datatype::FixedPoint { size, signed, .. } => {
-            if *signed {
-                let v = read_signed_int(bytes, *size as usize, order);
-                Ok(v as f64)
+        Datatype::FixedPoint {
+            size,
+            signed,
+            bit_offset,
+            bit_precision,
+            ..
+        } => {
+            let full = read_unsigned_int(bytes, *size as usize, order);
+            let (off, prec) = effective_bits(*size as usize, *bit_offset, *bit_precision);
+            let v = if *signed {
+                extract_signed(full, off, prec) as f64
             } else {
-                let v = read_unsigned_int(bytes, *size as usize, order);
-                Ok(v as f64)
-            }
+                extract_unsigned(full, off, prec) as f64
+            };
+            Ok(v)
         }
         _ => Err(FormatError::TypeMismatch {
             expected: "numeric",
@@ -707,6 +714,7 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
     // Fast path: native LE i64 — single bulk memcpy
     #[cfg(target_endian = "little")]
     if elem_size == 8
+        && is_full_width(datatype)
         && matches!(
             datatype,
             Datatype::FixedPoint {
@@ -725,11 +733,12 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
     }
 
     let order = get_byte_order(datatype);
+    let (off, prec) = fixed_bits(datatype);
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_signed_int(chunk, elem_size, &order);
-        result.push(v);
+        let full = read_unsigned_int(chunk, elem_size, &order);
+        result.push(extract_signed(full, off, prec));
     }
     Ok(result)
 }
@@ -746,11 +755,12 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
     }
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
+    let (off, prec) = fixed_bits(datatype);
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_unsigned_int(chunk, elem_size, &order);
-        result.push(v);
+        let full = read_unsigned_int(chunk, elem_size, &order);
+        result.push(extract_unsigned(full, off, prec));
     }
     Ok(result)
 }
@@ -797,16 +807,26 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 result.push(read_f64_bytes(chunk, &order) as f32);
             }
             Datatype::FixedPoint {
-                signed: true, size, ..
+                signed: true,
+                size,
+                bit_offset,
+                bit_precision,
+                ..
             } => {
-                result.push(read_signed_int(chunk, *size as usize, &order) as f32);
+                let full = read_unsigned_int(chunk, *size as usize, &order);
+                let (off, prec) = effective_bits(*size as usize, *bit_offset, *bit_precision);
+                result.push(extract_signed(full, off, prec) as f32);
             }
             Datatype::FixedPoint {
                 signed: false,
                 size,
+                bit_offset,
+                bit_precision,
                 ..
             } => {
-                result.push(read_unsigned_int(chunk, *size as usize, &order) as f32);
+                let full = read_unsigned_int(chunk, *size as usize, &order);
+                let (off, prec) = effective_bits(*size as usize, *bit_offset, *bit_precision);
+                result.push(extract_unsigned(full, off, prec) as f32);
             }
             _ => {
                 return Err(FormatError::TypeMismatch {
@@ -834,6 +854,7 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
     // Fast path: native LE i32 — single bulk memcpy
     #[cfg(target_endian = "little")]
     if elem_size == 4
+        && is_full_width(datatype)
         && matches!(
             datatype,
             Datatype::FixedPoint {
@@ -851,11 +872,12 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
     }
 
     let order = get_byte_order(datatype);
+    let (off, prec) = fixed_bits(datatype);
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_signed_int(chunk, elem_size, &order);
-        result.push(v as i32);
+        let full = read_unsigned_int(chunk, elem_size, &order);
+        result.push(extract_signed(full, off, prec) as i32);
     }
     Ok(result)
 }
@@ -1248,6 +1270,68 @@ fn read_f32_bytes(bytes: &[u8], order: &DatatypeByteOrder) -> f32 {
     f32::from_le_bytes(buf)
 }
 
+/// Effective (bit offset, bit precision) for a fixed-point field, defaulting a
+/// zero precision to the full storage width.
+fn effective_bits(size: usize, bit_offset: u16, bit_precision: u16) -> (u32, u32) {
+    let prec = if bit_precision == 0 {
+        (size * 8) as u32
+    } else {
+        bit_precision as u32
+    };
+    (bit_offset as u32, prec)
+}
+
+/// `(bit_offset, bit_precision)` for a fixed-point datatype, full width for
+/// other types.
+fn fixed_bits(datatype: &Datatype) -> (u32, u32) {
+    match datatype {
+        Datatype::FixedPoint {
+            size,
+            bit_offset,
+            bit_precision,
+            ..
+        } => effective_bits(*size as usize, *bit_offset, *bit_precision),
+        _ => (0, 0),
+    }
+}
+
+/// Whether a datatype occupies its full storage width (bit offset 0, precision
+/// == size·8), in which case the bulk-copy fast read paths apply. Non
+/// fixed-point types are treated as full width.
+fn is_full_width(datatype: &Datatype) -> bool {
+    match datatype {
+        Datatype::FixedPoint {
+            size,
+            bit_offset,
+            bit_precision,
+            ..
+        } => *bit_offset == 0 && *bit_precision as u32 == *size * 8,
+        _ => true,
+    }
+}
+
+/// Extract the `precision`-bit field at `offset` from a full-width integer read
+/// and sign-extend it. Full-width fields read as an ordinary signed integer;
+/// reduced-precision fields sign-extend from the field's top bit (HDF5 stores
+/// reduced-precision values zero-filled, so the sign lives in the precision
+/// field, not the storage word).
+fn extract_signed(full: u64, offset: u32, precision: u32) -> i64 {
+    if precision == 0 || precision >= 64 {
+        return full as i64;
+    }
+    let field = (full >> offset) & ((1u64 << precision) - 1);
+    let shift = 64 - precision;
+    ((field << shift) as i64) >> shift
+}
+
+/// Extract the `precision`-bit field at `offset` from a full-width integer read.
+fn extract_unsigned(full: u64, offset: u32, precision: u32) -> u64 {
+    if precision == 0 || precision >= 64 {
+        return full;
+    }
+    (full >> offset) & ((1u64 << precision) - 1)
+}
+
 fn read_unsigned_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> u64 {
     let buf = reorder_bytes(bytes, order);
     match size {
@@ -1262,22 +1346,6 @@ fn read_unsigned_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> u6
                 val |= (byte as u64) << (i * 8);
             }
             val
-        }
-    }
-}
-
-fn read_signed_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> i64 {
-    let buf = reorder_bytes(bytes, order);
-    match size {
-        1 => buf[0] as i8 as i64,
-        2 => i16::from_le_bytes([buf[0], buf[1]]) as i64,
-        4 => i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64,
-        8 => i64::from_le_bytes(buf),
-        _ => {
-            let u = read_unsigned_int(bytes, size, order);
-            // Sign extend
-            let shift = 64 - (size * 8);
-            ((u as i64) << shift) >> shift
         }
     }
 }
@@ -1361,6 +1429,49 @@ mod tests {
     use super::*;
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{CharacterSet, StringPadding};
+
+    fn reduced_int(signed: bool, precision: u16) -> Datatype {
+        Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed,
+            bit_offset: 0,
+            bit_precision: precision,
+        }
+    }
+
+    #[test]
+    fn reduced_precision_signed_sign_extends() {
+        // 16-bit-precision signed values stored zero-filled (HDF5's canonical
+        // layout, e.g. after N-Bit): the reader must sign-extend from bit 15.
+        let dt = reduced_int(true, 16);
+        // [-1, 100, -50, -32768] as 0x0000ffff / 0x00000064 / 0x0000ffce / 0x00008000
+        let raw: Vec<u8> = vec![
+            0xff, 0xff, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xce, 0xff, 0x00, 0x00, 0x00, 0x80,
+            0x00, 0x00,
+        ];
+        assert_eq!(read_as_i32(&raw, &dt).unwrap(), vec![-1, 100, -50, -32768]);
+        assert_eq!(read_as_i64(&raw, &dt).unwrap(), vec![-1, 100, -50, -32768]);
+    }
+
+    #[test]
+    fn reduced_precision_unsigned_masks() {
+        // 12-bit-precision unsigned: high bits must read as zero, not sign.
+        let dt = reduced_int(false, 12);
+        // [4095, 1, 2048] as 0x00000fff / 0x00000001 / 0x00000800
+        let raw: Vec<u8> = vec![
+            0xff, 0x0f, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+        ];
+        assert_eq!(read_as_u64(&raw, &dt).unwrap(), vec![4095, 1, 2048]);
+    }
+
+    #[test]
+    fn full_width_signed_unchanged() {
+        // Regression: full-width 32-bit signed must be unaffected.
+        let dt = reduced_int(true, 32);
+        let raw: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff, 0x2a, 0x00, 0x00, 0x00];
+        assert_eq!(read_as_i32(&raw, &dt).unwrap(), vec![-1, 42]);
+    }
 
     fn make_f64_le_type() -> Datatype {
         Datatype::FloatingPoint {
