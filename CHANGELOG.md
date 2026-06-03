@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.1.0 (2026-06-03)
 
 ### New Features
 - `clawhdf5-agent`: HNSW now backs the vector stage of `hybrid_search`. The
@@ -19,21 +19,15 @@
   pre-existing v1 files still load.
 - `clawhdf5-agent`: `hybrid::merge_vector_keyword` exposes the shared
   normalize-and-fuse step used by both the linear and HNSW vector paths.
+- Expose `max_dimensions()` API on Dataset, MmapDataset, and LazyDataset
+- NetCDF-4 unlimited dimension detection now works correctly
+- Python bindings (`clawhdf5-py`) build and link on macOS with system Python
 
 ### Bug Fixes
 - `clawhdf5-py`: upgrade PyO3 and numpy `0.23` → `0.28` so the bindings build on
   Python 3.14 (PyO3 0.23 capped at 3.13 and hard-failed `cargo build
   --workspace`). Updated for the removed `PyObject` alias (`Py<PyAny>`) and the
   `Python::allow_threads` → `Python::detach` rename.
-
-## v2.1.0 (2026-04-12)
-
-### New Features
-- Expose `max_dimensions()` API on Dataset, MmapDataset, and LazyDataset
-- NetCDF-4 unlimited dimension detection now works correctly
-- Python bindings (`clawhdf5-py`) build and link on macOS with system Python
-
-### Bug Fixes
 - Fix GPU L2 distance test (squared vs actual L2 mismatch in test helper)
 - Mark Android JNI functions as `unsafe` for Rust 2024 edition compliance
 - Add `# Safety` documentation to all public unsafe extern functions
