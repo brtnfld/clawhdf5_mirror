@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-ann"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "HNSW approximate nearest neighbor index stored as HDF5"
 license = "MIT"
@@ -10,5 +10,5 @@ keywords = ["hdf5", "ann", "hnsw", "nearest-neighbor"]
 categories = ["algorithms", "science"]
 
 [dependencies]
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
-clawhdf5-io = { path = "../clawhdf5-io", version = "2.0.0" }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0" }
+clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0" }

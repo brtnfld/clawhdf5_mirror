@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-android"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Android JNI bridge for edgehdf5-memory HDF5 backend"
 license = "MIT"

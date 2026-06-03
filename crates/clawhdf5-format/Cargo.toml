@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-format"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Pure-Rust HDF5 binary format parsing and writing — no C dependencies"
 license = "MIT"
@@ -22,7 +22,7 @@ blake3 = { version = "1", optional = true }
 [dev-dependencies]
 serde_json = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
-clawhdf5-derive = { path = "../clawhdf5-derive", version = "2.0.0" }
+clawhdf5-derive = { path = "../clawhdf5-derive", version = "2.1.0" }
 
 [[bench]]
 name = "bench"

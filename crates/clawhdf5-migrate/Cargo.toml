@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-migrate"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "CLI to migrate SQLite agent memory databases to HDF5 format"
 license = "MIT"
@@ -14,9 +14,9 @@ name = "clawhdf5-migrate"
 path = "src/main.rs"
 
 [dependencies]
-clawhdf5-agent = { path = "../clawhdf5-agent", version = "2.0.0" }
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
-clawhdf5 = { path = "../clawhdf5", version = "2.0.0" }
+clawhdf5-agent = { path = "../clawhdf5-agent", version = "2.1.0" }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0" }
+clawhdf5 = { path = "../clawhdf5", version = "2.1.0" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 half = "2"

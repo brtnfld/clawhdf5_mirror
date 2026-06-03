@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Pure-Rust HDF5 reader/writer — no C dependencies"
 license = "MIT"
@@ -10,16 +10,16 @@ keywords = ["hdf5", "science", "data", "binary"]
 categories = ["parser-implementations", "science", "encoding"]
 
 [dependencies]
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
-clawhdf5-io = { path = "../clawhdf5-io", version = "2.0.0" }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0" }
+clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0" }
 rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
-clawhdf5-io = { path = "../clawhdf5-io", version = "2.0.0", features = ["mmap"] }
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0", features = ["parallel", "fast-checksum"] }
-clawhdf5-filters = { path = "../clawhdf5-filters", version = "2.0.0" }
+clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0", features = ["mmap"] }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["parallel", "fast-checksum"] }
+clawhdf5-filters = { path = "../clawhdf5-filters", version = "2.1.0" }
 
 [[bench]]
 name = "mmap_bench"

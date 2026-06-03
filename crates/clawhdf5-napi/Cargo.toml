@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-napi"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Node.js native addon (napi-rs) exposing clawhdf5-agent to TypeScript/JavaScript"
 license = "MIT"
@@ -10,7 +10,7 @@ repository = "https://github.com/redclawsystems/clawhdf5"
 crate-type = ["cdylib"]
 
 [dependencies]
-clawhdf5-agent = { path = "../clawhdf5-agent", version = "2.0.0" }
+clawhdf5-agent = { path = "../clawhdf5-agent", version = "2.1.0" }
 napi = { version = "2", default-features = false, features = ["napi9"] }
 napi-derive = "2"
 

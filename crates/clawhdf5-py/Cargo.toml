@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-py"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Python bindings for rustyhdf5 — a pure-Rust HDF5 library"
 license = "MIT"
@@ -14,8 +14,8 @@ name = "clawhdf5"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-clawhdf5_rs = { path = "../clawhdf5", version = "2.0.0", package = "clawhdf5" }
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
+clawhdf5_rs = { path = "../clawhdf5", version = "2.1.0", package = "clawhdf5" }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0" }
 pyo3 = "0.28"
 numpy = "0.28"
 

@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-accel"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "SIMD-accelerated operations for rustyhdf5"
 license = "MIT"

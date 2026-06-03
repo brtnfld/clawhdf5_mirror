@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-gpu"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "GPU-accelerated vector operations for rustyhdf5 using wgpu compute shaders"
 license = "MIT"

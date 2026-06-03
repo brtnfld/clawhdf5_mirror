@@ -1,6 +1,6 @@
 [package]
 name = "clawhdf5-netcdf4"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "NetCDF-4 read support built on rustyhdf5 — pure Rust, no C dependencies"
 license = "MIT"
@@ -10,8 +10,8 @@ keywords = ["netcdf", "netcdf4", "hdf5", "science", "climate"]
 categories = ["parser-implementations", "science"]
 
 [dependencies]
-clawhdf5 = { path = "../clawhdf5", version = "2.0.0" }
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
+clawhdf5 = { path = "../clawhdf5", version = "2.1.0" }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0" }
 
 [dev-dependencies]
 tempfile = "3"
