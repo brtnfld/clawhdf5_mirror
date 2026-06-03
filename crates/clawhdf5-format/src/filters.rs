@@ -66,34 +66,42 @@ pub fn compress_chunk(
     Ok(result)
 }
 
-/// Decode the HDF5 scale-offset filter (id 6), integer variant (`H5Z_SO_INT`).
+/// Decode the HDF5 scale-offset filter (id 6).
 ///
-/// Layout of the compressed buffer (reverse-engineered against HDF5 2.0 and
-/// verified across signed/unsigned sizes, fill values and chunk sizes):
-/// `minbits` (u32 LE) · `minval_width` (1 byte, = 8) · `minval`
-/// (`minval_width` bytes LE) · 8 reserved bytes · MSB-first packed codes
-/// (`nelmts * minbits` bits). Each element's code is `value - minval`; the
-/// all-ones code is reserved for the (defined) fill value.
+/// Supports the integer variant (`H5Z_SO_INT`) and the floating-point
+/// **D-scale** variant (`H5Z_SO_FLOAT_DSCALE`); the float E-scale variant is
+/// reported as unsupported.
 ///
-/// `cd` is the filter client data (`H5Zscaleoffset.c` parameter block):
-/// `[0]`=scale type (2 = integer), `[2]`=element count, `[4]`=element size,
-/// `[5]`=signed flag, `[6]`=byte order (1 = big-endian), `[7]`=fill defined,
-/// `[8..]`=fill value. The floating-point variants (D-scale/E-scale) use a
-/// different algorithm and are reported as unsupported.
+/// Compressed buffer layout (reverse-engineered against HDF5 2.0 and verified
+/// across signed/unsigned int sizes, f32/f64, negatives, fill values and chunk
+/// sizes): `minbits` (u32 LE) · `minval_width` (1 byte) · `minval`
+/// (`minval_width` bytes — a little-endian integer for the int variant, or the
+/// minimum float for D-scale) · 8 reserved bytes · MSB-first packed codes
+/// (`nelmts * minbits` bits). The all-ones code is reserved for the (defined)
+/// fill value. Integer reconstruction is `value = minval + code`; D-scale float
+/// is `value = minval + code / 10^scale_factor`.
+///
+/// `cd` is the `H5Zscaleoffset.c` parameter block: `[0]`=scale type
+/// (0 = float D-scale, 2 = integer), `[1]`=scale factor (decimal digits for
+/// D-scale), `[2]`=element count, `[4]`=element size, `[5]`=signed flag,
+/// `[6]`=byte order (1 = big-endian), `[7]`=fill defined, `[8..]`=fill value.
 fn scaleoffset_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
+    const H5Z_SO_FLOAT_DSCALE: u32 = 0;
     const H5Z_SO_INT: u32 = 2;
     if cd.len() < 8 {
         return Err(FormatError::ChunkedReadError(
             "scale-offset: missing filter client data".into(),
         ));
     }
-    if cd[0] != H5Z_SO_INT {
-        // Floating-point scale-offset uses a different (D/E-scale) algorithm.
+    let scale_type = cd[0];
+    let is_float = scale_type == H5Z_SO_FLOAT_DSCALE;
+    if scale_type != H5Z_SO_INT && !is_float {
+        // Float E-scale (scale type 1) uses a different algorithm.
         return Err(FormatError::UnsupportedFilter(FILTER_SCALEOFFSET));
     }
     let nelmts = cd[2] as usize;
     let elem_size = cd[4] as usize;
-    if elem_size == 0 || elem_size > 8 {
+    if elem_size == 0 || elem_size > 8 || (is_float && elem_size != 4 && elem_size != 8) {
         return Err(FormatError::ChunkedReadError(
             "scale-offset: unsupported element size".into(),
         ));
@@ -101,14 +109,8 @@ fn scaleoffset_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatErro
     let signed = cd[5] == 1;
     let big_endian = cd[6] == 1;
     let fill_defined = cd[7] == 1;
-    let fill_value: i64 = if fill_defined {
-        let lo = *cd.get(8).unwrap_or(&0) as u64;
-        let hi = *cd.get(9).unwrap_or(&0) as u64;
-        sign_extend(lo | (hi << 32), elem_size, signed)
-    } else {
-        0
-    };
 
+    // --- header: minbits, then minval, then 8 reserved bytes ---
     if data.len() < 5 {
         return Err(FormatError::ChunkedReadError(
             "scale-offset: truncated header".into(),
@@ -122,54 +124,135 @@ fn scaleoffset_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatErro
             "scale-offset: truncated minval".into(),
         ));
     }
-    let minval = read_le_int(&data[5..minval_end], signed);
+    let minval_bytes = &data[5..minval_end];
 
-    // minbits == 0: every element equals minval (no packed payload).
-    if minbits == 0 {
-        let vals = vec![minval; nelmts];
-        return Ok(write_elements(&vals, elem_size, big_endian));
-    }
+    // --- unpack the per-element codes (MSB-first), shared by both variants ---
     if minbits > 64 {
         return Err(FormatError::ChunkedReadError(
             "scale-offset: implausible minbits".into(),
         ));
     }
-
-    let packed_off = minval_end + 8;
-    let packed = data.get(packed_off..).ok_or_else(|| {
-        FormatError::ChunkedReadError("scale-offset: truncated packed data".into())
-    })?;
-    let need_bits = nelmts
-        .checked_mul(minbits)
-        .ok_or_else(|| FormatError::ChunkedReadError("scale-offset: size overflow".into()))?;
-    if packed.len() * 8 < need_bits {
-        return Err(FormatError::ChunkedReadError(
-            "scale-offset: packed data too short".into(),
-        ));
-    }
-
-    let fill_code: u64 = if minbits >= 64 {
-        u64::MAX
+    let codes: Vec<u64> = if minbits == 0 {
+        // No packed payload: every element equals minval.
+        vec![0u64; nelmts]
     } else {
-        (1u64 << minbits) - 1
-    };
-    let mut values = Vec::with_capacity(nelmts);
-    let mut bitpos = 0usize;
-    for _ in 0..nelmts {
-        let mut code: u64 = 0;
-        for _ in 0..minbits {
-            let bit = (packed[bitpos / 8] >> (7 - (bitpos % 8))) & 1;
-            code = (code << 1) | bit as u64;
-            bitpos += 1;
+        let packed = data.get(minval_end + 8..).ok_or_else(|| {
+            FormatError::ChunkedReadError("scale-offset: truncated packed data".into())
+        })?;
+        let need_bits = nelmts
+            .checked_mul(minbits)
+            .ok_or_else(|| FormatError::ChunkedReadError("scale-offset: size overflow".into()))?;
+        if packed.len() * 8 < need_bits {
+            return Err(FormatError::ChunkedReadError(
+                "scale-offset: packed data too short".into(),
+            ));
         }
-        let v = if fill_defined && code == fill_code {
-            fill_value
+        let mut out = Vec::with_capacity(nelmts);
+        let mut bitpos = 0usize;
+        for _ in 0..nelmts {
+            let mut code: u64 = 0;
+            for _ in 0..minbits {
+                let bit = (packed[bitpos / 8] >> (7 - (bitpos % 8))) & 1;
+                code = (code << 1) | bit as u64;
+                bitpos += 1;
+            }
+            out.push(code);
+        }
+        out
+    };
+    // The fill code (all ones) only exists when there are bits to pack.
+    let has_fill_code = fill_defined && minbits > 0 && minbits < 64;
+    let fill_code: u64 = if minbits == 0 { 0 } else { (1u64 << minbits) - 1 };
+
+    if is_float {
+        let scale = 10f64.powi(cd[1] as i32);
+        let minval = read_le_float(minval_bytes, elem_size);
+        let fill_value = if fill_defined {
+            let lo = *cd.get(8).unwrap_or(&0) as u64;
+            let hi = *cd.get(9).unwrap_or(&0) as u64;
+            bits_to_float(lo | (hi << 32), elem_size)
         } else {
-            minval.wrapping_add(code as i64)
+            0.0
         };
-        values.push(v);
+        let values: Vec<f64> = codes
+            .iter()
+            .map(|&code| {
+                if has_fill_code && code == fill_code {
+                    fill_value
+                } else {
+                    minval + code as f64 / scale
+                }
+            })
+            .collect();
+        Ok(write_floats(&values, elem_size, big_endian))
+    } else {
+        let minval = read_le_int(minval_bytes, signed);
+        let fill_value: i64 = if fill_defined {
+            let lo = *cd.get(8).unwrap_or(&0) as u64;
+            let hi = *cd.get(9).unwrap_or(&0) as u64;
+            sign_extend(lo | (hi << 32), elem_size, signed)
+        } else {
+            0
+        };
+        let values: Vec<i64> = codes
+            .iter()
+            .map(|&code| {
+                if has_fill_code && code == fill_code {
+                    fill_value
+                } else {
+                    minval.wrapping_add(code as i64)
+                }
+            })
+            .collect();
+        Ok(write_elements(&values, elem_size, big_endian))
     }
-    Ok(write_elements(&values, elem_size, big_endian))
+}
+
+/// Read a little-endian float of `size` bytes (4 = f32, otherwise f64) as f64.
+fn read_le_float(bytes: &[u8], size: usize) -> f64 {
+    if size == 4 {
+        let mut b = [0u8; 4];
+        let n = bytes.len().min(4);
+        b[..n].copy_from_slice(&bytes[..n]);
+        f32::from_le_bytes(b) as f64
+    } else {
+        let mut b = [0u8; 8];
+        let n = bytes.len().min(8);
+        b[..n].copy_from_slice(&bytes[..n]);
+        f64::from_le_bytes(b)
+    }
+}
+
+/// Interpret the low bits of `raw` as an IEEE float of `size` bytes.
+fn bits_to_float(raw: u64, size: usize) -> f64 {
+    if size == 4 {
+        f32::from_bits(raw as u32) as f64
+    } else {
+        f64::from_bits(raw)
+    }
+}
+
+/// Serialize reconstructed float values as `elem_size`-byte (f32/f64) elements
+/// in the requested byte order.
+fn write_floats(values: &[f64], elem_size: usize, big_endian: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * elem_size);
+    for &v in values {
+        let bytes: [u8; 8] = if elem_size == 4 {
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&(v as f32).to_le_bytes());
+            b
+        } else {
+            v.to_le_bytes()
+        };
+        if big_endian {
+            for i in (0..elem_size).rev() {
+                out.push(bytes[i]);
+            }
+        } else {
+            out.extend_from_slice(&bytes[..elem_size]);
+        }
+    }
+    out
 }
 
 /// Read a little-endian integer of `bytes.len()` bytes, sign-extending when
@@ -904,10 +987,45 @@ mod tests {
         assert_eq!(scaleoffset_decompress(&raw, &cd).unwrap(), expected);
     }
 
+    fn as_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
     #[test]
-    fn scaleoffset_float_variant_unsupported() {
-        // scale_type 0 = float D-scale — a different algorithm, must be rejected.
-        let cd = [0u32, 3, 50, 1, 4, 0, 0, 1, 0];
+    fn scaleoffset_float_dscale_d1() {
+        // f32 [0,1,2,3], D=1, default fill 0 (element 0 is the fill).
+        let cd = [0u32, 1, 4, 1, 4, 0, 0, 1, 0];
+        let raw = [
+            0x05, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x15, 0x40,
+        ];
+        let got = as_f32(&scaleoffset_decompress(&raw, &cd).unwrap());
+        assert_eq!(got, vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn scaleoffset_float_dscale_d3() {
+        // f32 [0,0.1,0.2,0.3], D=3 (lossy reconstruction within 10^-3).
+        let cd = [0u32, 3, 4, 1, 4, 0, 0, 1, 0];
+        let raw = [
+            0x08, 0x00, 0x00, 0x00, 0x08, 0xcd, 0xcc, 0xcc, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x64, 0xc8, 0x00,
+        ];
+        let got = as_f32(&scaleoffset_decompress(&raw, &cd).unwrap());
+        let exp = [0.0f32, 0.1, 0.2, 0.3];
+        assert_eq!(got.len(), 4);
+        for (g, e) in got.iter().zip(exp.iter()) {
+            assert!((g - e).abs() < 1e-3, "got {g} expected {e}");
+        }
+    }
+
+    #[test]
+    fn scaleoffset_float_escale_unsupported() {
+        // scale_type 1 = float E-scale — a different algorithm, must be rejected.
+        let cd = [1u32, 3, 50, 1, 4, 0, 0, 1, 0];
         let raw = [0u8; 24];
         assert!(matches!(
             scaleoffset_decompress(&raw, &cd),
