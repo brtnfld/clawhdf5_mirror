@@ -3,6 +3,15 @@
 ## Unreleased
 
 ### New Features
+- `clawhdf5-format`: **write multi-block fractal heaps** (root indirect block).
+  Dense attribute and dense link storage previously capped at a single direct
+  block (~64 KiB of heap data — a few thousand attributes/links). When the
+  objects exceed one direct block, the heap now lays out a root indirect block
+  (FHIB) over multiple direct blocks sized by the doubling table, distributing
+  objects across blocks with correct per-block heap offsets. Validated
+  end-to-end: a 2,500-attribute object and a 2,500-link group round-trip
+  through our reader and are read correctly by h5py. (Objects still may not
+  span a block — no huge-object path.)
 - `clawhdf5-format`: **write dense group link storage** (fractal heap + v2
   B-tree). A group with more than 8 links (libhdf5's compact `max_compact`
   default) is now written densely — its links live in a fractal heap indexed by
@@ -91,6 +100,15 @@
   fixture produced via the HDF5 low-level API; no E-scale decoder is needed.
 
 ### Bug Fixes
+- `clawhdf5-format`: **read multi-direct-block fractal heaps**. The reader split
+  direct vs indirect block rows using the FRHP "Starting # of Rows in Root
+  Indirect Block" field (a constant, typically 1), so any heap whose data spans
+  more than one direct block — common in libhdf5 files with a large group or
+  many dense attributes — was misread as having indirect blocks and failed with
+  `InvalidFractalHeapSignature`. The split is now derived from the heap geometry
+  (`max_direct_rows = log2(max_direct / start) + 2`). Validated against an
+  h5py-written 400-dense-attribute group (root indirect block, 4 rows, 13 direct
+  blocks).
 - `clawhdf5-format`: scope the per-file **chunk cache by dataset**. The shared
   `ChunkCache` built its chunk index once and reused it for every chunked
   dataset in the file, keyed only by chunk coordinate with no dataset

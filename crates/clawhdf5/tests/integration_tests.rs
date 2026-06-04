@@ -871,3 +871,51 @@ fn reads_libhdf5_multiblock_fractal_heap() {
         }
     }
 }
+
+#[test]
+fn dense_attrs_multiblock_fractal_heap_roundtrip() {
+    // Enough dense attributes to overflow a single 64 KiB fractal-heap direct
+    // block, forcing a root indirect block over multiple direct blocks.
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    let n = 1600i64;
+    for i in 0..n {
+        g.set_attr(&format!("attribute_number_{i:05}"), AttrValue::I64(i * 2));
+    }
+    g.create_dataset("d").with_i32_data(&[1]);
+    b.add_group(g.finish());
+    let file = File::from_bytes(b.finish().unwrap()).unwrap();
+
+    let attrs = file.group("g").unwrap().attrs().unwrap();
+    for i in 0..n {
+        match attrs.get(&format!("attribute_number_{i:05}")) {
+            Some(AttrValue::I64(v)) => assert_eq!(*v, i * 2, "attr {i}"),
+            other => panic!("attr {i} = {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn dense_links_multiblock_fractal_heap_roundtrip() {
+    // Enough links to overflow a single fractal-heap direct block.
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("big");
+    let n = 2200;
+    for i in 0..n {
+        g.create_dataset(&format!("dataset_number_{i:05}"))
+            .with_i32_data(&[i]);
+    }
+    b.add_group(g.finish());
+    let file = File::from_bytes(b.finish().unwrap()).unwrap();
+
+    assert_eq!(file.group("big").unwrap().datasets().unwrap().len(), n as usize);
+    for i in [0, 1, 1234, n - 1] {
+        assert_eq!(
+            file.dataset(&format!("big/dataset_number_{i:05}"))
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            vec![i]
+        );
+    }
+}

@@ -519,3 +519,39 @@ print("OK")
     let out = run_python_output(&script);
     assert_eq!(out, "OK");
 }
+
+// ---------------------------------------------------------------------------
+// A_multiblock. Write a multi-direct-block fractal heap -> h5py reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clawhdf5_writes_multiblock_heap_h5py_reads() {
+    skip_if_no_python!();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multiblock.h5");
+    let path_str = path.display().to_string();
+
+    // ~1600 dense attributes overflow a single 64KiB fractal-heap direct block.
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    for i in 0..1600i64 {
+        g.set_attr(&format!("attribute_number_{i:05}"), AttrValue::I64(i * 2));
+    }
+    g.create_dataset("d").with_i32_data(&[1]);
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    let script = format!(
+        r#"
+import h5py
+with h5py.File("{path_str}", "r") as f:
+    a = f["g"].attrs
+    assert len(a) == 1600, f"expected 1600 attrs, got {{len(a)}}"
+    for i in (0, 1, 999, 1599):
+        v = int(a[f"attribute_number_{{i:05}}"])
+        assert v == i*2, f"attr {{i}} = {{v}}"
+print("OK")
+"#
+    );
+    assert_eq!(run_python_output(&script), "OK");
+}

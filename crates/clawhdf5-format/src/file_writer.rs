@@ -179,17 +179,16 @@ pub(crate) struct DenseAttrBlob {
     pub(crate) blob: Vec<u8>,
 }
 
-/// A single-direct-block fractal heap holding a set of serialized objects,
-/// plus the heap IDs that address them. Shared by dense attribute and dense
-/// link storage, which differ only in their v2 B-tree record layout.
+/// A fractal heap holding a set of serialized objects, plus the heap IDs that
+/// address them. Shared by dense attribute and dense link storage, which differ
+/// only in their v2 B-tree record layout.
 pub(crate) struct FractalHeapBlock {
-    /// Serialized fractal heap header (FRHP).
-    frhp: Vec<u8>,
-    /// Serialized root direct block (FHDB), padded to its block size.
-    dblock: Vec<u8>,
+    /// The complete heap bytes: FRHP header, then either a single root direct
+    /// block, or a root indirect block (FHIB) followed by its direct blocks.
+    blob: Vec<u8>,
     /// Address of the fractal heap header.
     frhp_addr: u64,
-    /// Address where the v2 B-tree should be placed (right after the dblock).
+    /// Address where the v2 B-tree should be placed (right after the heap).
     btree_addr: u64,
     /// Heap ID for each object, in input order.
     heap_ids: Vec<Vec<u8>>,
@@ -197,9 +196,13 @@ pub(crate) struct FractalHeapBlock {
     heap_id_length: u16,
 }
 
-/// Build a single-direct-block fractal heap for `serialized` objects, laid out
-/// at `base_address`. The caller builds the matching v2 B-tree (type 5 for
-/// links, type 8 for attributes) at the returned `btree_addr`.
+/// Build a fractal heap for `serialized` objects, laid out at `base_address`.
+///
+/// Uses a single root direct block when the data fits in one (≤ the maximum
+/// direct block size), otherwise a root indirect block over multiple direct
+/// blocks following the doubling table. The caller builds the matching v2
+/// B-tree (type 5 for links, type 8 for attributes) at the returned
+/// `btree_addr`.
 pub(crate) fn build_single_block_fractal_heap(
     serialized: &[Vec<u8>],
     base_address: u64,
@@ -217,6 +220,17 @@ pub(crate) fn build_single_block_fractal_heap(
     let total_data_size: usize = serialized.iter().map(|s| s.len()).sum();
     let dblock_content_size = dblock_header_size + total_data_size;
     let starting_block_size = dblock_content_size.next_power_of_two().max(512) as u64;
+
+    // When the objects don't fit in a single direct block, fall back to a
+    // multi-block heap with a root indirect block.
+    if starting_block_size > max_direct_block_size {
+        return build_multiblock_fractal_heap(
+            serialized,
+            base_address,
+            max_heap_size,
+            heap_id_length,
+        );
+    }
 
     // Fractal heap header size
     let frhp_size = 4
@@ -318,14 +332,256 @@ pub(crate) fn build_single_block_fractal_heap(
         .map(|(off, len)| encode_managed_id(*off, *len, max_heap_size, heap_id_length))
         .collect();
 
+    let mut blob = Vec::with_capacity(frhp.len() + dblock.len());
+    blob.extend_from_slice(&frhp);
+    blob.extend_from_slice(&dblock);
+
     FractalHeapBlock {
-        frhp,
-        dblock,
+        blob,
         frhp_addr,
         btree_addr,
         heap_ids,
         heap_id_length,
     }
+}
+
+/// Build a multi-block fractal heap: a root indirect block (FHIB) over multiple
+/// direct blocks sized by the doubling table. Used when the objects don't fit
+/// in a single direct block. Objects do not span blocks (no huge-object path).
+fn build_multiblock_fractal_heap(
+    serialized: &[Vec<u8>],
+    base_address: u64,
+    max_heap_size: u16,
+    heap_id_length: u16,
+) -> FractalHeapBlock {
+    let os = OFFSET_SIZE as usize;
+    let block_offset_bytes = (max_heap_size as usize).div_ceil(8);
+    let max_direct_block_size: u64 = 65536;
+    let table_width: u16 = 4;
+    let starting_block_size: u64 = 512;
+    let dblock_header_size = 4 + 1 + os + block_offset_bytes + 4;
+    let block_capacity = |row: usize| block_size_for_row(starting_block_size, row) - dblock_header_size as u64;
+
+    // ---- Pack objects into direct blocks (row-major over the doubling table) ----
+    struct Blk {
+        row: usize,
+        size: u64,
+        heap_offset: u64,
+        data: Vec<u8>,
+    }
+    let mut blocks: Vec<Blk> = Vec::new();
+    // Each object's (heap_offset, length) for the heap ID.
+    let mut obj_loc: Vec<(u64, u64)> = vec![(0, 0); serialized.len()];
+
+    let mut row = 0usize;
+    let mut col = 0u16;
+    let mut heap_off = 0u64;
+    let mut cur: Option<Blk> = None;
+
+    for (idx, s) in serialized.iter().enumerate() {
+        loop {
+            if cur.is_none() {
+                let size = block_size_for_row(starting_block_size, row);
+                cur = Some(Blk {
+                    row,
+                    size,
+                    heap_offset: heap_off,
+                    data: Vec::new(),
+                });
+            }
+            let blk = cur.as_mut().unwrap();
+            let cap = block_capacity(blk.row) as usize;
+            if !blk.data.is_empty() && blk.data.len() + s.len() > cap {
+                // Doesn't fit; finalize this block and advance to the next slot.
+                let finished = cur.take().unwrap();
+                heap_off += finished.size;
+                blocks.push(finished);
+                col += 1;
+                if col >= table_width {
+                    col = 0;
+                    row += 1;
+                }
+                continue;
+            }
+            // Place the object (a fresh block always accepts at least one object
+            // up to its capacity; objects larger than a max block are unsupported).
+            let pos_in_block = dblock_header_size + blk.data.len();
+            obj_loc[idx] = (blk.heap_offset + pos_in_block as u64, s.len() as u64);
+            blk.data.extend_from_slice(s);
+            break;
+        }
+    }
+    if let Some(b) = cur.take() {
+        blocks.push(b);
+    }
+
+    let cur_rows = (blocks.last().map(|b| b.row).unwrap_or(0) + 1) as u16;
+
+    // ---- Addresses ----
+    let frhp_size = frhp_header_size(os, LENGTH_SIZE as usize);
+    let frhp_addr = base_address;
+    let fhib_addr = frhp_addr + frhp_size as u64;
+    let fhib_entries = cur_rows as usize * table_width as usize;
+    let fhib_size = 5 + os + block_offset_bytes + fhib_entries * os + 4;
+    let first_dblock_addr = fhib_addr + fhib_size as u64;
+
+    // Assign each used block an address (laid out consecutively after the FHIB).
+    let mut blk_addrs: Vec<u64> = Vec::with_capacity(blocks.len());
+    let mut a = first_dblock_addr;
+    for b in &blocks {
+        blk_addrs.push(a);
+        a += b.size;
+    }
+    let heap_end = a;
+    let btree_addr = heap_end;
+
+    // Bookkeeping totals.
+    let managed_space: u64 = (0..cur_rows as usize)
+        .map(|r| block_size_for_row(starting_block_size, r) * table_width as u64)
+        .sum();
+    let alloc_space: u64 = blocks.iter().map(|b| b.size).sum();
+    let used: u64 = blocks
+        .iter()
+        .map(|b| dblock_header_size as u64 + b.data.len() as u64)
+        .sum();
+    let free_space = alloc_space.saturating_sub(used);
+
+    // ---- FRHP header ----
+    let max_managed = max_direct_block_size as u32 - dblock_header_size as u32;
+    let frhp = write_frhp(WriteFrhp {
+        heap_id_length,
+        max_managed,
+        free_space,
+        managed_space,
+        alloc_space,
+        nobjects: serialized.len() as u64,
+        table_width,
+        starting_block_size,
+        max_direct_block_size,
+        max_heap_size,
+        root_addr: fhib_addr,
+        cur_rows,
+    });
+    debug_assert_eq!(frhp.len(), frhp_size);
+
+    // ---- Root indirect block (FHIB) ----
+    let mut fhib = Vec::with_capacity(fhib_size);
+    fhib.extend_from_slice(b"FHIB");
+    fhib.push(0); // version
+    write_offset(&mut fhib, frhp_addr, OFFSET_SIZE);
+    fhib.extend_from_slice(&vec![0u8; block_offset_bytes]); // block offset = 0 (root)
+    for &addr in &blk_addrs {
+        write_offset(&mut fhib, addr, OFFSET_SIZE);
+    }
+    // Remaining slots within the current rows are unallocated.
+    for _ in blk_addrs.len()..fhib_entries {
+        write_undef_offset(&mut fhib, OFFSET_SIZE);
+    }
+    let fhib_checksum = crate::checksum::jenkins_lookup3(&fhib);
+    fhib.extend_from_slice(&fhib_checksum.to_le_bytes());
+    debug_assert_eq!(fhib.len(), fhib_size);
+
+    // ---- Direct blocks ----
+    let mut blob = frhp;
+    blob.extend_from_slice(&fhib);
+    for b in &blocks {
+        let mut dblock = Vec::with_capacity(b.size as usize);
+        dblock.extend_from_slice(b"FHDB");
+        dblock.push(0); // version
+        write_offset(&mut dblock, frhp_addr, OFFSET_SIZE);
+        let mut bo = b.heap_offset.to_le_bytes().to_vec();
+        bo.truncate(block_offset_bytes);
+        dblock.extend_from_slice(&bo);
+        let cksum_pos = dblock.len();
+        dblock.extend_from_slice(&[0u8; 4]); // checksum placeholder
+        dblock.extend_from_slice(&b.data);
+        dblock.resize(b.size as usize, 0);
+        let cksum = crate::checksum::jenkins_lookup3(&dblock);
+        dblock[cksum_pos..cksum_pos + 4].copy_from_slice(&cksum.to_le_bytes());
+        blob.extend_from_slice(&dblock);
+    }
+
+    let heap_ids: Vec<Vec<u8>> = obj_loc
+        .iter()
+        .map(|(off, len)| encode_managed_id(*off, *len, max_heap_size, heap_id_length))
+        .collect();
+
+    FractalHeapBlock {
+        blob,
+        frhp_addr,
+        btree_addr,
+        heap_ids,
+        heap_id_length,
+    }
+}
+
+/// Doubling-table block size for `row`: rows 0 and 1 share the starting size;
+/// row r (r ≥ 1) is `start * 2^(r-1)`.
+fn block_size_for_row(starting_block_size: u64, row: usize) -> u64 {
+    if row <= 1 {
+        starting_block_size
+    } else {
+        starting_block_size << (row - 1)
+    }
+}
+
+/// Size in bytes of the FRHP header for the given offset/length sizes.
+fn frhp_header_size(os: usize, ls: usize) -> usize {
+    4 + 1 + 2 + 2 + 1 + 4 + ls + os + ls + os + ls + ls + ls + ls + ls + ls + ls + ls + 2 + ls + ls
+        + 2
+        + 2
+        + os
+        + 2
+        + 4
+}
+
+/// Parameters for [`write_frhp`].
+struct WriteFrhp {
+    heap_id_length: u16,
+    max_managed: u32,
+    free_space: u64,
+    managed_space: u64,
+    alloc_space: u64,
+    nobjects: u64,
+    table_width: u16,
+    starting_block_size: u64,
+    max_direct_block_size: u64,
+    max_heap_size: u16,
+    root_addr: u64,
+    cur_rows: u16,
+}
+
+/// Serialize a fractal heap header (FRHP).
+fn write_frhp(p: WriteFrhp) -> Vec<u8> {
+    let mut frhp = Vec::with_capacity(frhp_header_size(OFFSET_SIZE as usize, LENGTH_SIZE as usize));
+    frhp.extend_from_slice(b"FRHP");
+    frhp.push(0); // version
+    frhp.extend_from_slice(&p.heap_id_length.to_le_bytes());
+    frhp.extend_from_slice(&0u16.to_le_bytes()); // io_filter_encoded_length
+    frhp.push(0x02); // flags: bit 1 = checksum direct blocks
+    frhp.extend_from_slice(&p.max_managed.to_le_bytes());
+    write_length(&mut frhp, 0, LENGTH_SIZE); // next_huge_object_id
+    write_undef_offset(&mut frhp, OFFSET_SIZE); // btree_huge_objects_address
+    write_length(&mut frhp, p.free_space, LENGTH_SIZE); // free_space_managed_blocks
+    write_undef_offset(&mut frhp, OFFSET_SIZE); // free_space_mgr_addr
+    write_length(&mut frhp, p.managed_space, LENGTH_SIZE); // managed_space_in_heap
+    write_length(&mut frhp, p.alloc_space, LENGTH_SIZE); // allocated_managed_space
+    write_length(&mut frhp, 0, LENGTH_SIZE); // dblock_alloc_iter
+    write_length(&mut frhp, p.nobjects, LENGTH_SIZE); // managed_objects_count
+    write_length(&mut frhp, 0, LENGTH_SIZE); // huge_objects_size
+    write_length(&mut frhp, 0, LENGTH_SIZE); // huge_objects_count
+    write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_size
+    write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_count
+    frhp.extend_from_slice(&p.table_width.to_le_bytes());
+    write_length(&mut frhp, p.starting_block_size, LENGTH_SIZE);
+    write_length(&mut frhp, p.max_direct_block_size, LENGTH_SIZE);
+    frhp.extend_from_slice(&p.max_heap_size.to_le_bytes());
+    frhp.extend_from_slice(&1u16.to_le_bytes()); // starting # rows in root indirect block
+    write_offset(&mut frhp, p.root_addr, OFFSET_SIZE);
+    frhp.extend_from_slice(&p.cur_rows.to_le_bytes());
+    let checksum = crate::checksum::jenkins_lookup3(&frhp);
+    frhp.extend_from_slice(&checksum.to_le_bytes());
+    frhp
 }
 
 /// Build dense attribute storage for a set of attributes.
@@ -400,9 +656,8 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     btlf.resize(node_size as usize, 0);
 
     let mut blob =
-        Vec::with_capacity(heap.frhp.len() + heap.dblock.len() + bthd.len() + btlf.len());
-    blob.extend_from_slice(&heap.frhp);
-    blob.extend_from_slice(&heap.dblock);
+        Vec::with_capacity(heap.blob.len() + bthd.len() + btlf.len());
+    blob.extend_from_slice(&heap.blob);
     blob.extend_from_slice(&bthd);
     blob.extend_from_slice(&btlf);
 
@@ -493,9 +748,8 @@ pub(crate) fn build_dense_links(links: &[LinkMessage], base_address: u64) -> Den
     btlf.resize(node_size as usize, 0);
 
     let mut blob =
-        Vec::with_capacity(heap.frhp.len() + heap.dblock.len() + bthd.len() + btlf.len());
-    blob.extend_from_slice(&heap.frhp);
-    blob.extend_from_slice(&heap.dblock);
+        Vec::with_capacity(heap.blob.len() + bthd.len() + btlf.len());
+    blob.extend_from_slice(&heap.blob);
     blob.extend_from_slice(&bthd);
     blob.extend_from_slice(&btlf);
 
