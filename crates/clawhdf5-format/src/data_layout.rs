@@ -104,7 +104,29 @@ pub fn parse_vds_mappings(
     let nused = read_length(heap_data, pos, length_size)?;
     pos += ls;
 
-    let mut mappings = Vec::with_capacity(nused as usize);
+    // `nused` is untrusted; don't pre-allocate from it. Each entry consumes at
+    // least a few bytes, so the loop is naturally bounded by the heap data and
+    // a bogus `nused` simply errors out on the first short read.
+    let mut mappings = Vec::new();
+    // Reads one self-describing selection at `pos`, returning its raw bytes and
+    // advancing past it — bounds-checked so a corrupt selection can't overrun.
+    let read_selection = |heap_data: &[u8], pos: &mut usize| -> Result<Vec<u8>, FormatError> {
+        let rest = heap_data.get(*pos..).ok_or(FormatError::UnexpectedEof {
+            expected: *pos,
+            available: heap_data.len(),
+        })?;
+        let (_, len) = Selection::decode_serialized(rest)?;
+        let bytes = rest
+            .get(..len)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: pos.saturating_add(len),
+                available: heap_data.len(),
+            })?
+            .to_vec();
+        *pos += len;
+        Ok(bytes)
+    };
+
     for _ in 0..nused {
         // Source file name (with the version-1 same-file marker handled).
         let source_file = if version >= 1 && heap_data.get(pos) == Some(&0x04) {
@@ -117,15 +139,9 @@ pub fn parse_vds_mappings(
         // Source dataset name.
         let source_dataset = read_null_terminated_string(heap_data, &mut pos)?;
 
-        // Source selection (self-describing length).
-        let (_, ssel_len) = Selection::decode_serialized(&heap_data[pos..])?;
-        let source_selection = heap_data[pos..pos + ssel_len].to_vec();
-        pos += ssel_len;
-
-        // Virtual selection.
-        let (_, vsel_len) = Selection::decode_serialized(&heap_data[pos..])?;
-        let virtual_selection = heap_data[pos..pos + vsel_len].to_vec();
-        pos += vsel_len;
+        // Source selection, then virtual selection (both self-describing length).
+        let source_selection = read_selection(heap_data, &mut pos)?;
+        let virtual_selection = read_selection(heap_data, &mut pos)?;
 
         mappings.push(VdsMapping {
             source_file,
@@ -814,5 +830,35 @@ mod tests {
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].source_file, "src_ext.h5");
         assert_eq!(mappings[0].source_dataset, "data");
+    }
+
+    #[test]
+    fn parse_vds_mappings_huge_nused_does_not_oom_or_panic() {
+        // nused = u64::MAX with no entry data: must error, not pre-allocate or
+        // overrun.
+        let mut blob = vec![0x01u8];
+        blob.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(parse_vds_mappings(&blob, 8).is_err());
+    }
+
+    #[test]
+    fn parse_vds_mappings_truncated_selection_does_not_overrun() {
+        // One entry whose source selection (ALL) is truncated to 8 of 16 bytes.
+        let blob = [
+            0x01u8, // version 1
+            0x01, 0, 0, 0, 0, 0, 0, 0, // nused = 1
+            0x04, // same-file marker
+            0x78, 0x00, // "x\0"
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, // ALL header, truncated (8 of 16 bytes)
+        ];
+        assert!(parse_vds_mappings(&blob, 8).is_err());
+    }
+
+    #[test]
+    fn parse_vds_mappings_empty_is_ok_empty() {
+        assert!(parse_vds_mappings(&[], 8).unwrap().is_empty());
+        // Header present, nused = 0.
+        let blob = [0x01u8, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(parse_vds_mappings(&blob, 8).unwrap().is_empty());
     }
 }

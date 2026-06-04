@@ -144,11 +144,29 @@ pub fn read_fixed_array_chunks(
     let elements_start = db_offset + db_header_size;
 
     let num_elements = header.num_elements as usize;
+    // A chunk index cannot describe more elements than the file has bytes (each
+    // element occupies at least `offset_size` bytes). Reject a corrupt count
+    // before it can drive a huge loop or overflow an offset computation.
+    if num_elements > file_data.len() {
+        return Err(FormatError::ChunkedReadError(
+            "Fixed Array element count exceeds file size".into(),
+        ));
+    }
     let os = offset_size as usize;
     // On-disk stride of one element. For non-filtered arrays the element is just
     // the chunk address (== offset_size); for filtered arrays it is
     // address + chunk_size + filter_mask (== header.element_size).
     let elem_stride = (header.element_size as usize).max(os);
+
+    // Absolute file offset of element `idx` within a run starting at `base`,
+    // with overflow surfaced as a clean error rather than a panic/wrap.
+    let elem_at = |base: usize, idx: usize| -> Result<usize, FormatError> {
+        idx.checked_mul(elem_stride)
+            .and_then(|o| base.checked_add(o))
+            .ok_or(FormatError::ChunkedReadError(
+                "Fixed Array element offset overflow".into(),
+            ))
+    };
 
     // Compute chunk offsets based on index.
     // Chunks are stored in row-major order within the dataset space.
@@ -189,6 +207,13 @@ pub fn read_fixed_array_chunks(
     };
 
     // A data block is paged when it holds more elements than fit in one page.
+    // `max_nelmts_bits` is an untrusted u8; a shift >= the pointer width would
+    // panic, so reject it (real page-size bits are tiny — 10 by default).
+    if header.max_nelmts_bits as u32 >= usize::BITS {
+        return Err(FormatError::ChunkedReadError(
+            "Fixed Array max_nelmts_bits too large".into(),
+        ));
+    }
     let page_nelmts = 1usize << header.max_nelmts_bits;
     let is_paged = num_elements > page_nelmts;
 
@@ -196,7 +221,7 @@ pub fn read_fixed_array_chunks(
         // Non-paged: prefix, then `num_elements` elements packed directly,
         // then a trailing checksum (which we don't validate).
         for i in 0..num_elements {
-            push_element(i, elements_start + i * elem_stride, &mut chunks)?;
+            push_element(i, elem_at(elements_start, i)?, &mut chunks)?;
         }
         return Ok(chunks);
     }
@@ -207,12 +232,18 @@ pub fn read_fixed_array_chunks(
     // only the final page holds fewer elements. Uninitialized pages (bit clear)
     // still occupy their slot on disk but are zero-filled, so the bitmap — not a
     // 0xFF sentinel — is what marks a whole page as unallocated.
+    let stride_overflow = || {
+        FormatError::ChunkedReadError("Fixed Array page offset overflow".into())
+    };
     let npages = num_elements.div_ceil(page_nelmts);
     let bitmap_size = npages.div_ceil(8);
     let bitmap_start = elements_start;
     // prefix(db_header_size) + bitmap + checksum(4)
     let pages_start = db_offset + db_header_size + bitmap_size + 4;
-    let page_stride = page_nelmts * elem_stride + 4;
+    let page_stride = page_nelmts
+        .checked_mul(elem_stride)
+        .and_then(|x| x.checked_add(4))
+        .ok_or_else(stride_overflow)?;
 
     if bitmap_start + bitmap_size > file_data.len() {
         return Err(FormatError::UnexpectedEof {
@@ -222,7 +253,7 @@ pub fn read_fixed_array_chunks(
     }
 
     for p in 0..npages {
-        let page_first = p * page_nelmts;
+        let page_first = p * page_nelmts; // < num_elements, cannot overflow
         let page_count = core::cmp::min(page_nelmts, num_elements - page_first);
 
         // Check the page-init bit (MSB-first within each byte).
@@ -232,9 +263,12 @@ pub fn read_fixed_array_chunks(
             continue; // entire page unallocated
         }
 
-        let page_off = pages_start + p * page_stride;
+        let page_off = p
+            .checked_mul(page_stride)
+            .and_then(|o| pages_start.checked_add(o))
+            .ok_or_else(stride_overflow)?;
         for e in 0..page_count {
-            push_element(page_first + e, page_off + e * elem_stride, &mut chunks)?;
+            push_element(page_first + e, elem_at(page_off, e)?, &mut chunks)?;
         }
     }
 
@@ -418,6 +452,41 @@ mod tests {
         buf[0..4].copy_from_slice(b"XXXX");
         let result = FixedArrayHeader::parse(&buf, 0, 8, 8);
         assert!(result.is_err());
+    }
+
+    /// Malformed headers must error, never panic (shift overflow, huge counts).
+    #[test]
+    fn read_rejects_oversized_max_nelmts_bits() {
+        let mut buf = vec![0u8; 512];
+        let fahd = 0x40usize;
+        buf[fahd..fahd + 4].copy_from_slice(b"FAHD");
+        buf[fahd + 4] = 0; // version
+        buf[fahd + 5] = 0; // client_id
+        buf[fahd + 6] = 8; // element_size
+        buf[fahd + 7] = 200; // max_nelmts_bits — absurd, would overflow a shift
+        buf[fahd + 8..fahd + 16].copy_from_slice(&3u64.to_le_bytes()); // num_elements
+        buf[fahd + 16..fahd + 24].copy_from_slice(&0x100u64.to_le_bytes());
+        // FADB so parsing reaches the paged check
+        let db = 0x100usize;
+        buf[db..db + 4].copy_from_slice(b"FADB");
+        let header = FixedArrayHeader::parse(&buf, fahd, 8, 8).unwrap();
+        let r = read_fixed_array_chunks(&buf, &header, &[100], &[20], 8, 8, 8);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn read_rejects_num_elements_larger_than_file() {
+        let mut buf = vec![0u8; 256];
+        let fahd = 0x40usize;
+        buf[fahd..fahd + 4].copy_from_slice(b"FAHD");
+        buf[fahd + 6] = 8;
+        buf[fahd + 7] = 10;
+        buf[fahd + 8..fahd + 16].copy_from_slice(&u64::MAX.to_le_bytes()); // absurd count
+        buf[fahd + 16..fahd + 24].copy_from_slice(&0x80u64.to_le_bytes());
+        buf[0x80..0x84].copy_from_slice(b"FADB");
+        let header = FixedArrayHeader::parse(&buf, fahd, 8, 8).unwrap();
+        let r = read_fixed_array_chunks(&buf, &header, &[100], &[20], 8, 8, 8);
+        assert!(r.is_err());
     }
 
     #[test]

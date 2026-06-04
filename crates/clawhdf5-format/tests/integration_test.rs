@@ -710,6 +710,36 @@ fn scaleoffset_float_escale_reads_as_raw() {
 }
 
 #[test]
+fn v4_virtual_dataset_cycle_errors_not_overflow() {
+    // virt -> virt2 -> virt (both virtual, same file). The reader must reject
+    // the nested virtual source rather than recurse into a stack overflow.
+    let file_data = include_bytes!("fixtures/vds_cyclic.h5");
+    let offset = find_signature(file_data).unwrap();
+    let sb = Superblock::parse(file_data, offset).unwrap();
+    let addr = resolve_path_any(file_data, &sb, "virt").unwrap();
+    let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
+    let ds = Dataspace::parse(
+        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Dataspace).unwrap().data,
+        sb.length_size,
+    )
+    .unwrap();
+    let (dt, _) = Datatype::parse(
+        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Datatype).unwrap().data,
+    )
+    .unwrap();
+    let layout = DataLayout::parse(
+        &hdr.messages.iter().find(|m| m.msg_type == MessageType::DataLayout).unwrap().data,
+        sb.offset_size,
+        sb.length_size,
+    )
+    .unwrap();
+    let r = read_raw_data_full(
+        file_data, &layout, &ds, &dt, None, sb.offset_size, sb.length_size,
+    );
+    assert!(r.is_err(), "cyclic virtual dataset must error, not overflow");
+}
+
+#[test]
 fn v4_virtual_dataset_external_file_read() {
     use clawhdf5_format::data_read::read_raw_data_full_with_resolver;
     // The virtual file maps virt[0:8] <- (external) ext_src.h5:/data = [10..17].

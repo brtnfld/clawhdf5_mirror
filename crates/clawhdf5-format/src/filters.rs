@@ -17,7 +17,7 @@ use crate::filter_pipeline::{
 pub fn decompress_chunk(
     compressed: &[u8],
     pipeline: &FilterPipeline,
-    _chunk_size: usize,
+    chunk_size: usize,
     element_size: u32,
 ) -> Result<Vec<u8>, FormatError> {
     let mut data = compressed.to_vec();
@@ -29,8 +29,10 @@ pub fn decompress_chunk(
             FILTER_LZ4 => lz4_decompress(&data)?,
             FILTER_ZSTD => zstd_decompress(&data)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
-            FILTER_SCALEOFFSET => scaleoffset_decompress(&data, &filter.client_data)?,
-            FILTER_NBIT => nbit_decompress(&data, &filter.client_data)?,
+            // `chunk_size` is the expected decompressed size; pass it so these
+            // decoders can reject an element count that would over-allocate.
+            FILTER_SCALEOFFSET => scaleoffset_decompress(&data, &filter.client_data, chunk_size)?,
+            FILTER_NBIT => nbit_decompress(&data, &filter.client_data, chunk_size)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -86,7 +88,11 @@ pub fn compress_chunk(
 /// (0 = float D-scale, 2 = integer), `[1]`=scale factor (decimal digits for
 /// D-scale), `[2]`=element count, `[4]`=element size, `[5]`=signed flag,
 /// `[6]`=byte order (1 = big-endian), `[7]`=fill defined, `[8..]`=fill value.
-fn scaleoffset_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
+fn scaleoffset_decompress(
+    data: &[u8],
+    cd: &[u32],
+    expected_bytes: usize,
+) -> Result<Vec<u8>, FormatError> {
     const H5Z_SO_FLOAT_DSCALE: u32 = 0;
     const H5Z_SO_INT: u32 = 2;
     if cd.len() < 8 {
@@ -105,6 +111,17 @@ fn scaleoffset_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatErro
     if elem_size == 0 || elem_size > 8 || (is_float && elem_size != 4 && elem_size != 8) {
         return Err(FormatError::ChunkedReadError(
             "scale-offset: unsupported element size".into(),
+        ));
+    }
+    // The decoded output must match the chunk's uncompressed size; reject an
+    // element count that would over-allocate (e.g. minbits == 0 with a huge
+    // nelmts and no packed payload to bound it).
+    let out_bytes = nelmts
+        .checked_mul(elem_size)
+        .ok_or_else(|| FormatError::ChunkedReadError("scale-offset: size overflow".into()))?;
+    if expected_bytes != 0 && out_bytes > expected_bytes {
+        return Err(FormatError::ChunkedReadError(
+            "scale-offset: element count exceeds chunk size".into(),
         ));
     }
     let signed = cd[5] == 1;
@@ -163,7 +180,14 @@ fn scaleoffset_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatErro
     };
     // The fill code (all ones) only exists when there are bits to pack.
     let has_fill_code = fill_defined && minbits > 0 && minbits < 64;
-    let fill_code: u64 = if minbits == 0 { 0 } else { (1u64 << minbits) - 1 };
+    // Computed for all 1..=64 widths; `1 << 64` would overflow, so saturate.
+    let fill_code: u64 = if minbits == 0 {
+        0
+    } else if minbits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << minbits) - 1
+    };
 
     if is_float {
         let scale = 10f64.powi(cd[1] as i32);
@@ -339,11 +363,20 @@ fn nbit_cd(cd: &[u32], i: usize) -> Result<u32, FormatError> {
         .ok_or_else(|| FormatError::ChunkedReadError("nbit: truncated client data".into()))
 }
 
+/// Maximum N-Bit type-tree nesting depth. Real types nest only a few levels;
+/// the bound stops a crafted tree from recursing into a stack overflow.
+const NBIT_MAX_DEPTH: u32 = 64;
+
 /// Parse one N-Bit type node from the client-data tree, advancing `idx`.
-fn parse_nbit_node(cd: &[u32], idx: &mut usize) -> Result<NbitNode, FormatError> {
+fn parse_nbit_node(cd: &[u32], idx: &mut usize, depth: u32) -> Result<NbitNode, FormatError> {
     const ATOMIC: u32 = 1;
     const ARRAY: u32 = 2;
     const COMPOUND: u32 = 3;
+    if depth > NBIT_MAX_DEPTH {
+        return Err(FormatError::ChunkedReadError(
+            "nbit: type tree nested too deeply".into(),
+        ));
+    }
     let class = nbit_cd(cd, *idx)?;
     match class {
         ATOMIC => {
@@ -353,7 +386,11 @@ fn parse_nbit_node(cd: &[u32], idx: &mut usize) -> Result<NbitNode, FormatError>
             let precision = nbit_cd(cd, *idx + 3)?;
             let bit_offset = nbit_cd(cd, *idx + 4)?;
             *idx += 5;
-            if size == 0 || size > 8 || precision == 0 || bit_offset + precision > (size * 8) as u32
+            let end_bit = bit_offset.checked_add(precision);
+            if size == 0
+                || size > 8
+                || precision == 0
+                || end_bit.is_none_or(|e| e > (size * 8) as u32)
             {
                 return Err(FormatError::ChunkedReadError(
                     "nbit: invalid atomic parameters".into(),
@@ -370,7 +407,7 @@ fn parse_nbit_node(cd: &[u32], idx: &mut usize) -> Result<NbitNode, FormatError>
             // class, total size, base type node
             let total = nbit_cd(cd, *idx + 1)? as usize;
             *idx += 2;
-            let base = parse_nbit_node(cd, idx)?;
+            let base = parse_nbit_node(cd, idx, depth + 1)?;
             let base_size = base.byte_size();
             if base_size == 0 || !total.is_multiple_of(base_size) {
                 return Err(FormatError::ChunkedReadError(
@@ -388,12 +425,17 @@ fn parse_nbit_node(cd: &[u32], idx: &mut usize) -> Result<NbitNode, FormatError>
             let total = nbit_cd(cd, *idx + 1)? as usize;
             let nmembers = nbit_cd(cd, *idx + 2)? as usize;
             *idx += 3;
-            let mut members = Vec::with_capacity(nmembers);
+            // Don't pre-allocate from the untrusted member count; the loop is
+            // bounded by `nbit_cd` running out of client data.
+            let mut members = Vec::new();
             for _ in 0..nmembers {
                 let moff = nbit_cd(cd, *idx)? as usize;
                 *idx += 1;
-                let node = parse_nbit_node(cd, idx)?;
-                if moff + node.byte_size() > total {
+                let node = parse_nbit_node(cd, idx, depth + 1)?;
+                if moff
+                    .checked_add(node.byte_size())
+                    .is_none_or(|end| end > total)
+                {
                     return Err(FormatError::ChunkedReadError(
                         "nbit: member exceeds compound size".into(),
                     ));
@@ -488,7 +530,7 @@ fn decode_nbit_node(
 /// (HDF5's canonical reduced-precision layout). Sign-extension of reduced
 /// precision signed integers is the datatype reader's job. Atomic floats are
 /// encoded as full-precision atomics and handled transparently.
-fn nbit_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
+fn nbit_decompress(data: &[u8], cd: &[u32], expected_bytes: usize) -> Result<Vec<u8>, FormatError> {
     if cd.len() < 4 {
         return Err(FormatError::ChunkedReadError(
             "nbit: missing filter client data".into(),
@@ -496,7 +538,7 @@ fn nbit_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
     }
     let nelmts = cd[2] as usize;
     let mut idx = 3;
-    let root = parse_nbit_node(cd, &mut idx)?;
+    let root = parse_nbit_node(cd, &mut idx, 0)?;
     let elem_size = root.byte_size();
     if elem_size == 0 {
         return Err(FormatError::ChunkedReadError(
@@ -507,6 +549,13 @@ fn nbit_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
     let total = nelmts
         .checked_mul(elem_size)
         .ok_or_else(|| FormatError::ChunkedReadError("nbit: size overflow".into()))?;
+    // The decoded output must match the chunk's uncompressed size; reject a
+    // count that would over-allocate.
+    if expected_bytes != 0 && total > expected_bytes {
+        return Err(FormatError::ChunkedReadError(
+            "nbit: element count exceeds chunk size".into(),
+        ));
+    }
     let mut out = vec![0u8; total];
     let mut br = BitReader { data, pos: 0 };
     for elem in out.chunks_exact_mut(elem_size) {
@@ -1176,7 +1225,7 @@ mod tests {
             0x02, 0x00, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc6, 0x00,
         ];
-        assert_eq!(scaleoffset_decompress(&raw, &cd).unwrap(), i32_le(&[0, 1, 2, 3]));
+        assert_eq!(scaleoffset_decompress(&raw, &cd, 0).unwrap(), i32_le(&[0, 1, 2, 3]));
     }
 
     #[test]
@@ -1188,7 +1237,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x4f, 0x79, 0xce, 0x00,
         ];
         assert_eq!(
-            scaleoffset_decompress(&raw, &cd).unwrap(),
+            scaleoffset_decompress(&raw, &cd, 0).unwrap(),
             i32_le(&[-5, -3, -1, 0, 2, 4, 7, 9])
         );
     }
@@ -1202,7 +1251,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0x00,
         ];
         let expected: Vec<u8> = (100u32..110).flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(scaleoffset_decompress(&raw, &cd).unwrap(), expected);
+        assert_eq!(scaleoffset_decompress(&raw, &cd, 0).unwrap(), expected);
     }
 
     fn as_f32(bytes: &[u8]) -> Vec<f32> {
@@ -1220,7 +1269,7 @@ mod tests {
             0x05, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x15, 0x40,
         ];
-        let got = as_f32(&scaleoffset_decompress(&raw, &cd).unwrap());
+        let got = as_f32(&scaleoffset_decompress(&raw, &cd, 0).unwrap());
         assert_eq!(got, vec![0.0, 1.0, 2.0, 3.0]);
     }
 
@@ -1232,7 +1281,7 @@ mod tests {
             0x08, 0x00, 0x00, 0x00, 0x08, 0xcd, 0xcc, 0xcc, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x64, 0xc8, 0x00,
         ];
-        let got = as_f32(&scaleoffset_decompress(&raw, &cd).unwrap());
+        let got = as_f32(&scaleoffset_decompress(&raw, &cd, 0).unwrap());
         let exp = [0.0f32, 0.1, 0.2, 0.3];
         assert_eq!(got.len(), 4);
         for (g, e) in got.iter().zip(exp.iter()) {
@@ -1246,7 +1295,7 @@ mod tests {
         let cd = [1u32, 3, 50, 1, 4, 0, 0, 1, 0];
         let raw = [0u8; 24];
         assert!(matches!(
-            scaleoffset_decompress(&raw, &cd),
+            scaleoffset_decompress(&raw, &cd, 0),
             Err(FormatError::UnsupportedFilter(FILTER_SCALEOFFSET))
         ));
     }
@@ -1265,7 +1314,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+        assert_eq!(nbit_decompress(&raw, &cd, 0).unwrap(), expected);
     }
 
     #[test]
@@ -1282,7 +1331,7 @@ mod tests {
             0x64, 0x00, 0x00, 0x00, // 0x00000064
             0x18, 0xfc, 0x00, 0x00, // 0x0000fc18
         ];
-        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+        assert_eq!(nbit_decompress(&raw, &cd, 0).unwrap(), expected);
     }
 
     #[test]
@@ -1297,7 +1346,7 @@ mod tests {
             0xe8,0x03,0x00,0x00, 0x07,0x00,0x00,0x00, // (1000, 7)
             0x00,0x80,0x00,0x00, 0xff,0x00,0x00,0x00, // (-32768, 255)
         ];
-        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+        assert_eq!(nbit_decompress(&raw, &cd, 0).unwrap(), expected);
     }
 
     #[test]
@@ -1311,7 +1360,7 @@ mod tests {
             0xff,0xff,0x00,0x00, 0x64,0x00,0x00,0x00, 0xc8,0x00,0x00,0x00, // ([-1,100], 200)
             0xe8,0x03,0x00,0x00, 0x00,0x80,0x00,0x00, 0x07,0x00,0x00,0x00, // ([1000,-32768], 7)
         ];
-        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+        assert_eq!(nbit_decompress(&raw, &cd, 0).unwrap(), expected);
     }
 
     #[test]
@@ -1328,6 +1377,72 @@ mod tests {
             0xff,0xff,0x00,0x00, 0x00,0x00,0xc0,0x3f, // (-1, 1.5)
             0x64,0x00,0x00,0x00, 0x00,0x00,0x20,0xc0, // (100, -2.5)
         ];
-        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+        assert_eq!(nbit_decompress(&raw, &cd, 0).unwrap(), expected);
+    }
+
+    // ----- Adversarial / hardening: malformed filter data must not panic -----
+
+    #[test]
+    fn scaleoffset_minbits_64_does_not_panic() {
+        // minbits == 64 previously overflowed `1u64 << minbits` computing the
+        // fill code. cd: int, nelmts=1, elem_size=8, fill_defined=1.
+        let cd = [2u32, 0, 1, 0, 8, 1, 0, 1];
+        let mut data = Vec::new();
+        data.extend_from_slice(&64u32.to_le_bytes()); // minbits = 64
+        data.push(8); // minval_width
+        data.extend_from_slice(&0i64.to_le_bytes()); // minval
+        data.extend_from_slice(&[0u8; 8]); // reserved
+        data.extend_from_slice(&[0u8; 8]); // one 64-bit code
+        // Must return a Result (Ok or Err) without panicking.
+        let _ = scaleoffset_decompress(&data, &cd, 8);
+    }
+
+    #[test]
+    fn scaleoffset_huge_nelmts_bounded_by_chunk_size() {
+        // minbits == 0 (no packed payload) with a giant nelmts must not try to
+        // allocate when the expected chunk size is small.
+        let cd = [2u32, 0, u32::MAX, 0, 4, 0, 0, 0];
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes()); // minbits = 0
+        data.push(4);
+        data.extend_from_slice(&[0u8; 4]);
+        assert!(scaleoffset_decompress(&data, &cd, 64).is_err());
+    }
+
+    #[test]
+    fn nbit_deeply_nested_array_is_rejected() {
+        // A chain of ARRAY nodes (class 2) far deeper than NBIT_MAX_DEPTH must
+        // error rather than recurse into a stack overflow. Layout per level:
+        // [class=2, total]. Terminate with a (never-reached) atomic.
+        let mut cd = vec![0u32, 0, 1]; // nparms, flag, nelmts
+        for _ in 0..500 {
+            cd.push(2); // ARRAY
+            cd.push(8); // total size
+        }
+        cd.extend_from_slice(&[1, 8, 0, 8, 0]); // atomic leaf
+        assert!(nbit_decompress(&[], &cd, 0).is_err());
+    }
+
+    #[test]
+    fn nbit_atomic_bit_offset_overflow_is_rejected() {
+        // bit_offset + precision near u32::MAX must not overflow the check.
+        let cd = [0u32, 0, 1, 1, 8, 0, u32::MAX, u32::MAX];
+        assert!(nbit_decompress(&[0u8; 8], &cd, 0).is_err());
+    }
+
+    #[test]
+    fn nbit_huge_nelmts_bounded_by_chunk_size() {
+        // Valid 1-byte atomic but an enormous element count; the expected chunk
+        // size bounds the allocation.
+        let cd = [0u32, 0, u32::MAX, 1, 1, 0, 8, 0];
+        assert!(nbit_decompress(&[0u8; 4], &cd, 16).is_err());
+    }
+
+    #[test]
+    fn scaleoffset_truncated_inputs_do_not_panic() {
+        assert!(scaleoffset_decompress(&[], &[2, 0, 1, 0, 4, 0, 0, 0], 4).is_err());
+        assert!(scaleoffset_decompress(&[0u8; 3], &[2, 0, 1, 0, 4, 0, 0, 0], 4).is_err());
+        // Missing client data entirely.
+        assert!(scaleoffset_decompress(&[0u8; 32], &[2, 0], 4).is_err());
     }
 }

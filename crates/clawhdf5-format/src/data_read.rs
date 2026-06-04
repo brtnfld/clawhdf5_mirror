@@ -554,6 +554,14 @@ fn read_named_dataset_raw(
     let dl_msg = find(MessageType::DataLayout)
         .ok_or_else(|| FormatError::ChunkedReadError("VDS source has no data layout".into()))?;
     let layout = DataLayout::parse(&dl_msg.data, sb.offset_size, sb.length_size)?;
+    // A virtual dataset whose source is itself another virtual dataset could
+    // form a cycle (A -> B -> A) and recurse into a stack overflow. Nested
+    // virtual sources are exotic and unsupported, so stop here cleanly.
+    if matches!(layout, DataLayout::Virtual { .. }) {
+        return Err(FormatError::ChunkedReadError(
+            "virtual dataset source is itself virtual (unsupported)".into(),
+        ));
+    }
     let pipeline = find(MessageType::FilterPipeline)
         .map(|m| FilterPipeline::parse(&m.data))
         .transpose()?;

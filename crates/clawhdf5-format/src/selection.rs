@@ -245,8 +245,20 @@ impl Selection {
 
         match sel_type {
             // ALL / NONE: type(4) + version(4) + reserved(4) + length(4) = 16 bytes.
-            3 => Ok((Selection::All, 16)),
-            0 => Ok((Selection::None, 16)),
+            3 | 0 => {
+                if data.len() < 16 {
+                    return Err(FormatError::UnexpectedEof {
+                        expected: 16,
+                        available: data.len(),
+                    });
+                }
+                let sel = if sel_type == 3 {
+                    Selection::All
+                } else {
+                    Selection::None
+                };
+                Ok((sel, 16))
+            }
             2 => decode_hyperslab_serialized(data, version),
             1 => Err(FormatError::ChunkedReadError(
                 "VDS point selections are not supported".into(),
@@ -274,12 +286,18 @@ impl Selection {
     /// selection. Hyperslab/point selections whose rank differs from
     /// `dims.len()` are rejected.
     pub fn iter_linear(&self, dims: &[u64]) -> Result<Vec<u64>, FormatError> {
-        let total: u64 = dims.iter().product();
+        let overflow = || FormatError::Overflow("VDS selection index overflow".into());
+        let total: u64 = dims
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(overflow)?;
         // Row-major strides: row_stride[d] = product(dims[d+1..]).
         let rank = dims.len();
         let mut row_stride = vec![1u64; rank];
         for d in (0..rank.saturating_sub(1)).rev() {
-            row_stride[d] = row_stride[d + 1] * dims[d + 1];
+            row_stride[d] = row_stride[d + 1]
+                .checked_mul(dims[d + 1])
+                .ok_or_else(overflow)?;
         }
 
         match self {
@@ -301,9 +319,14 @@ impl Selection {
                 for d in 0..rank {
                     let mut coords = Vec::new();
                     for ci in 0..count[d] {
-                        let base = start[d] + ci * stride[d];
+                        let base = ci
+                            .checked_mul(stride[d])
+                            .and_then(|o| start[d].checked_add(o))
+                            .ok_or_else(overflow)?;
                         for bi in 0..block[d] {
-                            let coord = base + bi;
+                            let coord = base.checked_add(bi).ok_or_else(overflow)?;
+                            // Anything past the extent is malformed; bail before the
+                            // coordinate list can grow without bound.
                             if coord >= dims[d] {
                                 return Err(FormatError::ChunkedReadError(
                                     "VDS hyperslab selection exceeds dataspace extent".into(),
@@ -318,13 +341,19 @@ impl Selection {
                     return Ok(Vec::new());
                 }
                 // Cartesian product in row-major order (dim 0 slowest-varying).
-                let out_len: usize = per_dim.iter().map(|c| c.len()).product();
+                let out_len: usize = per_dim
+                    .iter()
+                    .try_fold(1usize, |acc, c| acc.checked_mul(c.len()))
+                    .ok_or_else(overflow)?;
                 let mut out = Vec::with_capacity(out_len);
                 let mut idx = vec![0usize; rank];
                 loop {
                     let mut lin = 0u64;
                     for d in 0..rank {
-                        lin += per_dim[d][idx[d]] * row_stride[d];
+                        lin = per_dim[d][idx[d]]
+                            .checked_mul(row_stride[d])
+                            .and_then(|o| lin.checked_add(o))
+                            .ok_or_else(overflow)?;
                     }
                     out.push(lin);
                     // Increment the mixed-radix counter, last dimension fastest.
@@ -358,7 +387,10 @@ impl Selection {
                                 "VDS point selection exceeds dataspace extent".into(),
                             ));
                         }
-                        lin += p[d] * row_stride[d];
+                        lin = p[d]
+                            .checked_mul(row_stride[d])
+                            .and_then(|o| lin.checked_add(o))
+                            .ok_or_else(overflow)?;
                     }
                     out.push(lin);
                 }
@@ -400,6 +432,13 @@ fn decode_hyperslab_serialized(
         ));
     }
     let rank = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    // HDF5 caps dataspace rank at 32 (H5S_MAX_RANK). Reject anything larger so a
+    // corrupt rank can't drive a huge allocation or read loop.
+    if rank > 32 {
+        return Err(FormatError::ChunkedReadError(
+            "hyperslab selection rank exceeds maximum (32)".into(),
+        ));
+    }
     let mut pos = 14;
     let read_coord = |data: &[u8], pos: usize| -> Result<u64, FormatError> {
         if pos + enc_size > data.len() {
@@ -659,5 +698,46 @@ mod tests {
             block: vec![2],
         };
         assert!(sel.iter_linear(&[4, 4]).is_err());
+    }
+
+    // ----- Adversarial / hardening: malformed input must error, never panic -----
+
+    #[test]
+    fn decode_all_truncated_does_not_overrun() {
+        // ALL claims to consume 16 bytes but only 8 are present.
+        let bytes = [3u8, 0, 0, 0, 1, 0, 0, 0];
+        assert!(Selection::decode_serialized(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_hyperslab_huge_rank_rejected() {
+        // rank = 0xFFFFFFFF must not drive a giant allocation.
+        let bytes = [
+            0x02u8, 0, 0, 0, 0x03, 0, 0, 0, 0x01, 0x02, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        assert!(Selection::decode_serialized(&bytes).is_err());
+    }
+
+    #[test]
+    fn iter_linear_hyperslab_overflow_is_error() {
+        // start/stride/count near u64::MAX must not panic on multiply/add.
+        let sel = Selection::Hyperslab {
+            start: vec![u64::MAX - 1],
+            stride: vec![u64::MAX],
+            count: vec![u64::MAX],
+            block: vec![u64::MAX],
+        };
+        assert!(sel.iter_linear(&[100]).is_err());
+    }
+
+    #[test]
+    fn iter_linear_dims_product_overflow_is_error() {
+        assert!(Selection::All.iter_linear(&[u64::MAX, u64::MAX]).is_err());
+    }
+
+    #[test]
+    fn decode_empty_or_short_is_error_not_panic() {
+        assert!(Selection::decode_serialized(&[]).is_err());
+        assert!(Selection::decode_serialized(&[2, 0, 0, 0, 3, 0]).is_err());
     }
 }

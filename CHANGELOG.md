@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Robustness
+- `clawhdf5-format`: harden the readers added this cycle against malformed /
+  hostile input — they parse untrusted bytes and must return errors, never
+  panic, OOM, or recurse without bound. Fixed concrete vectors found by audit
+  and locked in with adversarial tests:
+  - **Paged Fixed Array**: `1 << max_nelmts_bits` shift overflow (a `u8` ≥ 64);
+    element/page offset multiplications now checked; element count bounded by
+    file size.
+  - **H5S selection decoder**: `ALL`/`NONE` no longer claim 16 bytes they don't
+    have; hyperslab `rank` capped at 32 (`H5S_MAX_RANK`) to stop a giant
+    allocation; `iter_linear` coordinate/stride/product arithmetic is checked.
+  - **VDS mapping parser**: no pre-allocation from the untrusted `nused`; all
+    selection slicing is bounds-checked.
+  - **scale-offset / N-Bit filters**: `1 << minbits` overflow at `minbits == 64`;
+    N-Bit `bit_offset + precision` overflow; N-Bit type-tree recursion depth
+    capped (no stack overflow from a crafted nested tree); element counts
+    bounded by the chunk's expected decompressed size so a bogus count can't
+    drive a huge allocation.
+  - **Virtual Dataset assembly**: a virtual dataset whose source is itself
+    virtual (a cycle) now errors instead of recursing into a stack overflow.
+
 ### New Features
 - `clawhdf5-agent`: **compress fixed-length string datasets** (memory text
   chunks, session summaries, ids, tags, entity/relation names, …). These were
