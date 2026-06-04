@@ -481,3 +481,41 @@ fn serde_json_minimal_parse(s: &str) -> Vec<f64> {
         .map(|v| v.trim().parse::<f64>().unwrap())
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// A_dense. Write a group with many links (dense storage) -> h5py reads all
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clawhdf5_writes_dense_group_h5py_reads() {
+    skip_if_no_python!();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dense_group.h5");
+    let path_str = path.display().to_string();
+
+    // 20 links exceeds the compact threshold (8) -> dense fractal-heap storage.
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("big");
+    for i in 0..20 {
+        g.create_dataset(&format!("dataset_{i:03}"))
+            .with_i32_data(&[i, i * 10]);
+    }
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    let script = format!(
+        r#"
+import h5py
+with h5py.File("{path_str}", "r") as f:
+    big = f["big"]
+    names = sorted(big.keys())
+    assert len(names) == 20, f"expected 20 links, got {{len(names)}}"
+    for i in range(20):
+        v = big[f"dataset_{{i:03}}"][()].tolist()
+        assert v == [i, i*10], f"link {{i}} = {{v}}"
+print("OK")
+"#
+    );
+    let out = run_python_output(&script);
+    assert_eq!(out, "OK");
+}

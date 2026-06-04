@@ -814,3 +814,42 @@ fn same_dataset_name_in_different_groups() {
         vec![3.0, 4.0]
     );
 }
+
+#[test]
+fn dense_group_links_roundtrip() {
+    // A group with more than the compact threshold (8) of links is stored
+    // densely (fractal heap + v2 B-tree). It must round-trip; a small sibling
+    // group stays compact. Names are chosen so hashes are non-trivial.
+    let mut b = FileBuilder::new();
+    let mut big = b.create_group("big");
+    for i in 0..20 {
+        big.create_dataset(&format!("dataset_{i:03}"))
+            .with_i32_data(&[i, i * 2, i * 3]);
+    }
+    b.add_group(big.finish());
+    let mut small = b.create_group("small");
+    small.create_dataset("a").with_f64_data(&[1.0]);
+    small.create_dataset("b").with_f64_data(&[2.0]);
+    b.add_group(small.finish());
+    let bytes = b.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+
+    // All 20 dense-group links resolve, with correct data.
+    let mut names = file.group("big").unwrap().datasets().unwrap();
+    names.sort();
+    assert_eq!(names.len(), 20);
+    for i in 0..20 {
+        assert_eq!(
+            file.dataset(&format!("big/dataset_{i:03}"))
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            vec![i, i * 2, i * 3],
+            "dense link {i} mismatch"
+        );
+    }
+    // The small (compact) group still works.
+    assert_eq!(file.dataset("small/a").unwrap().read_f64().unwrap(), vec![1.0]);
+    assert_eq!(file.dataset("small/b").unwrap().read_f64().unwrap(), vec![2.0]);
+}

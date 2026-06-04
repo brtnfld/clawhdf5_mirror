@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### New Features
+- `clawhdf5-format`: **write dense group link storage** (fractal heap + v2
+  B-tree). A group with more than 8 links (libhdf5's compact `max_compact`
+  default) is now written densely — its links live in a fractal heap indexed by
+  a v2 B-tree of type 5 (link-name index) referenced from the group's LinkInfo
+  message — instead of as inline Link messages. This matches libhdf5's
+  compact→dense switchover and keeps large groups out of the object header.
+  Reverse-engineered against libhdf5: link heaps use `heap_id_length` 7 /
+  `max_heap_size` 32 (vs 8 / 40 for attributes). The shared single-direct-block
+  fractal-heap builder is now parameterized and used by both dense attributes
+  and dense links. Validated end-to-end: our reader round-trips, and h5py reads
+  the dense groups we write. (Single direct block — up to ~a couple thousand
+  links per group; beyond that needs indirect blocks, still unsupported.)
+
 ### Robustness
 - `clawhdf5-format`: harden the readers added this cycle against malformed /
   hostile input — they parse untrusted bytes and must return errors, never

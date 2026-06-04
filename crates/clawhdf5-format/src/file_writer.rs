@@ -33,6 +33,11 @@ const SUPERBLOCK_SIZE: usize = 48;
 /// Threshold for switching from compact (inline) to dense attribute storage.
 const DENSE_ATTR_THRESHOLD: usize = 8;
 
+/// Threshold for switching a group from compact (inline Link messages) to dense
+/// link storage (fractal heap + v2 B-tree), matching libhdf5's default
+/// `max_compact` of 8 links.
+const DENSE_LINK_THRESHOLD: usize = 8;
+
 // ---- OH builders ----
 
 pub(crate) fn build_chunked_dataset_oh(
@@ -123,18 +128,25 @@ pub(crate) fn build_compact_dataset_oh(
 
 pub(crate) fn build_group_oh(
     links: &[LinkMessage],
+    dense_link_info: Option<&[u8]>,
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
 ) -> Vec<u8> {
     let mut w = ObjectHeaderWriter::new();
-    let mut li = Vec::new();
-    li.push(0); // version
-    li.push(0); // flags
-    li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
-    li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
-    w.add_message(MessageType::LinkInfo, li);
-    for link in links {
-        w.add_message(MessageType::Link, link.serialize(OFFSET_SIZE));
+    if let Some(li) = dense_link_info {
+        // Dense link storage: a LinkInfo pointing at the fractal heap + name
+        // B-tree, and no inline Link messages.
+        w.add_message(MessageType::LinkInfo, li.to_vec());
+    } else {
+        let mut li = Vec::new();
+        li.push(0); // version
+        li.push(0); // flags
+        li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
+        li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
+        w.add_message(MessageType::LinkInfo, li);
+        for link in links {
+            w.add_message(MessageType::Link, link.serialize(OFFSET_SIZE));
+        }
     }
     if let Some(blob) = dense_blob {
         w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
@@ -167,21 +179,36 @@ pub(crate) struct DenseAttrBlob {
     pub(crate) blob: Vec<u8>,
 }
 
-/// Build dense attribute storage for a set of attributes.
-pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -> DenseAttrBlob {
-    // Dense attrs use v3 attribute messages (adds character set encoding byte).
-    let serialized: Vec<Vec<u8>> = attrs.iter().map(|a| a.serialize_v3(LENGTH_SIZE)).collect();
+/// A single-direct-block fractal heap holding a set of serialized objects,
+/// plus the heap IDs that address them. Shared by dense attribute and dense
+/// link storage, which differ only in their v2 B-tree record layout.
+pub(crate) struct FractalHeapBlock {
+    /// Serialized fractal heap header (FRHP).
+    frhp: Vec<u8>,
+    /// Serialized root direct block (FHDB), padded to its block size.
+    dblock: Vec<u8>,
+    /// Address of the fractal heap header.
+    frhp_addr: u64,
+    /// Address where the v2 B-tree should be placed (right after the dblock).
+    btree_addr: u64,
+    /// Heap ID for each object, in input order.
+    heap_ids: Vec<Vec<u8>>,
+    /// Heap ID length (bytes).
+    heap_id_length: u16,
+}
 
-    let name_hashes: Vec<u32> = attrs
-        .iter()
-        .map(|a| crate::checksum::jenkins_lookup3(a.name.as_bytes()))
-        .collect();
-
+/// Build a single-direct-block fractal heap for `serialized` objects, laid out
+/// at `base_address`. The caller builds the matching v2 B-tree (type 5 for
+/// links, type 8 for attributes) at the returned `btree_addr`.
+pub(crate) fn build_single_block_fractal_heap(
+    serialized: &[Vec<u8>],
+    base_address: u64,
+    max_heap_size: u16,
+    heap_id_length: u16,
+) -> FractalHeapBlock {
     let os = OFFSET_SIZE as usize;
     let ls = LENGTH_SIZE as usize;
-    let max_heap_size: u16 = 40;
-    let block_offset_bytes = (max_heap_size as usize).div_ceil(8); // 5
-    let heap_id_length: u16 = 8;
+    let block_offset_bytes = (max_heap_size as usize).div_ceil(8);
     let max_direct_block_size: u64 = 65536;
 
     // Direct block layout: sig(4) + ver(1) + heap_addr(os) + block_offset(bo_bytes)
@@ -242,7 +269,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     write_length(&mut frhp, starting_block_size, LENGTH_SIZE); // managed_space_in_heap
     write_length(&mut frhp, starting_block_size, LENGTH_SIZE); // allocated_managed_space
     write_length(&mut frhp, 0, LENGTH_SIZE); // dblock_alloc_iter
-    write_length(&mut frhp, attrs.len() as u64, LENGTH_SIZE); // managed_objects_count
+    write_length(&mut frhp, serialized.len() as u64, LENGTH_SIZE); // managed_objects_count
     write_length(&mut frhp, 0, LENGTH_SIZE); // huge_objects_size
     write_length(&mut frhp, 0, LENGTH_SIZE); // huge_objects_count
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_size
@@ -270,10 +297,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     debug_assert_eq!(dblock.len(), dblock_header_size);
 
     // Data area starts after header
-    let mut attr_offsets: Vec<(u64, u64)> = Vec::with_capacity(attrs.len());
-    for s in &serialized {
+    let mut obj_offsets: Vec<(u64, u64)> = Vec::with_capacity(serialized.len());
+    for s in serialized {
         let offset_in_heap = dblock.len() as u64;
-        attr_offsets.push((offset_in_heap, s.len() as u64));
+        obj_offsets.push((offset_in_heap, s.len() as u64));
         dblock.extend_from_slice(s);
     }
 
@@ -286,10 +313,40 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     debug_assert_eq!(dblock.len(), starting_block_size as usize);
 
     // Build heap IDs
-    let heap_ids: Vec<Vec<u8>> = attr_offsets
+    let heap_ids: Vec<Vec<u8>> = obj_offsets
         .iter()
         .map(|(off, len)| encode_managed_id(*off, *len, max_heap_size, heap_id_length))
         .collect();
+
+    FractalHeapBlock {
+        frhp,
+        dblock,
+        frhp_addr,
+        btree_addr,
+        heap_ids,
+        heap_id_length,
+    }
+}
+
+/// Build dense attribute storage for a set of attributes.
+pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -> DenseAttrBlob {
+    // Dense attrs use v3 attribute messages (adds character set encoding byte).
+    let serialized: Vec<Vec<u8>> = attrs.iter().map(|a| a.serialize_v3(LENGTH_SIZE)).collect();
+
+    let name_hashes: Vec<u32> = attrs
+        .iter()
+        .map(|a| crate::checksum::jenkins_lookup3(a.name.as_bytes()))
+        .collect();
+
+    let os = OFFSET_SIZE as usize;
+    let ls = LENGTH_SIZE as usize;
+
+    // Attribute heaps use max_heap_size 40 / heap ID length 8 (matching libhdf5).
+    let heap = build_single_block_fractal_heap(&serialized, base_address, 40, 8);
+    let frhp_addr = heap.frhp_addr;
+    let btree_addr = heap.btree_addr;
+    let heap_id_length = heap.heap_id_length;
+    let heap_ids = &heap.heap_ids;
 
     // Build B-tree v2 type 8 records (17 bytes each)
     let record_size: u16 = heap_id_length + 1 + 4 + 4;
@@ -342,9 +399,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // Pad to node_size
     btlf.resize(node_size as usize, 0);
 
-    let mut blob = Vec::with_capacity(frhp.len() + dblock.len() + bthd.len() + btlf.len());
-    blob.extend_from_slice(&frhp);
-    blob.extend_from_slice(&dblock);
+    let mut blob =
+        Vec::with_capacity(heap.frhp.len() + heap.dblock.len() + bthd.len() + btlf.len());
+    blob.extend_from_slice(&heap.frhp);
+    blob.extend_from_slice(&heap.dblock);
     blob.extend_from_slice(&bthd);
     blob.extend_from_slice(&btlf);
 
@@ -354,6 +412,108 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
         attr_info_message: attr_info,
         blob,
     }
+}
+
+// ---- Dense link blob ----
+
+/// Pre-built dense link storage (fractal heap + B-tree v2 + link-info message).
+pub(crate) struct DenseLinkBlob {
+    /// Serialized LinkInfo message (to embed in the group's object header).
+    pub(crate) link_info_message: Vec<u8>,
+    /// The combined fractal heap header + direct block + B-tree v2 bytes.
+    pub(crate) blob: Vec<u8>,
+}
+
+/// Build dense link storage for a group's links, laid out at `base_address`.
+///
+/// Mirrors [`build_dense_attrs`]: each link is stored as a serialized Link
+/// message in a single-direct-block fractal heap, indexed by a v2 B-tree of
+/// **type 5** (link-name index, record = name hash + heap ID). The returned
+/// LinkInfo message points at the heap and the name B-tree.
+pub(crate) fn build_dense_links(links: &[LinkMessage], base_address: u64) -> DenseLinkBlob {
+    let serialized: Vec<Vec<u8>> = links.iter().map(|l| l.serialize(OFFSET_SIZE)).collect();
+    let name_hashes: Vec<u32> = links
+        .iter()
+        .map(|l| crate::checksum::jenkins_lookup3(l.name.as_bytes()))
+        .collect();
+
+    let os = OFFSET_SIZE as usize;
+    let ls = LENGTH_SIZE as usize;
+
+    // libhdf5's link heap uses max_heap_size 32 / heap ID length 7 (vs 40/8 for
+    // attributes), giving a 7-byte heap ID and an 11-byte type-5 record.
+    let heap = build_single_block_fractal_heap(&serialized, base_address, 32, 7);
+    let heap_id_length = heap.heap_id_length;
+
+    // B-tree v2 type 5 records: hash(4) + heap_id(heap_id_length). The B-tree
+    // search key is the name hash, so records are sorted by (hash, order).
+    let record_size: u16 = 4 + heap_id_length;
+    let mut records: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(links.len());
+    for (i, heap_id) in heap.heap_ids.iter().enumerate() {
+        let mut rec = Vec::with_capacity(record_size as usize);
+        rec.extend_from_slice(&name_hashes[i].to_le_bytes()); // hash
+        rec.extend_from_slice(heap_id); // heap ID
+        records.push((name_hashes[i], i as u32, rec));
+    }
+    records.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let bthd_size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4;
+    let num_records = links.len();
+    let btlf_size = 4 + 1 + 1 + (num_records * record_size as usize) + 4;
+    let node_size = btlf_size.next_power_of_two().max(512) as u32;
+
+    let bthd_addr = heap.btree_addr;
+    let btlf_addr = bthd_addr + bthd_size as u64;
+
+    let mut bthd = Vec::with_capacity(bthd_size);
+    bthd.extend_from_slice(b"BTHD");
+    bthd.push(0); // version
+    bthd.push(5); // type = link name index
+    bthd.extend_from_slice(&node_size.to_le_bytes());
+    bthd.extend_from_slice(&record_size.to_le_bytes());
+    bthd.extend_from_slice(&0u16.to_le_bytes()); // depth = 0 (single leaf)
+    bthd.push(100); // split_percent
+    bthd.push(40); // merge_percent
+    write_offset(&mut bthd, btlf_addr, OFFSET_SIZE);
+    bthd.extend_from_slice(&(num_records as u16).to_le_bytes());
+    write_length(&mut bthd, num_records as u64, LENGTH_SIZE);
+    let bthd_checksum = crate::checksum::jenkins_lookup3(&bthd);
+    bthd.extend_from_slice(&bthd_checksum.to_le_bytes());
+    debug_assert_eq!(bthd.len(), bthd_size);
+
+    let mut btlf = Vec::with_capacity(node_size as usize);
+    btlf.extend_from_slice(b"BTLF");
+    btlf.push(0); // version
+    btlf.push(5); // type
+    for (_, _, rec) in &records {
+        btlf.extend_from_slice(rec);
+    }
+    let btlf_checksum = crate::checksum::jenkins_lookup3(&btlf);
+    btlf.extend_from_slice(&btlf_checksum.to_le_bytes());
+    btlf.resize(node_size as usize, 0);
+
+    let mut blob =
+        Vec::with_capacity(heap.frhp.len() + heap.dblock.len() + bthd.len() + btlf.len());
+    blob.extend_from_slice(&heap.frhp);
+    blob.extend_from_slice(&heap.dblock);
+    blob.extend_from_slice(&bthd);
+    blob.extend_from_slice(&btlf);
+
+    DenseLinkBlob {
+        link_info_message: serialize_link_info(heap.frhp_addr, bthd_addr),
+        blob,
+    }
+}
+
+/// Serialize a LinkInfo message (version 0, no creation-order index) pointing
+/// at a fractal heap and a v2 B-tree name index.
+fn serialize_link_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.push(0); // version
+    data.push(0x00); // flags: no creation-order tracking
+    write_offset(&mut data, fh_addr, OFFSET_SIZE);
+    write_offset(&mut data, btree_name_addr, OFFSET_SIZE);
+    data
 }
 
 fn encode_managed_id(offset: u64, length: u64, max_heap_size: u16, id_length: u16) -> Vec<u8> {
@@ -599,6 +759,18 @@ impl FileWriter {
             .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
             .collect();
 
+        // Dense link decision: a group with more than the compact threshold of
+        // links stores them in a fractal heap + v2 B-tree instead of inline.
+        let root_link_count = root_ds_indices.len() + groups.len();
+        let root_links_dense = root_link_count > DENSE_LINK_THRESHOLD;
+        let group_links_dense: Vec<bool> = groups
+            .iter()
+            .map(|g| g.ds_indices.len() > DENSE_LINK_THRESHOLD)
+            .collect();
+        // The dense LinkInfo message is a fixed size regardless of address, so a
+        // dummy is sufficient for OH size computation.
+        let dummy_link_info = serialize_link_info(0, 0);
+
         // Pass 1: compute OH sizes with dummy addresses
         let group_oh_sizes: Vec<usize> = groups
             .iter()
@@ -609,12 +781,9 @@ impl FileWriter {
                     .iter()
                     .map(|&i| make_link(&all_ds[i].name, 0))
                     .collect();
-                if group_dense[gi] {
-                    let dummy_blob = build_dense_attrs(&g.attrs, 0);
-                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob)).len()
-                } else {
-                    build_group_oh(&dummy_links, &g.attrs, None).len()
-                }
+                let attr_blob = group_dense[gi].then(|| build_dense_attrs(&g.attrs, 0));
+                let dl = group_links_dense[gi].then_some(dummy_link_info.as_slice());
+                build_group_oh(&dummy_links, dl, &g.attrs, attr_blob.as_ref()).len()
             })
             .collect();
 
@@ -628,11 +797,10 @@ impl FileWriter {
             }
             links
         };
-        let root_oh_size = if root_dense {
-            let dummy_blob = build_dense_attrs(&root_attrs, 0);
-            build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob)).len()
-        } else {
-            build_group_oh(&root_dummy_links, &root_attrs, None).len()
+        let root_oh_size = {
+            let attr_blob = root_dense.then(|| build_dense_attrs(&root_attrs, 0));
+            let dl = root_links_dense.then_some(dummy_link_info.as_slice());
+            build_group_oh(&root_dummy_links, dl, &root_attrs, attr_blob.as_ref()).len()
         };
 
         struct DataBlob {
@@ -720,6 +888,17 @@ impl FileWriter {
         let root_group_addr = SUPERBLOCK_SIZE as u64;
         let mut cursor2 = SUPERBLOCK_SIZE + root_oh_size;
 
+        // Each group is laid out as: object header, then (if dense) its link
+        // blob, then (if dense) its attribute blob. Link blobs are sized with
+        // dummy target addresses here — link message size is address-independent
+        // — and rebuilt with real addresses in the final pass.
+        let root_link_blob_addr = if root_links_dense {
+            let addr = cursor2 as u64;
+            cursor2 += build_dense_links(&root_dummy_links, addr).blob.len();
+            Some(addr)
+        } else {
+            None
+        };
         let root_dense_blob = if root_dense {
             let blob = build_dense_attrs(&root_attrs, cursor2 as u64);
             cursor2 += blob.blob.len();
@@ -728,6 +907,7 @@ impl FileWriter {
             None
         };
 
+        let mut group_link_blob_addrs: Vec<Option<u64>> = Vec::new();
         let mut group_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
         let group_addrs2: Vec<u64> = group_oh_sizes
             .iter()
@@ -735,6 +915,18 @@ impl FileWriter {
             .map(|(gi, &sz)| {
                 let addr = cursor2 as u64;
                 cursor2 += sz;
+                if group_links_dense[gi] {
+                    let dummy_links: Vec<LinkMessage> = groups[gi]
+                        .ds_indices
+                        .iter()
+                        .map(|&i| make_link(&all_ds[i].name, 0))
+                        .collect();
+                    let blob_addr = cursor2 as u64;
+                    cursor2 += build_dense_links(&dummy_links, blob_addr).blob.len();
+                    group_link_blob_addrs.push(Some(blob_addr));
+                } else {
+                    group_link_blob_addrs.push(None);
+                }
                 if group_dense[gi] {
                     let blob = build_dense_attrs(&groups[gi].attrs, cursor2 as u64);
                     cursor2 += blob.blob.len();
@@ -868,27 +1060,41 @@ impl FileWriter {
         for (gi, g) in groups.iter().enumerate() {
             root_links.push(make_link(&g.name, group_addrs2[gi]));
         }
+        // Rebuild the root link blob with real target addresses (same size as
+        // the dummy used for layout); its LinkInfo goes in the OH.
+        let root_link_blob = root_link_blob_addr.map(|addr| build_dense_links(&root_links, addr));
+        let root_dl = root_link_blob.as_ref().map(|b| b.link_info_message.as_slice());
         buf.extend_from_slice(&build_group_oh(
             &root_links,
+            root_dl,
             &root_attrs,
             root_dense_blob.as_ref(),
         ));
+        if let Some(ref b) = root_link_blob {
+            buf.extend_from_slice(&b.blob);
+        }
         if let Some(ref blob) = root_dense_blob {
             buf.extend_from_slice(&blob.blob);
         }
 
-        // Group OHs + dense blobs
+        // Group OHs + dense blobs (link blob, then attr blob, matching pass 2)
         for (gi, g) in groups.iter().enumerate() {
             let links: Vec<LinkMessage> = g
                 .ds_indices
                 .iter()
                 .map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i]))
                 .collect();
+            let link_blob = group_link_blob_addrs[gi].map(|addr| build_dense_links(&links, addr));
+            let dl = link_blob.as_ref().map(|b| b.link_info_message.as_slice());
             buf.extend_from_slice(&build_group_oh(
                 &links,
+                dl,
                 &g.attrs,
                 group_dense_blobs[gi].as_ref(),
             ));
+            if let Some(ref b) = link_blob {
+                buf.extend_from_slice(&b.blob);
+            }
             if let Some(ref blob) = group_dense_blobs[gi] {
                 buf.extend_from_slice(&blob.blob);
             }
