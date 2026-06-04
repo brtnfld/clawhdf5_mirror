@@ -895,6 +895,7 @@ fn convert_to_f64(
                 Ok(v as f64)
             }
             8 => Ok(read_f64_bytes(bytes, order)),
+            2 => Ok(read_f16_bytes(bytes, order) as f64),
             _ => Err(FormatError::DataSizeMismatch {
                 expected: 8,
                 actual: *size as usize,
@@ -1038,6 +1039,9 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
             }
             Datatype::FloatingPoint { size: 8, .. } => {
                 result.push(read_f64_bytes(chunk, &order) as f32);
+            }
+            Datatype::FloatingPoint { size: 2, .. } => {
+                result.push(read_f16_bytes(chunk, &order));
             }
             Datatype::FixedPoint {
                 signed: true,
@@ -1490,6 +1494,53 @@ fn read_f64_bytes(bytes: &[u8], order: &DatatypeByteOrder) -> f64 {
     f64::from_le_bytes(buf)
 }
 
+/// Decode an IEEE-754 half-precision (binary16) value to `f32`. Pure integer
+/// bit manipulation (no_std-safe, no `powi`/`libm`).
+fn read_f16_bytes(bytes: &[u8], order: &DatatypeByteOrder) -> f32 {
+    let mut buf = [0u8; 2];
+    let len = bytes.len().min(2);
+    match order {
+        DatatypeByteOrder::BigEndian => {
+            for i in 0..len {
+                buf[i] = bytes[len - 1 - i];
+            }
+        }
+        _ => buf[..len].copy_from_slice(&bytes[..len]),
+    }
+    f16_bits_to_f32(u16::from_le_bytes(buf))
+}
+
+/// Convert the bit pattern of an IEEE-754 half (binary16) to an `f32`.
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let h = h as u32;
+    let sign = (h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign // signed zero
+        } else {
+            // Subnormal: normalize into an f32 normal.
+            let mut e: i32 = -1;
+            let mut m = mant;
+            loop {
+                e += 1;
+                m <<= 1;
+                if m & 0x400 != 0 {
+                    break;
+                }
+            }
+            let m = m & 0x3ff;
+            sign | (((127 - 15 - e) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (mant << 13) // inf / NaN
+    } else {
+        sign | ((exp + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
 fn read_f32_bytes(bytes: &[u8], order: &DatatypeByteOrder) -> f32 {
     let mut buf = [0u8; 4];
     let len = bytes.len().min(4);
@@ -1665,6 +1716,48 @@ mod tests {
     use super::*;
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{CharacterSet, StringPadding};
+
+    fn f16_datatype() -> Datatype {
+        Datatype::FloatingPoint {
+            size: 2,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 16,
+            exponent_location: 10,
+            exponent_size: 5,
+            mantissa_location: 0,
+            mantissa_size: 10,
+            exponent_bias: 15,
+        }
+    }
+
+    // IEEE-754 half bit patterns for known values.
+    fn f16_bits(v: f32) -> u16 {
+        // Encode a few exact values used by the test.
+        match v {
+            x if x == 0.0 => 0x0000,
+            x if x == 1.0 => 0x3c00,
+            x if x == -2.0 => 0xc000,
+            x if x == 0.5 => 0x3800,
+            x if x == 65504.0 => 0x7bff, // f16 max
+            _ => panic!("unsupported test value {v}"),
+        }
+    }
+
+    #[test]
+    fn read_f16_as_f32_and_f64() {
+        let values = [0.0f32, 1.0, -2.0, 0.5, 65504.0];
+        let raw: Vec<u8> = values
+            .iter()
+            .flat_map(|&v| f16_bits(v).to_le_bytes())
+            .collect();
+        let dt = f16_datatype();
+        let got32 = read_as_f32(&raw, &dt).unwrap();
+        assert_eq!(got32, values);
+        let got64 = read_as_f64(&raw, &dt).unwrap();
+        let expect64: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+        assert_eq!(got64, expect64);
+    }
 
     fn reduced_int(signed: bool, precision: u16) -> Datatype {
         Datatype::FixedPoint {

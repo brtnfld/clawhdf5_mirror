@@ -3,6 +3,24 @@
 ## Unreleased
 
 ### New Features
+- `clawhdf5-migrate`: substantial engine improvements:
+  - **Real content validation** — the post-migration check now reads the written
+    HDF5 back and compares actual content (chunk text, embeddings, and every
+    session/entity/relation field) against the source, not just row counts. A
+    representative sample of chunk rows is verified by default; `--validate-full`
+    checks every row. A corrupt migration that preserves counts no longer passes.
+  - **Configurable schema** — table names are no longer hardcoded; queries are
+    built from a `SchemaConfig` (table + ordered column names, defaulting to the
+    ZeroClaw layout) with `--chunks-table` / `--sessions-table` /
+    `--entities-table` / `--relations-table` overrides.
+  - **Streaming count pass** — `--dry-run` now does a `COUNT(*)`-only pass per
+    table instead of loading every row into memory.
+  - **Incremental migration** — `--incremental` reads the existing output, reads
+    only source chunks newer than the last migrated id, and appends them
+    (refreshing the metadata groups), instead of re-migrating everything.
+- `clawhdf5-format`: read **IEEE-754 half-precision (f16)** floats. `read_as_f32`
+  / `read_as_f64` previously only handled 4- and 8-byte floats; 2-byte floats
+  (e.g. float16-stored embeddings) now decode via a no_std-safe bit conversion.
 - `clawhdf5-format`: **write multi-block fractal heaps** (root indirect block).
   Dense attribute and dense link storage previously capped at a single direct
   block (~64 KiB of heap data — a few thousand attributes/links). When the
