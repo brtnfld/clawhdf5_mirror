@@ -51,3 +51,8 @@ merkle = ["sha2", "blake3", "k12"]
 name = "parallel_decompress_bench"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "hash_bench"
+harness = false
+required-features = ["merkle"]

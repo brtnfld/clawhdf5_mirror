@@ -300,6 +300,21 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 raw_data: raw,
             }
         }
+        AttrValue::Bytes(data) => {
+            // Store as opaque binary data (1D array of uint8)
+            AttributeMessage {
+                name: name.to_string(),
+                datatype: Datatype::FixedPoint {
+                    size: 1,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    signed: false,
+                    bit_offset: 0,
+                    bit_precision: 8,
+                },
+                dataspace: simple_1d(data.len() as u64),
+                raw_data: data.clone(),
+            }
+        }
     }
 }
 
@@ -333,6 +348,8 @@ pub enum AttrValue {
     U64(u64),
     String(String),
     StringArray(Vec<String>),
+    /// Raw binary data (opaque byte array).
+    Bytes(Vec<u8>),
 }
 
 // ---- Dataset builder ----

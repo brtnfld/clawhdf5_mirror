@@ -1,0 +1,54 @@
+{
+  "description": "Merkle tree test vectors for clawhdf5",
+  "specification": "§5.5 Domain-separated Merkle trees",
+  "domain_separation": {
+    "leaf_prefix": "0x00",
+    "internal_prefix": "0x01",
+    "null_prefix": "0x02"
+  },
+  "single_leaf_blake3": {
+    "input": "single leaf data",
+    "leaf_hash": "49b4c27dbfa1bb5fd1088c79ec66367377e3275e36363df4a598fc0c61820ba9",
+    "root": "49b4c27dbfa1bb5fd1088c79ec66367377e3275e36363df4a598fc0c61820ba9",
+    "note": "For single-leaf tree, root equals leaf hash"
+  },
+  "two_leaf_blake3": {
+    "inputs": ["leaf zero", "leaf one"],
+    "leaf_hashes": [
+      "e44cff2db506ad3a6ac699d9fe494d55d654b5f9e001c0d15d9a9b83ff0ab508",
+      "781d891aea5193d219db3fa9ac719acfa7de8f1a0a5cefedbbbe71871fc09af0"
+    ],
+    "root": "609e5e93238d9d06bcd2c13bacaf8cd82ee62cf2f0e191c60e50b7100b5973f8",
+    "computation": "H(0x01 || leaf0 || leaf1)"
+  },
+  "eight_leaf_blake3": {
+    "inputs": ["L\\x00", "L\\x01", "L\\x02", "L\\x03", "L\\x04", "L\\x05", "L\\x06", "L\\x07"],
+    "leaf_hashes": [
+      "746a418eaca78abd6452253fcefae4498ae66ea7fd86d60e7ff717b9acf55728",
+      "f3634800f1ef7dfad40e9a6f5a71b56f83f5cd1e1a4f65241c0fe0dd62ee5018",
+      "efe2406dc57b8e4a81068bedef4a3dbb79a9f35bc9a806dcbd2f89629c668022",
+      "bf740f54a2c65b5aea81f95fb72a6389c5764fc1adbff72287c4a93d986f3ba8",
+      "a8a1d5eb32c8554e0a07c5097e3cfa24e084806b0988c9fd5691620a7a6e877d",
+      "945fab662d81381ad8f4c6d7ba669744d616736d25840298e9ee9cae9643ad6b",
+      "09839567769b9d086cc6021b7b11177f50f8afb6017d32f0693968c56ab03d4e",
+      "18b443941fd09dce2465b66388da2fedf5e74c07c0f8670093f3ae0033334164"
+    ],
+    "internal_nodes": {
+      "n3_H(L0,L1)": "71d57bb98a2fd09e0c803d4e5031d36a211ec314b86a33d419d8d68f106cd289",
+      "n4_H(L2,L3)": "abea98fcad733ed215e8626b92d88530176f618b92b4b9459a87effc91ca122a",
+      "n5_H(L4,L5)": "b79c68e48500d01e522068f186507f39f6ad18efbfca1b7bc253a94f9aaffed6",
+      "n6_H(L6,L7)": "97828c33e46e97c15ff78791b9eceb79a2ff9b70399b7c163f2de6272521cdad",
+      "n1_H(n3,n4)": "55d2b47c5f09e02ab4930a8e98a66084bae3e17158a61b4a997df6c5f19a170f",
+      "n2_H(n5,n6)": "58b638e25fd4f9d28c4d55018a818e900a70c5f3d29b43fbafc5929f33be5757"
+    },
+    "root": "67eb95678d8bf3c4e6e2fe399cc87212cfd64da2b5ebb5f6850d903ea3ef5561"
+  },
+  "two_leaf_sha256": {
+    "inputs": ["leaf zero", "leaf one"],
+    "leaf_hashes": [
+      "98c778b30f68619a76a5e449ba5f0175e963bf8bc6a2af901a581dd609df7836",
+      "b2d4977ce9e64c95f098c8f295c36bbbf38a5d2008246d1943fa618251464f47"
+    ],
+    "root": "b172059d59fc0d851a969a0731387faeb3b39705b5475ba7a1673704c2bdec58"
+  }
+}

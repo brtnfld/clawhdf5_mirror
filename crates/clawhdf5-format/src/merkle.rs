@@ -705,6 +705,184 @@ fn hash_chunk_k12(_data: &[u8]) -> [u8; HASH_SIZE] {
 }
 
 // ============================================================================
+// HDF5 Merkle Attribute Support
+// ============================================================================
+
+/// Algorithm identifier bytes for the merkle_root attribute.
+const ALG_ID_SHA256: u8 = 0x00;
+const ALG_ID_BLAKE3: u8 = 0x01;
+const ALG_ID_K12: u8 = 0x02;
+
+/// Domain separator for companion integrity hash.
+const INTEGRITY_PREFIX: u8 = 0x03;
+
+/// Size of the packed merkle_root attribute (root + alg_id + integrity).
+pub const MERKLE_ATTR_SIZE: usize = HASH_SIZE + 1 + HASH_SIZE; // 65 bytes
+
+/// Name of the HDF5 attribute storing merkle root information.
+pub const MERKLE_ATTR_NAME: &str = "merkle_root";
+
+impl HashAlg {
+    /// Get the algorithm identifier byte for serialization.
+    #[inline]
+    #[must_use]
+    pub const fn to_id(self) -> u8 {
+        match self {
+            HashAlg::Sha256 => ALG_ID_SHA256,
+            HashAlg::Blake3 => ALG_ID_BLAKE3,
+            HashAlg::K12 => ALG_ID_K12,
+        }
+    }
+
+    /// Parse an algorithm identifier byte.
+    ///
+    /// Returns `None` for unknown algorithm IDs.
+    #[inline]
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            ALG_ID_SHA256 => Some(HashAlg::Sha256),
+            ALG_ID_BLAKE3 => Some(HashAlg::Blake3),
+            ALG_ID_K12 => Some(HashAlg::K12),
+            _ => None,
+        }
+    }
+}
+
+/// Packed merkle root attribute data.
+///
+/// Layout (65 bytes total):
+/// - Bytes 0-31: Root hash (32 bytes)
+/// - Byte 32: Algorithm identifier (1 byte)
+/// - Bytes 33-64: Companion integrity hash (32 bytes)
+///
+/// The companion integrity hash is `H(0x03 || root || alg_id)` and prevents
+/// an attacker from modifying the algorithm ID without detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleAttr {
+    /// The Merkle tree root hash.
+    pub root: [u8; HASH_SIZE],
+    /// The hash algorithm used.
+    pub algorithm: HashAlg,
+    /// Companion integrity hash binding root and algorithm.
+    pub integrity: [u8; HASH_SIZE],
+}
+
+impl MerkleAttr {
+    /// Create a new merkle attribute from a tree.
+    ///
+    /// Computes the companion integrity hash as `H(0x03 || root || alg_id)`.
+    #[must_use]
+    pub fn from_tree(tree: &MerkleTree) -> Self {
+        let root = *tree.root();
+        let algorithm = tree.algorithm();
+        let integrity = Self::compute_integrity(&root, algorithm);
+
+        Self {
+            root,
+            algorithm,
+            integrity,
+        }
+    }
+
+    /// Compute the companion integrity hash.
+    ///
+    /// This binds the root hash and algorithm ID together, preventing
+    /// an attacker from changing the algorithm without detection.
+    fn compute_integrity(root: &[u8; HASH_SIZE], alg: HashAlg) -> [u8; HASH_SIZE] {
+        let mut data = [0u8; 1 + HASH_SIZE + 1];
+        data[0] = INTEGRITY_PREFIX;
+        data[1..HASH_SIZE + 1].copy_from_slice(root);
+        data[HASH_SIZE + 1] = alg.to_id();
+        alg.hash_raw(&data)
+    }
+
+    /// Pack the attribute into a 65-byte binary blob.
+    #[must_use]
+    pub fn pack(&self) -> [u8; MERKLE_ATTR_SIZE] {
+        let mut buf = [0u8; MERKLE_ATTR_SIZE];
+        buf[0..HASH_SIZE].copy_from_slice(&self.root);
+        buf[HASH_SIZE] = self.algorithm.to_id();
+        buf[HASH_SIZE + 1..].copy_from_slice(&self.integrity);
+        buf
+    }
+
+    /// Unpack from a 65-byte binary blob.
+    ///
+    /// Returns `None` if:
+    /// - The data is not exactly 65 bytes
+    /// - The algorithm ID is unknown
+    /// - The integrity hash does not match
+    #[must_use]
+    pub fn unpack(data: &[u8]) -> Option<Self> {
+        if data.len() != MERKLE_ATTR_SIZE {
+            return None;
+        }
+
+        let mut root = [0u8; HASH_SIZE];
+        root.copy_from_slice(&data[0..HASH_SIZE]);
+
+        let alg_id = data[HASH_SIZE];
+        let algorithm = HashAlg::from_id(alg_id)?;
+
+        let mut integrity = [0u8; HASH_SIZE];
+        integrity.copy_from_slice(&data[HASH_SIZE + 1..]);
+
+        // Verify integrity hash
+        let expected_integrity = Self::compute_integrity(&root, algorithm);
+        if !constant_time_eq(&integrity, &expected_integrity) {
+            return None;
+        }
+
+        Some(Self {
+            root,
+            algorithm,
+            integrity,
+        })
+    }
+
+    /// Verify that a Merkle tree matches this attribute.
+    #[must_use]
+    pub fn verify_tree(&self, tree: &MerkleTree) -> bool {
+        tree.algorithm() == self.algorithm && constant_time_eq(tree.root(), &self.root)
+    }
+}
+
+/// Write the merkle_root attribute to a dataset.
+///
+/// Packs the root hash (32 bytes), algorithm identifier (1 byte), and
+/// companion integrity hash (32 bytes) into a fixed-width 65-byte binary
+/// blob and writes it as the HDF5 attribute `merkle_root`.
+///
+/// # Arguments
+///
+/// * `dataset` - The dataset builder to add the attribute to
+/// * `tree` - The Merkle tree to store
+///
+/// # Example
+///
+/// ```ignore
+/// use clawhdf5_format::merkle::{MerkleTree, HashAlg, write_merkle_attr};
+/// use clawhdf5_format::file_writer::FileWriter;
+///
+/// let chunks: Vec<&[u8]> = vec![&[1, 2, 3], &[4, 5, 6]];
+/// let tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
+///
+/// let mut fw = FileWriter::new();
+/// let ds = fw.create_dataset("data");
+/// ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
+/// write_merkle_attr(ds, &tree);
+/// ```
+pub fn write_merkle_attr(
+    dataset: &mut crate::type_builders::DatasetBuilder,
+    tree: &MerkleTree,
+) {
+    let attr = MerkleAttr::from_tree(tree);
+    let packed = attr.pack();
+    dataset.set_attr(MERKLE_ATTR_NAME, crate::type_builders::AttrValue::Bytes(packed.to_vec()));
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1071,5 +1249,276 @@ mod tests {
 
         // The leaf hash includes the 0x00 prefix, so it should differ
         assert_ne!(leaf_hash, raw_hash);
+    }
+
+    // =========================================================================
+    // §5.5 Specification Tests: Manual verification of tree structure
+    // =========================================================================
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_single_leaf_root_equals_leaf_hash() {
+        // For a single-leaf tree, the root must equal the leaf hash directly.
+        // No internal hashing should occur.
+        let alg = HashAlg::Blake3;
+
+        // Create a leaf hash
+        let leaf_data = b"single leaf data";
+        let leaf_hash = alg.hash_leaf(leaf_data);
+
+        // Build tree from the single pre-hashed leaf
+        let tree = MerkleTree::build(&[leaf_hash], alg).expect("build should succeed");
+
+        // Root must equal the leaf hash exactly
+        assert_eq!(
+            tree.root(),
+            &leaf_hash,
+            "Single-leaf tree root must equal the leaf hash"
+        );
+
+        // Verify tree structure
+        assert_eq!(tree.leaf_count(), 1);
+        assert_eq!(tree.padded_leaf_count(), 1);
+        assert_eq!(tree.depth(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_two_leaf_tree_manual_verification() {
+        // For a two-leaf tree, manually compute the root as:
+        // root = H(0x01 || leaf0 || leaf1)
+        let alg = HashAlg::Blake3;
+
+        // Create two distinct leaf hashes
+        let leaf0 = alg.hash_leaf(b"leaf zero");
+        let leaf1 = alg.hash_leaf(b"leaf one");
+
+        // Build tree from the two leaves
+        let tree = MerkleTree::build(&[leaf0, leaf1], alg).expect("build should succeed");
+
+        // Manually compute expected root: H(0x01 || leaf0 || leaf1)
+        let mut combined = [0u8; 1 + HASH_SIZE * 2];
+        combined[0] = INTERNAL_PREFIX; // 0x01
+        combined[1..HASH_SIZE + 1].copy_from_slice(&leaf0);
+        combined[HASH_SIZE + 1..].copy_from_slice(&leaf1);
+        let expected_root: [u8; HASH_SIZE] = blake3::hash(&combined).into();
+
+        // Verify root matches hand computation
+        assert_eq!(
+            tree.root(),
+            &expected_root,
+            "Two-leaf tree root must equal H(0x01 || leaf0 || leaf1)"
+        );
+
+        // Verify tree structure
+        assert_eq!(tree.leaf_count(), 2);
+        assert_eq!(tree.padded_leaf_count(), 2);
+        assert_eq!(tree.depth(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_eight_leaf_tree_reference_computation() {
+        // Build an 8-leaf tree and verify root against hand-computed reference.
+        //
+        // Tree structure (level-order storage):
+        //                     root (0)
+        //                    /        \
+        //               n1 (1)         n2 (2)
+        //              /     \        /      \
+        //           n3 (3)  n4 (4)  n5 (5)  n6 (6)
+        //           /  \    /  \    /  \    /   \
+        //         L0  L1  L2  L3  L4  L5  L6   L7
+        //
+        // Computation steps:
+        //   n3 = H(0x01 || L0 || L1)
+        //   n4 = H(0x01 || L2 || L3)
+        //   n5 = H(0x01 || L4 || L5)
+        //   n6 = H(0x01 || L6 || L7)
+        //   n1 = H(0x01 || n3 || n4)
+        //   n2 = H(0x01 || n5 || n6)
+        //   root = H(0x01 || n1 || n2)
+
+        let alg = HashAlg::Blake3;
+
+        // Create 8 distinct leaf hashes
+        let leaves: Vec<[u8; HASH_SIZE]> = (0u8..8)
+            .map(|i| alg.hash_leaf(&[b'L', i]))
+            .collect();
+
+        // Build tree
+        let tree = MerkleTree::build(&leaves, alg).expect("build should succeed");
+
+        // Reference implementation: compute expected root step by step
+        let hash_pair_ref = |left: &[u8; HASH_SIZE], right: &[u8; HASH_SIZE]| -> [u8; HASH_SIZE] {
+            let mut combined = [0u8; 1 + HASH_SIZE * 2];
+            combined[0] = INTERNAL_PREFIX;
+            combined[1..HASH_SIZE + 1].copy_from_slice(left);
+            combined[HASH_SIZE + 1..].copy_from_slice(right);
+            blake3::hash(&combined).into()
+        };
+
+        // Level 2: pair up leaves
+        let n3 = hash_pair_ref(&leaves[0], &leaves[1]);
+        let n4 = hash_pair_ref(&leaves[2], &leaves[3]);
+        let n5 = hash_pair_ref(&leaves[4], &leaves[5]);
+        let n6 = hash_pair_ref(&leaves[6], &leaves[7]);
+
+        // Level 1: pair up level 2 nodes
+        let n1 = hash_pair_ref(&n3, &n4);
+        let n2 = hash_pair_ref(&n5, &n6);
+
+        // Level 0: compute root
+        let expected_root = hash_pair_ref(&n1, &n2);
+
+        // Verify root matches reference computation
+        assert_eq!(
+            tree.root(),
+            &expected_root,
+            "Eight-leaf tree root must match reference computation"
+        );
+
+        // Verify tree structure
+        assert_eq!(tree.leaf_count(), 8);
+        assert_eq!(tree.padded_leaf_count(), 8);
+        assert_eq!(tree.depth(), 4); // log2(8) + 1 = 4
+
+        // Additionally verify all proofs work
+        for i in 0..8 {
+            let proof = tree.proof(i).expect("proof should exist");
+            // Verify using raw chunk data
+            let chunk_data = [b'L', i as u8];
+            assert!(
+                tree.verify_proof(i, &chunk_data, &proof),
+                "Proof for leaf {} should verify",
+                i
+            );
+        }
+    }
+
+    // =========================================================================
+    // MerkleAttr Tests
+    // =========================================================================
+
+    #[test]
+    fn test_algorithm_id_roundtrip() {
+        assert_eq!(HashAlg::from_id(HashAlg::Sha256.to_id()), Some(HashAlg::Sha256));
+        assert_eq!(HashAlg::from_id(HashAlg::Blake3.to_id()), Some(HashAlg::Blake3));
+        assert_eq!(HashAlg::from_id(HashAlg::K12.to_id()), Some(HashAlg::K12));
+        assert_eq!(HashAlg::from_id(0xFF), None);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_pack_unpack() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let packed = attr.pack();
+
+        // Verify size
+        assert_eq!(packed.len(), MERKLE_ATTR_SIZE);
+        assert_eq!(packed.len(), 65);
+
+        // Unpack and verify round-trip
+        let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
+        assert_eq!(unpacked.root, attr.root);
+        assert_eq!(unpacked.algorithm, attr.algorithm);
+        assert_eq!(unpacked.integrity, attr.integrity);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_integrity_verification() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let mut packed = attr.pack();
+
+        // Tamper with the algorithm ID
+        packed[HASH_SIZE] = 0x00; // Change from BLAKE3 to SHA256
+
+        // Unpack should fail due to integrity mismatch
+        assert!(
+            MerkleAttr::unpack(&packed).is_none(),
+            "Tampered algorithm ID should fail integrity check"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_root_tampering_detected() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let mut packed = attr.pack();
+
+        // Tamper with the root hash
+        packed[0] ^= 0xFF;
+
+        // Unpack should fail due to integrity mismatch
+        assert!(
+            MerkleAttr::unpack(&packed).is_none(),
+            "Tampered root hash should fail integrity check"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_verify_tree() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+
+        // Same tree should verify
+        assert!(attr.verify_tree(&tree));
+
+        // Different tree should not verify
+        let other_chunks = vec![b"different".to_vec()];
+        let other_refs: Vec<&[u8]> = other_chunks.iter().map(|c| c.as_slice()).collect();
+        let other_tree = MerkleTree::from_chunks(&other_refs, HashAlg::Blake3);
+        assert!(!attr.verify_tree(&other_tree));
+    }
+
+    #[test]
+    fn test_merkle_attr_invalid_size() {
+        // Too short
+        assert!(MerkleAttr::unpack(&[0u8; 64]).is_none());
+        // Too long
+        assert!(MerkleAttr::unpack(&[0u8; 66]).is_none());
+        // Empty
+        assert!(MerkleAttr::unpack(&[]).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_attr() {
+        use crate::file_writer::FileWriter;
+
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_u8_data(&[1, 2, 3, 4]);
+
+        // Write merkle attribute
+        write_merkle_attr(ds, &tree);
+
+        // Finish and verify the file is valid
+        let bytes = fw.finish().expect("file should build");
+        assert!(!bytes.is_empty());
+
+        // The attribute should be readable (basic check)
+        // Full parsing would require reading the attribute back
     }
 }
