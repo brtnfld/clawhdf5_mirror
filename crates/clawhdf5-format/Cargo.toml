@@ -56,3 +56,11 @@ required-features = ["parallel"]
 name = "hash_bench"
 harness = false
 required-features = ["merkle"]
+
+[[example]]
+name = "gen_merkle_vectors"
+required-features = ["merkle"]
+
+[[example]]
+name = "write_merkle_test"
+required-features = ["merkle"]

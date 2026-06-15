@@ -132,6 +132,9 @@ pub(crate) fn attr_value_to_py(py: Python<'_>, val: &clawhdf5_rs::AttrValue) -> 
             let list = pyo3::types::PyList::new(py, a).unwrap();
             list.into_any().unbind()
         }
+        clawhdf5_rs::AttrValue::Bytes(b) => {
+            pyo3::types::PyBytes::new(py, b).into_any().unbind()
+        }
     }
 }
 

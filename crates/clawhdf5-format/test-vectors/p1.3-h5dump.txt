@@ -1,0 +1,8 @@
+HDF5 "merkle_test.h5" {
+FILE_CONTENTS {
+ group      /
+ group      /merkle
+ dataset    /merkle/sensor_data
+ dataset    /sensor_data
+ }
+}

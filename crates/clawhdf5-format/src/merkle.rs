@@ -29,6 +29,12 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+#[cfg(not(feature = "std"))]
+use alloc::borrow::Cow;
+
+#[cfg(feature = "std")]
+use std::borrow::Cow;
+
 /// Size of hash output in bytes (256 bits).
 const HASH_SIZE: usize = 32;
 
@@ -69,7 +75,7 @@ pub enum MerkleError {
 /// Reasons why a merkle attribute is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidAttrReason {
-    /// Attribute size is not 65 bytes.
+    /// Attribute size is not a valid format (97 bytes for v0).
     WrongSize,
     /// Unknown algorithm identifier.
     UnknownAlgorithm,
@@ -89,7 +95,7 @@ impl core::fmt::Display for MerkleError {
             }
             MerkleError::InvalidAttribute { reason } => {
                 let msg = match reason {
-                    InvalidAttrReason::WrongSize => "attribute size is not 65 bytes",
+                    InvalidAttrReason::WrongSize => "attribute size is not valid (expected 97 bytes for v0)",
                     InvalidAttrReason::UnknownAlgorithm => "unknown algorithm identifier",
                     InvalidAttrReason::IntegrityMismatch => "integrity hash mismatch",
                 };
@@ -192,6 +198,16 @@ pub fn hash_chunk(data: &[u8], alg: HashAlg) -> [u8; HASH_SIZE] {
         HashAlg::Blake3 => hash_chunk_blake3(data),
         HashAlg::K12 => hash_chunk_k12(data),
     }
+}
+
+/// Compute SHA-256 hash of arbitrary data.
+///
+/// Used for companion integrity verification. Always uses SHA-256 regardless
+/// of the tree's hash algorithm to provide a consistent integrity check.
+#[cfg(feature = "sha2")]
+fn compute_sha256(data: &[u8]) -> [u8; HASH_SIZE] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
 }
 
 /// Constant-time comparison of two hash values.
@@ -740,12 +756,23 @@ const ALG_ID_K12: u8 = 0x02;
 /// Domain separator for companion integrity hash.
 const INTEGRITY_PREFIX: u8 = 0x03;
 
+// ---- Attribute format versioning ----
+//
+// Version 0 (implicit): 97 bytes, current format
+// Future versions may add a version byte prefix
+
+/// Attribute format version 0 (current, implicit based on size).
+pub const MERKLE_ATTR_VERSION_0: u8 = 0;
+
+/// Size of version 0 attribute (97 bytes).
+pub const MERKLE_ATTR_SIZE_V0: usize = 97;
+
 // ---- 65-byte attribute layout offsets ----
 //
-// ┌─────────────────────────────────┬───────┬─────────────────────────────────┐
-// │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │
-// └─────────────────────────────────┴───────┴─────────────────────────────────┘
-// 0                                32      33                                65
+// ┌─────────────────────────────────┬───────┬─────────────────────────────────┬─────────────────────────────────┐
+// │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │   Companion Hash (32B)          │
+// └─────────────────────────────────┴───────┴─────────────────────────────────┴─────────────────────────────────┘
+// 0                                32      33                                65                                97
 //
 /// Offset of root hash in packed attribute.
 const ATTR_ROOT_OFFSET: usize = 0;
@@ -766,8 +793,15 @@ const ATTR_INTEGRITY_SIZE: usize = HASH_SIZE;
 /// End offset of integrity hash (exclusive).
 const ATTR_INTEGRITY_END: usize = ATTR_INTEGRITY_OFFSET + ATTR_INTEGRITY_SIZE; // 65
 
-/// Size of the packed merkle_root attribute (root + alg_id + integrity).
-pub const MERKLE_ATTR_SIZE: usize = ATTR_INTEGRITY_END; // 65 bytes
+/// Offset of companion hash in packed attribute.
+const ATTR_COMPANION_OFFSET: usize = ATTR_INTEGRITY_END; // 65
+/// Size of companion hash field.
+const ATTR_COMPANION_SIZE: usize = HASH_SIZE;
+/// End offset of companion hash (exclusive).
+const ATTR_COMPANION_END: usize = ATTR_COMPANION_OFFSET + ATTR_COMPANION_SIZE; // 97
+
+/// Size of the packed merkle_root attribute (root + alg_id + integrity + companion_hash).
+pub const MERKLE_ATTR_SIZE: usize = ATTR_COMPANION_END; // 97 bytes
 
 /// Name of the HDF5 attribute storing merkle root information.
 pub const MERKLE_ATTR_NAME: &str = "merkle_root";
@@ -801,29 +835,47 @@ impl HashAlg {
 
 /// Packed merkle root attribute data.
 ///
-/// Layout (65 bytes total):
+/// Layout (97 bytes total):
 /// - Bytes 0-31: Root hash (32 bytes)
 /// - Byte 32: Algorithm identifier (1 byte)
-/// - Bytes 33-64: Companion integrity hash (32 bytes)
+/// - Bytes 33-64: Integrity hash (32 bytes) - binds root and algorithm
+/// - Bytes 65-96: Companion hash (32 bytes) - SHA-256 of nodes data
 ///
-/// The companion integrity hash is `H(0x03 || root || alg_id)` and prevents
+/// The integrity hash is `H(0x03 || root || alg_id)` and prevents
 /// an attacker from modifying the algorithm ID without detection.
+///
+/// The companion hash is SHA-256 of the full nodes array (either inline
+/// in `merkle_nodes` attribute or in `/merkle/{name}` companion dataset).
+/// This allows quick tamper detection before walking the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerkleAttr {
     /// The Merkle tree root hash.
     pub root: [u8; HASH_SIZE],
     /// The hash algorithm used.
     pub algorithm: HashAlg,
-    /// Companion integrity hash binding root and algorithm.
+    /// Integrity hash binding root and algorithm.
     pub integrity: [u8; HASH_SIZE],
+    /// SHA-256 hash of the companion/inline nodes data.
+    /// All zeros if no companion data (root-only attribute).
+    pub companion_hash: [u8; HASH_SIZE],
 }
 
 impl MerkleAttr {
-    /// Create a new merkle attribute from a tree.
+    /// Create a new merkle attribute from a tree without companion data.
     ///
-    /// Computes the companion integrity hash as `H(0x03 || root || alg_id)`.
+    /// Computes the integrity hash as `H(0x03 || root || alg_id)`.
+    /// Sets companion_hash to all zeros.
     #[must_use]
     pub fn from_tree(tree: &MerkleTree) -> Self {
+        Self::from_tree_with_companion(tree, [0u8; HASH_SIZE])
+    }
+
+    /// Create a new merkle attribute from a tree with companion data hash.
+    ///
+    /// The companion_hash should be SHA-256 of the nodes data (either inline
+    /// in `merkle_nodes` attribute or in `/merkle/{name}` companion dataset).
+    #[must_use]
+    pub fn from_tree_with_companion(tree: &MerkleTree, companion_hash: [u8; HASH_SIZE]) -> Self {
         let root = *tree.root();
         let algorithm = tree.algorithm();
         let integrity = Self::compute_integrity(&root, algorithm);
@@ -832,10 +884,11 @@ impl MerkleAttr {
             root,
             algorithm,
             integrity,
+            companion_hash,
         }
     }
 
-    /// Compute the companion integrity hash.
+    /// Compute the integrity hash.
     ///
     /// This binds the root hash and algorithm ID together, preventing
     /// an attacker from changing the algorithm without detection.
@@ -847,26 +900,27 @@ impl MerkleAttr {
         alg.hash_raw(&data)
     }
 
-    /// Pack the attribute into a 65-byte binary blob.
+    /// Pack the attribute into a 97-byte binary blob.
     ///
-    /// Layout: `[root:32][alg:1][integrity:32]`
+    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32]`
     #[must_use]
     pub fn pack(&self) -> [u8; MERKLE_ATTR_SIZE] {
         let mut buf = [0u8; MERKLE_ATTR_SIZE];
         buf[ATTR_ROOT_OFFSET..ATTR_ROOT_END].copy_from_slice(&self.root);
         buf[ATTR_ALG_OFFSET] = self.algorithm.to_id();
         buf[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END].copy_from_slice(&self.integrity);
+        buf[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END].copy_from_slice(&self.companion_hash);
         buf
     }
 
-    /// Unpack from a 65-byte binary blob.
+    /// Unpack from a 97-byte binary blob.
     ///
-    /// Layout: `[root:32][alg:1][integrity:32]`
+    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32]`
     ///
     /// # Errors
     ///
     /// Returns `Err` if:
-    /// - The data is not exactly 65 bytes (`WrongSize`)
+    /// - The data is not exactly 97 bytes (`WrongSize`)
     /// - The algorithm ID is unknown (`UnknownAlgorithm`)
     /// - The integrity hash does not match (`IntegrityMismatch`)
     pub fn unpack(data: &[u8]) -> Result<Self, MerkleError> {
@@ -887,6 +941,9 @@ impl MerkleAttr {
         let mut integrity = [0u8; ATTR_INTEGRITY_SIZE];
         integrity.copy_from_slice(&data[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END]);
 
+        let mut companion_hash = [0u8; ATTR_COMPANION_SIZE];
+        companion_hash.copy_from_slice(&data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]);
+
         // Verify integrity hash
         let expected_integrity = Self::compute_integrity(&root, algorithm);
         if !constant_time_eq(&integrity, &expected_integrity) {
@@ -899,6 +956,7 @@ impl MerkleAttr {
             root,
             algorithm,
             integrity,
+            companion_hash,
         })
     }
 
@@ -906,6 +964,248 @@ impl MerkleAttr {
     #[must_use]
     pub fn verify_tree(&self, tree: &MerkleTree) -> bool {
         tree.algorithm() == self.algorithm && constant_time_eq(tree.root(), &self.root)
+    }
+
+    /// Verify the companion data integrity.
+    ///
+    /// Computes SHA-256 of the provided nodes data and compares with
+    /// the stored companion_hash. Returns false if companion_hash is
+    /// all zeros (no companion data expected).
+    #[must_use]
+    pub fn verify_companion(&self, nodes_data: &[u8]) -> bool {
+        // All zeros means no companion data
+        if self.companion_hash == [0u8; HASH_SIZE] {
+            return false;
+        }
+        let computed = compute_sha256(nodes_data);
+        constant_time_eq(&computed, &self.companion_hash)
+    }
+
+    /// Check if this attribute has companion data.
+    #[must_use]
+    pub fn has_companion(&self) -> bool {
+        self.companion_hash != [0u8; HASH_SIZE]
+    }
+
+    /// Get the format version of this attribute.
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        MERKLE_ATTR_VERSION_0
+    }
+}
+
+/// Zero-copy reference to packed merkle attribute data.
+///
+/// This struct holds a reference to the raw attribute bytes using [`Cow`],
+/// allowing zero-copy reads when the data is borrowed directly from HDF5
+/// file memory, while still supporting owned data when needed.
+///
+/// # Format Versioning
+///
+/// The format version is determined implicitly by the data size:
+/// - 97 bytes: Version 0 (current format)
+///
+/// Future versions may add an explicit version byte prefix.
+///
+/// # Example
+///
+/// ```ignore
+/// use clawhdf5_format::merkle::MerkleAttrRef;
+///
+/// // Zero-copy read from HDF5 attribute data
+/// let attr_data: &[u8] = /* read from HDF5 */;
+/// let attr_ref = MerkleAttrRef::from_slice(attr_data)?;
+///
+/// // Access fields without copying
+/// let root = attr_ref.root();
+/// let alg = attr_ref.algorithm()?;
+///
+/// // Convert to owned if needed
+/// let owned: MerkleAttr = attr_ref.to_owned_attr()?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct MerkleAttrRef<'a> {
+    /// Raw attribute data (borrowed or owned).
+    data: Cow<'a, [u8]>,
+    /// Cached format version (determined from size).
+    version: u8,
+}
+
+impl<'a> MerkleAttrRef<'a> {
+    /// Create a reference from a borrowed slice (zero-copy).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the data size is not a valid attribute size.
+    pub fn from_slice(data: &'a [u8]) -> Result<Self, MerkleError> {
+        let version = Self::detect_version(data.len())?;
+        Ok(Self {
+            data: Cow::Borrowed(data),
+            version,
+        })
+    }
+
+    /// Create a reference from owned data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the data size is not a valid attribute size.
+    pub fn from_vec(data: Vec<u8>) -> Result<MerkleAttrRef<'static>, MerkleError> {
+        let version = Self::detect_version(data.len())?;
+        Ok(MerkleAttrRef {
+            data: Cow::Owned(data),
+            version,
+        })
+    }
+
+    /// Create from a packed MerkleAttr.
+    #[must_use]
+    pub fn from_attr(attr: &MerkleAttr) -> MerkleAttrRef<'static> {
+        MerkleAttrRef {
+            data: Cow::Owned(attr.pack().to_vec()),
+            version: MERKLE_ATTR_VERSION_0,
+        }
+    }
+
+    /// Detect format version from data size.
+    fn detect_version(size: usize) -> Result<u8, MerkleError> {
+        match size {
+            MERKLE_ATTR_SIZE_V0 => Ok(MERKLE_ATTR_VERSION_0),
+            _ => Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            }),
+        }
+    }
+
+    /// Get the format version.
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Get a reference to the raw data.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Get the root hash (zero-copy slice).
+    #[must_use]
+    pub fn root(&self) -> &[u8] {
+        &self.data[ATTR_ROOT_OFFSET..ATTR_ROOT_END]
+    }
+
+    /// Get the root hash as a fixed-size array.
+    #[must_use]
+    pub fn root_array(&self) -> [u8; HASH_SIZE] {
+        let mut arr = [0u8; HASH_SIZE];
+        arr.copy_from_slice(self.root());
+        arr
+    }
+
+    /// Get the algorithm identifier byte.
+    #[must_use]
+    pub fn algorithm_id(&self) -> u8 {
+        self.data[ATTR_ALG_OFFSET]
+    }
+
+    /// Get the hash algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the algorithm ID is unknown.
+    pub fn algorithm(&self) -> Result<HashAlg, MerkleError> {
+        HashAlg::from_id(self.algorithm_id()).ok_or(MerkleError::InvalidAttribute {
+            reason: InvalidAttrReason::UnknownAlgorithm,
+        })
+    }
+
+    /// Get the integrity hash (zero-copy slice).
+    #[must_use]
+    pub fn integrity(&self) -> &[u8] {
+        &self.data[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END]
+    }
+
+    /// Get the companion hash (zero-copy slice).
+    #[must_use]
+    pub fn companion_hash(&self) -> &[u8] {
+        &self.data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]
+    }
+
+    /// Check if this attribute has companion data.
+    #[must_use]
+    pub fn has_companion(&self) -> bool {
+        self.companion_hash().iter().any(|&b| b != 0)
+    }
+
+    /// Verify the integrity hash without fully unpacking.
+    ///
+    /// This validates that the root and algorithm haven't been tampered with.
+    pub fn verify_integrity(&self) -> Result<(), MerkleError> {
+        let algorithm = self.algorithm()?;
+        let expected = MerkleAttr::compute_integrity(&self.root_array(), algorithm);
+        // Safe: integrity() always returns exactly HASH_SIZE bytes for v0
+        let integrity_arr: &[u8; HASH_SIZE] = self.integrity().try_into().map_err(|_| {
+            MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            }
+        })?;
+        if !constant_time_eq(integrity_arr, &expected) {
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::IntegrityMismatch,
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify companion data against the stored hash.
+    ///
+    /// Returns `false` if no companion hash is present (all zeros).
+    #[must_use]
+    pub fn verify_companion(&self, nodes_data: &[u8]) -> bool {
+        if !self.has_companion() {
+            return false;
+        }
+        let computed = compute_sha256(nodes_data);
+        // Safe: companion_hash() always returns exactly HASH_SIZE bytes for v0
+        let companion_arr: &[u8; HASH_SIZE] = match self.companion_hash().try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        constant_time_eq(&computed, companion_arr)
+    }
+
+    /// Convert to an owned `MerkleAttr`, verifying integrity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if validation fails (unknown algorithm or integrity mismatch).
+    pub fn to_owned_attr(&self) -> Result<MerkleAttr, MerkleError> {
+        MerkleAttr::unpack(&self.data)
+    }
+
+    /// Convert to owned data, consuming the reference.
+    #[must_use]
+    pub fn into_owned(self) -> Vec<u8> {
+        self.data.into_owned()
+    }
+
+    /// Check if the data is borrowed (zero-copy).
+    #[must_use]
+    pub fn is_borrowed(&self) -> bool {
+        matches!(self.data, Cow::Borrowed(_))
+    }
+}
+
+impl<'a> AsRef<[u8]> for MerkleAttrRef<'a> {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl<'a> From<&'a MerkleAttr> for MerkleAttrRef<'static> {
+    fn from(attr: &'a MerkleAttr) -> Self {
+        Self::from_attr(attr)
     }
 }
 
@@ -947,6 +1247,123 @@ pub fn write_merkle_attr(
     let packed = attr.pack();
     dataset.set_attr(MERKLE_ATTR_NAME, crate::type_builders::AttrValue::Bytes(packed.to_vec()));
     Ok(())
+}
+
+/// Threshold for inline node storage vs companion dataset.
+/// Trees with up to this many leaf chunks will have their nodes stored
+/// directly in an attribute. Larger trees use a companion dataset.
+pub const INLINE_CHUNK_THRESHOLD: usize = 256;
+
+/// Name of the attribute used for inline merkle nodes.
+pub const MERKLE_NODES_ATTR_NAME: &str = "merkle_nodes";
+
+/// Name of the group containing companion merkle datasets.
+pub const MERKLE_GROUP_NAME: &str = "merkle";
+
+/// Result of `write_merkle_companion` indicating storage method and companion hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MerkleCompanionResult {
+    /// Nodes were small enough to be inlined.
+    ///
+    /// Contains:
+    /// - `nodes`: packed bytes to write as `merkle_nodes` attribute
+    /// - `companion_hash`: SHA-256 of nodes for integrity verification
+    Inline {
+        /// Packed node hashes to write as attribute.
+        nodes: Vec<u8>,
+        /// SHA-256 hash of the nodes data for integrity verification.
+        companion_hash: [u8; HASH_SIZE],
+    },
+    /// Nodes were written as a companion dataset at `/merkle/{name}`.
+    ///
+    /// Contains the SHA-256 hash of the companion dataset content.
+    Dataset {
+        /// SHA-256 hash of the companion dataset for integrity verification.
+        companion_hash: [u8; HASH_SIZE],
+    },
+}
+
+/// Write merkle tree node data, using companion dataset for large trees.
+///
+/// For datasets with 256 or fewer chunks, returns packed node hashes that
+/// should be written as a `merkle_nodes` attribute on the dataset. For larger
+/// datasets, writes the nodes as a flat u8 dataset at `/merkle/{name}`.
+///
+/// The nodes array contains all internal and leaf hashes in level-order
+/// (breadth-first) layout. Each hash is 32 bytes, so the total size is
+/// `node_count * 32` bytes.
+///
+/// # Arguments
+///
+/// * `file` - The FileWriter to write companion datasets to (used only for large trees)
+/// * `name` - The name of the dataset this tree belongs to
+/// * `tree` - The Merkle tree whose nodes to write
+///
+/// # Returns
+///
+/// - `Ok(Inline(bytes))` - For trees with ≤256 chunks. Add bytes as `merkle_nodes` attribute.
+/// - `Ok(Dataset)` - For larger trees. Companion dataset was written at `/merkle/{name}`.
+///
+/// # Layout
+///
+/// For a tree with N leaves (padded to next power of 2):
+/// - Total nodes: `2 * padded_leaf_count - 1`
+/// - Node 0: root
+/// - Nodes 1..padded_leaf_count-1: internal nodes (level-order)
+/// - Nodes padded_leaf_count-1..2*padded_leaf_count-1: leaf hashes
+///
+/// # Example
+///
+/// ```ignore
+/// use clawhdf5_format::merkle::{MerkleTree, HashAlg, write_merkle_companion, MerkleCompanionResult};
+/// use clawhdf5_format::file_writer::FileWriter;
+/// use clawhdf5_format::type_builders::AttrValue;
+///
+/// let chunks: Vec<&[u8]> = vec![&[1, 2, 3], &[4, 5, 6]];
+/// let tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
+///
+/// let mut fw = FileWriter::new();
+/// let ds = fw.create_dataset("data");
+/// ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
+///
+/// match write_merkle_companion(&mut fw, "data", &tree)? {
+///     MerkleCompanionResult::Inline(bytes) => {
+///         ds.set_attr("merkle_nodes", AttrValue::Bytes(bytes));
+///     }
+///     MerkleCompanionResult::Dataset => {
+///         // Companion dataset already written at /merkle/data
+///     }
+/// }
+/// ```
+pub fn write_merkle_companion(
+    file: &mut crate::file_writer::FileWriter,
+    name: &str,
+    tree: &MerkleTree,
+) -> Result<MerkleCompanionResult, MerkleError> {
+    // Flatten nodes to bytes
+    let nodes = tree.nodes();
+    let mut flat_nodes = Vec::with_capacity(nodes.len() * HASH_SIZE);
+    for node in nodes {
+        flat_nodes.extend_from_slice(node);
+    }
+
+    // Compute SHA-256 companion integrity hash
+    let companion_hash = compute_sha256(&flat_nodes);
+
+    if tree.leaf_count() <= INLINE_CHUNK_THRESHOLD {
+        // Return packed nodes for caller to add as attribute
+        Ok(MerkleCompanionResult::Inline {
+            nodes: flat_nodes,
+            companion_hash,
+        })
+    } else {
+        // Create companion dataset at /merkle/{name}
+        let mut group = file.create_group(MERKLE_GROUP_NAME);
+        let companion = group.create_dataset(name);
+        companion.with_u8_data(&flat_nodes);
+        file.add_group(group.finish());
+        Ok(MerkleCompanionResult::Dataset { companion_hash })
+    }
 }
 
 // ============================================================================
@@ -1559,15 +1976,17 @@ mod tests {
         let attr = MerkleAttr::from_tree(&tree);
         let packed = attr.pack();
 
-        // Verify size
+        // Verify size (now 97 bytes with companion hash)
         assert_eq!(packed.len(), MERKLE_ATTR_SIZE);
-        assert_eq!(packed.len(), 65);
+        assert_eq!(packed.len(), 97);
 
         // Unpack and verify round-trip
         let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
         assert_eq!(unpacked.root, attr.root);
         assert_eq!(unpacked.algorithm, attr.algorithm);
         assert_eq!(unpacked.integrity, attr.integrity);
+        assert_eq!(unpacked.companion_hash, [0u8; HASH_SIZE]); // No companion for basic from_tree
+        assert!(!unpacked.has_companion());
     }
 
     #[test]
@@ -1631,12 +2050,14 @@ mod tests {
 
     #[test]
     fn test_merkle_attr_invalid_size() {
-        // Too short
-        assert!(MerkleAttr::unpack(&[0u8; 64]).is_err());
+        // Too short (97 bytes expected)
+        assert!(MerkleAttr::unpack(&[0u8; 96]).is_err());
         // Too long
-        assert!(MerkleAttr::unpack(&[0u8; 66]).is_err());
+        assert!(MerkleAttr::unpack(&[0u8; 98]).is_err());
         // Empty
         assert!(MerkleAttr::unpack(&[]).is_err());
+        // Old size (65 bytes) should also fail
+        assert!(MerkleAttr::unpack(&[0u8; 65]).is_err());
     }
 
     #[test]
@@ -1661,5 +2082,499 @@ mod tests {
 
         // The attribute should be readable (basic check)
         // Full parsing would require reading the attribute back
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_companion_inline() {
+        use crate::file_writer::FileWriter;
+        use crate::type_builders::AttrValue;
+
+        // Create a small tree (< 256 chunks) - should return inline data
+        let chunks: Vec<Vec<u8>> = (0..10).map(|i| vec![i as u8; 64]).collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut fw = FileWriter::new();
+
+        // Write merkle companion - should return Inline result
+        let result = write_merkle_companion(&mut fw, "small_data", &tree)
+            .expect("write_merkle_companion should succeed");
+
+        match result {
+            MerkleCompanionResult::Inline { nodes, companion_hash } => {
+                // Verify expected size: 10 leaves padded to 16, so 31 nodes * 32 bytes
+                assert_eq!(nodes.len(), 31 * HASH_SIZE);
+
+                // Verify companion hash is SHA-256 of nodes
+                let expected_hash = compute_sha256(&nodes);
+                assert_eq!(companion_hash, expected_hash);
+
+                // Add as attribute to verify it works
+                let ds = fw.create_dataset("small_data");
+                ds.with_u8_data(&[1, 2, 3, 4]);
+                ds.set_attr(MERKLE_NODES_ATTR_NAME, AttrValue::Bytes(nodes));
+            }
+            MerkleCompanionResult::Dataset { .. } => {
+                panic!("Expected Inline result for small tree");
+            }
+        }
+
+        // Finish and verify the file is valid
+        let bytes = fw.finish().expect("file should build");
+        assert!(!bytes.is_empty());
+
+        assert_eq!(tree.padded_leaf_count(), 16);
+        assert_eq!(tree.nodes().len(), 31);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_companion_dataset() {
+        use crate::file_writer::FileWriter;
+
+        // Create a large tree (> 256 chunks) - should create companion dataset
+        let chunks: Vec<Vec<u8>> = (0..300).map(|i| vec![(i % 256) as u8; 64]).collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut fw = FileWriter::new();
+
+        // Also create the main dataset
+        let ds = fw.create_dataset("large_data");
+        ds.with_u8_data(&[1, 2, 3, 4]);
+
+        // Write merkle companion - should create /merkle/large_data dataset
+        let result = write_merkle_companion(&mut fw, "large_data", &tree)
+            .expect("write_merkle_companion should succeed");
+
+        match result {
+            MerkleCompanionResult::Dataset { companion_hash } => {
+                // Verify companion hash is not all zeros
+                assert_ne!(companion_hash, [0u8; HASH_SIZE]);
+            }
+            MerkleCompanionResult::Inline { .. } => {
+                panic!("Expected Dataset result for large tree");
+            }
+        }
+
+        // Finish and verify the file is valid
+        let bytes = fw.finish().expect("file should build");
+        assert!(!bytes.is_empty());
+
+        // Verify expected node count: 300 leaves padded to 512, so 1023 nodes
+        assert_eq!(tree.padded_leaf_count(), 512);
+        assert_eq!(tree.nodes().len(), 1023);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_companion_threshold_boundary() {
+        use crate::file_writer::FileWriter;
+
+        // Test exactly at the threshold (256 chunks) - should use inline
+        let chunks: Vec<Vec<u8>> = (0..256).map(|i| vec![(i % 256) as u8; 32]).collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        assert_eq!(tree.leaf_count(), 256);
+
+        let mut fw = FileWriter::new();
+
+        let result = write_merkle_companion(&mut fw, "boundary_data", &tree)
+            .expect("write_merkle_companion should succeed");
+
+        match result {
+            MerkleCompanionResult::Inline { nodes, companion_hash } => {
+                // 256 leaves = 256 padded (power of 2), so 511 nodes * 32 bytes
+                assert_eq!(nodes.len(), 511 * HASH_SIZE);
+                assert_ne!(companion_hash, [0u8; HASH_SIZE]);
+            }
+            MerkleCompanionResult::Dataset { .. } => {
+                panic!("Expected Inline result at threshold");
+            }
+        }
+
+        // Create dataset and finish file
+        let ds = fw.create_dataset("boundary_data");
+        ds.with_u8_data(&[1, 2, 3, 4]);
+
+        let bytes = fw.finish().expect("file should build");
+        assert!(!bytes.is_empty());
+
+        assert_eq!(tree.padded_leaf_count(), 256);
+        assert_eq!(tree.nodes().len(), 511);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_companion_just_over_threshold() {
+        use crate::file_writer::FileWriter;
+
+        // Test just over threshold (257 chunks) - should create dataset
+        let chunks: Vec<Vec<u8>> = (0..257).map(|i| vec![(i % 256) as u8; 32]).collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        assert_eq!(tree.leaf_count(), 257);
+
+        let mut fw = FileWriter::new();
+
+        let result = write_merkle_companion(&mut fw, "over_threshold", &tree)
+            .expect("write_merkle_companion should succeed");
+
+        match result {
+            MerkleCompanionResult::Dataset { companion_hash } => {
+                assert_ne!(companion_hash, [0u8; HASH_SIZE]);
+            }
+            MerkleCompanionResult::Inline { .. } => {
+                panic!("Expected Dataset result for large tree");
+            }
+        }
+
+        // Create main dataset and finish file
+        let ds = fw.create_dataset("over_threshold");
+        ds.with_u8_data(&[1, 2, 3, 4]);
+
+        let bytes = fw.finish().expect("file should build");
+        assert!(!bytes.is_empty());
+
+        // 257 leaves padded to 512, so 1023 nodes
+        assert_eq!(tree.padded_leaf_count(), 512);
+        assert_eq!(tree.nodes().len(), 1023);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_with_companion_hash() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        // Create a fake companion hash
+        let companion_hash = compute_sha256(b"test companion data");
+
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+
+        // Pack and unpack
+        let packed = attr.pack();
+        assert_eq!(packed.len(), MERKLE_ATTR_SIZE); // 97 bytes
+
+        let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
+        assert_eq!(unpacked.root, attr.root);
+        assert_eq!(unpacked.algorithm, attr.algorithm);
+        assert_eq!(unpacked.companion_hash, companion_hash);
+        assert!(unpacked.has_companion());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_verify_companion() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        // Flatten nodes
+        let nodes = tree.nodes();
+        let mut flat_nodes = Vec::new();
+        for node in nodes {
+            flat_nodes.extend_from_slice(node);
+        }
+
+        let companion_hash = compute_sha256(&flat_nodes);
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+
+        // Verify with correct data
+        assert!(attr.verify_companion(&flat_nodes));
+
+        // Verify with tampered data fails
+        let mut tampered = flat_nodes.clone();
+        tampered[0] ^= 0xFF;
+        assert!(!attr.verify_companion(&tampered));
+    }
+
+    /// Round-trip test: write 1024-chunk dataset with merkle companion,
+    /// read it back, verify companion-integrity hash matches.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_roundtrip_1024_chunks() {
+        use crate::attribute::{extract_attributes, find_attribute};
+        use crate::data_layout::DataLayout;
+        use crate::file_writer::FileWriter;
+        use crate::group_v2::resolve_path_any;
+        use crate::object_header::ObjectHeader;
+        use crate::signature::find_signature;
+        use crate::superblock::Superblock;
+        use crate::type_builders::AttrValue;
+
+        // 1. Create 1024 synthetic chunks (each 64 bytes)
+        let chunks: Vec<Vec<u8>> = (0..1024)
+            .map(|i| {
+                let mut chunk = vec![0u8; 64];
+                // Fill with predictable pattern
+                for (j, byte) in chunk.iter_mut().enumerate() {
+                    *byte = ((i + j) % 256) as u8;
+                }
+                chunk
+            })
+            .collect();
+
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        // Verify we're above the inline threshold (256)
+        assert_eq!(tree.leaf_count(), 1024);
+        assert!(tree.leaf_count() > INLINE_CHUNK_THRESHOLD);
+
+        // 2. Write the file with merkle companion and attribute
+        let mut fw = FileWriter::new();
+
+        // Write merkle companion first - should create /merkle/sensor_data dataset
+        let result = write_merkle_companion(&mut fw, "sensor_data", &tree)
+            .expect("write_merkle_companion should succeed");
+
+        let companion_hash = match &result {
+            MerkleCompanionResult::Dataset { companion_hash } => *companion_hash,
+            MerkleCompanionResult::Inline { .. } => {
+                panic!("Expected Dataset result for 1024 chunks");
+            }
+        };
+
+        // Now create the main dataset with the merkle attribute
+        let ds = fw.create_dataset("sensor_data");
+        // Flatten all chunk data for the dataset
+        let all_data: Vec<u8> = chunks.iter().flatten().copied().collect();
+        ds.with_u8_data(&all_data);
+
+        // Write merkle_root attribute with companion hash
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+        ds.set_attr(MERKLE_ATTR_NAME, AttrValue::Bytes(attr.pack().to_vec()));
+
+        // 3. Finish and get file bytes
+        let file_bytes = fw.finish().expect("file should build");
+        assert!(!file_bytes.is_empty());
+
+        // 4. Re-open and parse the file
+        let sig_offset = find_signature(&file_bytes).expect("signature not found");
+        let sb = Superblock::parse(&file_bytes, sig_offset).expect("superblock parse failed");
+
+        // 5. Read back the merkle_root attribute from sensor_data dataset
+        let data_addr =
+            resolve_path_any(&file_bytes, &sb, "sensor_data").expect("sensor_data not found");
+        let data_hdr = ObjectHeader::parse(
+            &file_bytes,
+            data_addr as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .expect("dataset header parse failed");
+
+        let attrs = extract_attributes(&data_hdr, sb.length_size).expect("extract attrs failed");
+        let merkle_attr = find_attribute(&attrs, MERKLE_ATTR_NAME).expect("merkle_root attr not found");
+
+        // Verify attribute size
+        assert_eq!(merkle_attr.raw_data.len(), MERKLE_ATTR_SIZE);
+
+        // Unpack and verify
+        let unpacked =
+            MerkleAttr::unpack(&merkle_attr.raw_data).expect("merkle attr unpack failed");
+        assert_eq!(unpacked.root, *tree.root());
+        assert_eq!(unpacked.algorithm, HashAlg::Blake3);
+        assert!(unpacked.has_companion());
+
+        // 6. Read back the companion dataset from /merkle/sensor_data
+        let companion_addr = resolve_path_any(&file_bytes, &sb, "merkle/sensor_data")
+            .expect("companion dataset not found");
+        let companion_hdr = ObjectHeader::parse(
+            &file_bytes,
+            companion_addr as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .expect("companion header parse failed");
+
+        // Find the data layout message to get the companion data
+        let mut companion_data: Option<Vec<u8>> = None;
+        for msg in &companion_hdr.messages {
+            if msg.msg_type == crate::message_type::MessageType::DataLayout {
+                let layout = DataLayout::parse(&msg.data, sb.offset_size, sb.length_size)
+                    .expect("data layout parse failed");
+                if let DataLayout::Contiguous { address, size } = layout {
+                    if let Some(addr) = address {
+                        let start = addr as usize;
+                        let end = start + size as usize;
+                        companion_data = Some(file_bytes[start..end].to_vec());
+                    }
+                }
+            }
+        }
+
+        let companion_bytes = companion_data.expect("companion data not found in layout");
+
+        // 7. Verify companion-integrity hash matches recomputed value
+        let recomputed_hash = compute_sha256(&companion_bytes);
+        assert_eq!(
+            unpacked.companion_hash, recomputed_hash,
+            "Companion hash mismatch: stored vs recomputed"
+        );
+
+        // Also verify using the verify_companion method
+        assert!(
+            unpacked.verify_companion(&companion_bytes),
+            "verify_companion should return true"
+        );
+
+        // Verify node count: 1024 leaves padded to 1024 (power of 2), so 2047 nodes
+        // Each node is 32 bytes, so 2047 * 32 = 65504 bytes
+        assert_eq!(tree.padded_leaf_count(), 1024);
+        assert_eq!(tree.nodes().len(), 2047);
+        assert_eq!(companion_bytes.len(), 2047 * HASH_SIZE);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_ref_zero_copy() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let packed = attr.pack();
+
+        // Create zero-copy reference from slice
+        let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
+
+        // Verify it's borrowed (zero-copy)
+        assert!(attr_ref.is_borrowed());
+
+        // Access fields without copying
+        assert_eq!(attr_ref.root(), &attr.root);
+        assert_eq!(attr_ref.algorithm_id(), attr.algorithm.to_id());
+        assert_eq!(attr_ref.algorithm().unwrap(), attr.algorithm);
+        assert_eq!(attr_ref.integrity(), &attr.integrity);
+        assert_eq!(attr_ref.companion_hash(), &attr.companion_hash);
+
+        // Version should be 0
+        assert_eq!(attr_ref.version(), MERKLE_ATTR_VERSION_0);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_ref_from_vec() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let packed = attr.pack().to_vec();
+
+        // Create from owned vec
+        let attr_ref = MerkleAttrRef::from_vec(packed).expect("should parse");
+
+        // Verify it's owned (not borrowed)
+        assert!(!attr_ref.is_borrowed());
+
+        // Should still work correctly
+        assert_eq!(attr_ref.root_array(), attr.root);
+        assert_eq!(attr_ref.algorithm().unwrap(), attr.algorithm);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_ref_verify_integrity() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let packed = attr.pack();
+
+        // Valid data should pass integrity check
+        let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
+        assert!(attr_ref.verify_integrity().is_ok());
+
+        // Tampered data should fail
+        let mut tampered = packed;
+        tampered[0] ^= 0xFF;
+        let tampered_ref = MerkleAttrRef::from_slice(&tampered).expect("should parse");
+        assert!(tampered_ref.verify_integrity().is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_ref_to_owned() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let attr = MerkleAttr::from_tree(&tree);
+        let packed = attr.pack();
+
+        // Create reference and convert to owned
+        let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
+        let owned = attr_ref.to_owned_attr().expect("should convert");
+
+        // Should match original
+        assert_eq!(owned.root, attr.root);
+        assert_eq!(owned.algorithm, attr.algorithm);
+        assert_eq!(owned.integrity, attr.integrity);
+        assert_eq!(owned.companion_hash, attr.companion_hash);
+    }
+
+    #[test]
+    fn test_merkle_attr_ref_invalid_size() {
+        // Too short
+        assert!(MerkleAttrRef::from_slice(&[0u8; 96]).is_err());
+        // Too long
+        assert!(MerkleAttrRef::from_slice(&[0u8; 98]).is_err());
+        // Empty
+        assert!(MerkleAttrRef::from_slice(&[]).is_err());
+        // Old size (65 bytes)
+        assert!(MerkleAttrRef::from_slice(&[0u8; 65]).is_err());
+        // Correct size should work (even with invalid content)
+        assert!(MerkleAttrRef::from_slice(&[0u8; 97]).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_ref_verify_companion() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        // Create attribute with companion hash
+        let nodes = tree.nodes();
+        let mut flat_nodes = Vec::with_capacity(nodes.len() * HASH_SIZE);
+        for node in nodes {
+            flat_nodes.extend_from_slice(node);
+        }
+        let companion_hash = compute_sha256(&flat_nodes);
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+        let packed = attr.pack();
+
+        // Zero-copy reference should verify companion
+        let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
+        assert!(attr_ref.has_companion());
+        assert!(attr_ref.verify_companion(&flat_nodes));
+
+        // Wrong data should fail
+        let wrong_data = vec![0u8; flat_nodes.len()];
+        assert!(!attr_ref.verify_companion(&wrong_data));
+    }
+
+    #[test]
+    fn test_merkle_attr_version() {
+        // MerkleAttr should report version 0
+        let attr = MerkleAttr {
+            root: [0u8; HASH_SIZE],
+            algorithm: HashAlg::Blake3,
+            integrity: [0u8; HASH_SIZE],
+            companion_hash: [0u8; HASH_SIZE],
+        };
+        assert_eq!(attr.version(), MERKLE_ATTR_VERSION_0);
+
+        // Size constants
+        assert_eq!(MERKLE_ATTR_SIZE, MERKLE_ATTR_SIZE_V0);
+        assert_eq!(MERKLE_ATTR_SIZE_V0, 97);
     }
 }
