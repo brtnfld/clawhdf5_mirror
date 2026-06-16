@@ -75,12 +75,23 @@ pub enum MerkleError {
 /// Reasons why a merkle attribute is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidAttrReason {
-    /// Attribute size is not a valid format (97 bytes for v0).
+    /// Attribute size is not a valid format (65 or 97 bytes).
     WrongSize,
     /// Unknown algorithm identifier.
     UnknownAlgorithm,
     /// Integrity hash does not match.
     IntegrityMismatch,
+}
+
+/// Result of companion data verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionVerifyResult {
+    /// Verification passed: companion hash matches.
+    Valid,
+    /// No companion data present (hash is all zeros or legacy format).
+    NoCompanion,
+    /// Verification failed: hash mismatch (possible tampering).
+    HashMismatch,
 }
 
 impl core::fmt::Display for MerkleError {
@@ -204,7 +215,9 @@ pub fn hash_chunk(data: &[u8], alg: HashAlg) -> [u8; HASH_SIZE] {
 ///
 /// Used for companion integrity verification. Always uses SHA-256 regardless
 /// of the tree's hash algorithm to provide a consistent integrity check.
-#[cfg(feature = "sha2")]
+///
+/// Note: No feature gate needed here since the merkle module is only compiled
+/// when `feature = "merkle"` is enabled, which implies `sha2`.
 fn compute_sha256(data: &[u8]) -> [u8; HASH_SIZE] {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).into()
@@ -761,13 +774,22 @@ const INTEGRITY_PREFIX: u8 = 0x03;
 // Version 0 (implicit): 97 bytes, current format
 // Future versions may add a version byte prefix
 
-/// Attribute format version 0 (current, implicit based on size).
+/// Legacy attribute format (65 bytes, no companion hash).
+///
+/// This format was used before companion hash support was added.
+/// Files with this format can still be read; companion_hash will be all zeros.
+pub const MERKLE_ATTR_VERSION_LEGACY: u8 = 0xFF;
+
+/// Size of legacy attribute (65 bytes: root + alg + integrity).
+pub const MERKLE_ATTR_SIZE_LEGACY: usize = 65;
+
+/// Attribute format version 0 (current, 97 bytes with companion hash).
 pub const MERKLE_ATTR_VERSION_0: u8 = 0;
 
 /// Size of version 0 attribute (97 bytes).
 pub const MERKLE_ATTR_SIZE_V0: usize = 97;
 
-// ---- 65-byte attribute layout offsets ----
+// ---- 97-byte attribute layout offsets ----
 //
 // ┌─────────────────────────────────┬───────┬─────────────────────────────────┬─────────────────────────────────┐
 // │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │   Companion Hash (32B)          │
@@ -920,11 +942,19 @@ impl MerkleAttr {
     /// # Errors
     ///
     /// Returns `Err` if:
-    /// - The data is not exactly 97 bytes (`WrongSize`)
+    /// - The data is not 65 or 97 bytes (`WrongSize`)
     /// - The algorithm ID is unknown (`UnknownAlgorithm`)
     /// - The integrity hash does not match (`IntegrityMismatch`)
+    ///
+    /// # Legacy Support
+    ///
+    /// Accepts both 65-byte (legacy) and 97-byte (current) formats.
+    /// Legacy format attributes will have `companion_hash` set to all zeros.
     pub fn unpack(data: &[u8]) -> Result<Self, MerkleError> {
-        if data.len() != MERKLE_ATTR_SIZE {
+        let is_legacy = data.len() == MERKLE_ATTR_SIZE_LEGACY;
+        let is_current = data.len() == MERKLE_ATTR_SIZE;
+
+        if !is_legacy && !is_current {
             return Err(MerkleError::InvalidAttribute {
                 reason: InvalidAttrReason::WrongSize,
             });
@@ -941,8 +971,11 @@ impl MerkleAttr {
         let mut integrity = [0u8; ATTR_INTEGRITY_SIZE];
         integrity.copy_from_slice(&data[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END]);
 
+        // Legacy format has no companion hash; use zeros
         let mut companion_hash = [0u8; ATTR_COMPANION_SIZE];
-        companion_hash.copy_from_slice(&data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]);
+        if is_current {
+            companion_hash.copy_from_slice(&data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]);
+        }
 
         // Verify integrity hash
         let expected_integrity = Self::compute_integrity(&root, algorithm);
@@ -969,16 +1002,25 @@ impl MerkleAttr {
     /// Verify the companion data integrity.
     ///
     /// Computes SHA-256 of the provided nodes data and compares with
-    /// the stored companion_hash. Returns false if companion_hash is
-    /// all zeros (no companion data expected).
+    /// the stored companion_hash.
+    ///
+    /// # Returns
+    ///
+    /// - `Valid`: Companion hash matches the provided data
+    /// - `NoCompanion`: No companion data present (hash is all zeros)
+    /// - `HashMismatch`: Verification failed (possible tampering)
     #[must_use]
-    pub fn verify_companion(&self, nodes_data: &[u8]) -> bool {
+    pub fn verify_companion(&self, nodes_data: &[u8]) -> CompanionVerifyResult {
         // All zeros means no companion data
         if self.companion_hash == [0u8; HASH_SIZE] {
-            return false;
+            return CompanionVerifyResult::NoCompanion;
         }
         let computed = compute_sha256(nodes_data);
-        constant_time_eq(&computed, &self.companion_hash)
+        if constant_time_eq(&computed, &self.companion_hash) {
+            CompanionVerifyResult::Valid
+        } else {
+            CompanionVerifyResult::HashMismatch
+        }
     }
 
     /// Check if this attribute has companion data.
@@ -1070,6 +1112,7 @@ impl<'a> MerkleAttrRef<'a> {
     /// Detect format version from data size.
     fn detect_version(size: usize) -> Result<u8, MerkleError> {
         match size {
+            MERKLE_ATTR_SIZE_LEGACY => Ok(MERKLE_ATTR_VERSION_LEGACY),
             MERKLE_ATTR_SIZE_V0 => Ok(MERKLE_ATTR_VERSION_0),
             _ => Err(MerkleError::InvalidAttribute {
                 reason: InvalidAttrReason::WrongSize,
@@ -1127,14 +1170,26 @@ impl<'a> MerkleAttrRef<'a> {
     }
 
     /// Get the companion hash (zero-copy slice).
+    ///
+    /// Returns an empty slice for legacy (65-byte) format attributes.
     #[must_use]
     pub fn companion_hash(&self) -> &[u8] {
-        &self.data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]
+        if self.version == MERKLE_ATTR_VERSION_LEGACY {
+            // Legacy format has no companion hash
+            &[]
+        } else {
+            &self.data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]
+        }
     }
 
     /// Check if this attribute has companion data.
+    ///
+    /// Returns `false` for legacy format or when companion hash is all zeros.
     #[must_use]
     pub fn has_companion(&self) -> bool {
+        if self.version == MERKLE_ATTR_VERSION_LEGACY {
+            return false;
+        }
         self.companion_hash().iter().any(|&b| b != 0)
     }
 
@@ -1160,19 +1215,27 @@ impl<'a> MerkleAttrRef<'a> {
 
     /// Verify companion data against the stored hash.
     ///
-    /// Returns `false` if no companion hash is present (all zeros).
+    /// # Returns
+    ///
+    /// - `Valid`: Companion hash matches the provided data
+    /// - `NoCompanion`: No companion data (legacy format or all zeros)
+    /// - `HashMismatch`: Verification failed (possible tampering)
     #[must_use]
-    pub fn verify_companion(&self, nodes_data: &[u8]) -> bool {
+    pub fn verify_companion(&self, nodes_data: &[u8]) -> CompanionVerifyResult {
         if !self.has_companion() {
-            return false;
+            return CompanionVerifyResult::NoCompanion;
         }
         let computed = compute_sha256(nodes_data);
         // Safe: companion_hash() always returns exactly HASH_SIZE bytes for v0
         let companion_arr: &[u8; HASH_SIZE] = match self.companion_hash().try_into() {
             Ok(arr) => arr,
-            Err(_) => return false,
+            Err(_) => return CompanionVerifyResult::NoCompanion,
         };
-        constant_time_eq(&computed, companion_arr)
+        if constant_time_eq(&computed, companion_arr) {
+            CompanionVerifyResult::Valid
+        } else {
+            CompanionVerifyResult::HashMismatch
+        }
     }
 
     /// Convert to an owned `MerkleAttr`, verifying integrity.
@@ -1211,9 +1274,10 @@ impl<'a> From<&'a MerkleAttr> for MerkleAttrRef<'static> {
 
 /// Write the merkle_root attribute to a dataset.
 ///
-/// Packs the root hash (32 bytes), algorithm identifier (1 byte), and
-/// companion integrity hash (32 bytes) into a fixed-width 65-byte binary
-/// blob and writes it as the HDF5 attribute `merkle_root`.
+/// Packs the root hash (32 bytes), algorithm identifier (1 byte),
+/// integrity hash (32 bytes), and companion hash (32 bytes) into a
+/// fixed-width 97-byte binary blob and writes it as the HDF5 attribute
+/// `merkle_root`.
 ///
 /// # Arguments
 ///
@@ -1260,6 +1324,106 @@ pub const MERKLE_NODES_ATTR_NAME: &str = "merkle_nodes";
 /// Name of the group containing companion merkle datasets.
 pub const MERKLE_GROUP_NAME: &str = "merkle";
 
+/// Pending companion dataset to be written.
+#[derive(Debug, Clone)]
+struct PendingCompanion {
+    name: String,
+    data: Vec<u8>,
+}
+
+/// Batched writer for merkle companion datasets.
+///
+/// Collects companion datasets and writes them to a single `/merkle` group
+/// when finalized. This avoids creating duplicate groups when multiple
+/// datasets require companion storage.
+///
+/// # Example
+///
+/// ```ignore
+/// use clawhdf5_format::merkle::{MerkleTree, HashAlg, MerkleCompanionWriter};
+/// use clawhdf5_format::file_writer::FileWriter;
+///
+/// let mut fw = FileWriter::new();
+/// let mut companion_writer = MerkleCompanionWriter::new();
+///
+/// // Add multiple datasets with merkle trees
+/// let tree1 = MerkleTree::from_chunks(&chunks1, HashAlg::Blake3);
+/// let result1 = companion_writer.add("dataset1", &tree1);
+///
+/// let tree2 = MerkleTree::from_chunks(&chunks2, HashAlg::Blake3);
+/// let result2 = companion_writer.add("dataset2", &tree2);
+///
+/// // Write all companion datasets to a single /merkle group
+/// companion_writer.finish(&mut fw);
+/// ```
+#[derive(Debug, Default)]
+pub struct MerkleCompanionWriter {
+    pending: Vec<PendingCompanion>,
+}
+
+impl MerkleCompanionWriter {
+    /// Create a new companion writer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+
+    /// Add a merkle tree's nodes, returning the storage result.
+    ///
+    /// For trees with ≤256 chunks, returns `Inline` with the packed nodes.
+    /// For larger trees, queues the companion dataset and returns `Dataset`.
+    pub fn add(&mut self, name: &str, tree: &MerkleTree) -> MerkleCompanionResult {
+        let nodes = tree.nodes();
+        let mut flat_nodes = Vec::with_capacity(nodes.len() * HASH_SIZE);
+        for node in nodes {
+            flat_nodes.extend_from_slice(node);
+        }
+
+        let companion_hash = compute_sha256(&flat_nodes);
+
+        if tree.leaf_count() <= INLINE_CHUNK_THRESHOLD {
+            MerkleCompanionResult::Inline {
+                nodes: flat_nodes,
+                companion_hash,
+            }
+        } else {
+            self.pending.push(PendingCompanion {
+                name: name.to_string(),
+                data: flat_nodes,
+            });
+            MerkleCompanionResult::Dataset { companion_hash }
+        }
+    }
+
+    /// Write all pending companion datasets to a single `/merkle` group.
+    ///
+    /// Does nothing if no datasets require companion storage.
+    pub fn finish(self, file: &mut crate::file_writer::FileWriter) {
+        if self.pending.is_empty() {
+            return;
+        }
+
+        let mut group = file.create_group(MERKLE_GROUP_NAME);
+        for companion in self.pending {
+            let ds = group.create_dataset(&companion.name);
+            ds.with_u8_data(&companion.data);
+        }
+        file.add_group(group.finish());
+    }
+
+    /// Check if any companion datasets are pending.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Get the number of pending companion datasets.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 /// Result of `write_merkle_companion` indicating storage method and companion hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MerkleCompanionResult {
@@ -1285,6 +1449,10 @@ pub enum MerkleCompanionResult {
 
 /// Write merkle tree node data, using companion dataset for large trees.
 ///
+/// **Warning**: This function creates a new `/merkle` group each time it's called
+/// for a large dataset. For files with multiple datasets requiring companion storage,
+/// use [`MerkleCompanionWriter`] instead to batch writes to a single group.
+///
 /// For datasets with 256 or fewer chunks, returns packed node hashes that
 /// should be written as a `merkle_nodes` attribute on the dataset. For larger
 /// datasets, writes the nodes as a flat u8 dataset at `/merkle/{name}`.
@@ -1301,8 +1469,8 @@ pub enum MerkleCompanionResult {
 ///
 /// # Returns
 ///
-/// - `Ok(Inline(bytes))` - For trees with ≤256 chunks. Add bytes as `merkle_nodes` attribute.
-/// - `Ok(Dataset)` - For larger trees. Companion dataset was written at `/merkle/{name}`.
+/// - `Ok(Inline { nodes, companion_hash })` - For trees with ≤256 chunks
+/// - `Ok(Dataset { companion_hash })` - For larger trees
 ///
 /// # Layout
 ///
@@ -1327,10 +1495,10 @@ pub enum MerkleCompanionResult {
 /// ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
 ///
 /// match write_merkle_companion(&mut fw, "data", &tree)? {
-///     MerkleCompanionResult::Inline(bytes) => {
-///         ds.set_attr("merkle_nodes", AttrValue::Bytes(bytes));
+///     MerkleCompanionResult::Inline { nodes, companion_hash } => {
+///         ds.set_attr("merkle_nodes", AttrValue::Bytes(nodes));
 ///     }
-///     MerkleCompanionResult::Dataset => {
+///     MerkleCompanionResult::Dataset { companion_hash } => {
 ///         // Companion dataset already written at /merkle/data
 ///     }
 /// }
@@ -2056,7 +2224,7 @@ mod tests {
         assert!(MerkleAttr::unpack(&[0u8; 98]).is_err());
         // Empty
         assert!(MerkleAttr::unpack(&[]).is_err());
-        // Old size (65 bytes) should also fail
+        // Legacy size (65 bytes) is valid but all-zeros fails integrity check
         assert!(MerkleAttr::unpack(&[0u8; 65]).is_err());
     }
 
@@ -2285,12 +2453,18 @@ mod tests {
         let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
 
         // Verify with correct data
-        assert!(attr.verify_companion(&flat_nodes));
+        assert_eq!(
+            attr.verify_companion(&flat_nodes),
+            CompanionVerifyResult::Valid
+        );
 
         // Verify with tampered data fails
         let mut tampered = flat_nodes.clone();
         tampered[0] ^= 0xFF;
-        assert!(!attr.verify_companion(&tampered));
+        assert_eq!(
+            attr.verify_companion(&tampered),
+            CompanionVerifyResult::HashMismatch
+        );
     }
 
     /// Round-trip test: write 1024-chunk dataset with merkle companion,
@@ -2419,9 +2593,10 @@ mod tests {
         );
 
         // Also verify using the verify_companion method
-        assert!(
+        assert_eq!(
             unpacked.verify_companion(&companion_bytes),
-            "verify_companion should return true"
+            CompanionVerifyResult::Valid,
+            "verify_companion should return Valid"
         );
 
         // Verify node count: 1024 leaves padded to 1024 (power of 2), so 2047 nodes
@@ -2529,9 +2704,11 @@ mod tests {
         assert!(MerkleAttrRef::from_slice(&[0u8; 98]).is_err());
         // Empty
         assert!(MerkleAttrRef::from_slice(&[]).is_err());
-        // Old size (65 bytes)
-        assert!(MerkleAttrRef::from_slice(&[0u8; 65]).is_err());
-        // Correct size should work (even with invalid content)
+        // Legacy size (65 bytes) is valid
+        let legacy_ref = MerkleAttrRef::from_slice(&[0u8; 65]).unwrap();
+        assert_eq!(legacy_ref.version(), MERKLE_ATTR_VERSION_LEGACY);
+        assert!(!legacy_ref.has_companion());
+        // Current size (97 bytes) should work
         assert!(MerkleAttrRef::from_slice(&[0u8; 97]).is_ok());
     }
 
@@ -2555,11 +2732,17 @@ mod tests {
         // Zero-copy reference should verify companion
         let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
         assert!(attr_ref.has_companion());
-        assert!(attr_ref.verify_companion(&flat_nodes));
+        assert_eq!(
+            attr_ref.verify_companion(&flat_nodes),
+            CompanionVerifyResult::Valid
+        );
 
         // Wrong data should fail
         let wrong_data = vec![0u8; flat_nodes.len()];
-        assert!(!attr_ref.verify_companion(&wrong_data));
+        assert_eq!(
+            attr_ref.verify_companion(&wrong_data),
+            CompanionVerifyResult::HashMismatch
+        );
     }
 
     #[test]

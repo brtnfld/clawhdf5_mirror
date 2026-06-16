@@ -1,3 +1,4 @@
 /target
 Cargo.lock
 benchmarks/longmemeval/*.json
+benches/results/
