@@ -57,16 +57,16 @@ def get_hostname():
 
 
 def parse_throughput(text):
-    """Parse throughput value and convert to MB/s.
+    """Parse throughput value and convert to MiB/s.
 
-    Criterion outputs in GiB/s, we convert to MB/s (1 GiB = 1073.74 MB).
+    Criterion outputs in GiB/s, we convert to MiB/s (1 GiB = 1024 MiB).
     """
     # Match patterns like "2.2168 GiB/s" or "5.5041 GiB/s"
     match = re.search(r"([\d.]+)\s*GiB/s", text)
     if match:
         gib_per_sec = float(match.group(1))
-        # Convert GiB/s to MB/s (1 GiB = 1024 MiB = 1073.741824 MB)
-        return gib_per_sec * 1024  # MiB/s (using binary units for consistency)
+        # Convert GiB/s to MiB/s (1 GiB = 1024 MiB)
+        return gib_per_sec * 1024
     return None
 
 
@@ -122,7 +122,7 @@ def parse_benchmark_results(filepath):
         results.append({
             "alg": alg,
             "chunk_size_kb": chunk_kb,
-            "throughput_mbs": round(thrpt_med, 2),
+            "throughput_mibs": round(thrpt_med, 2),
             "ci95_low": round(thrpt_low, 2),
             "ci95_high": round(thrpt_high, 2),
             "platform": plat,
@@ -138,7 +138,7 @@ def write_csv(results, output_path):
     fieldnames = [
         "alg",
         "chunk_size_kb",
-        "throughput_mbs",
+        "throughput_mibs",
         "ci95_low",
         "ci95_high",
         "platform",
@@ -198,7 +198,7 @@ def main():
     print("-" * 60)
     for r in results:
         chunk = f"{r['chunk_size_kb']} KB"
-        thrpt = f"{r['throughput_mbs']:.1f}"
+        thrpt = f"{r['throughput_mibs']:.1f}"
         ci = f"[{r['ci95_low']:.1f}, {r['ci95_high']:.1f}]"
         print(f"{r['alg']:<10} {chunk:<8} {thrpt:<20} {ci}")
 
