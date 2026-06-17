@@ -2373,6 +2373,68 @@ mod tests {
 
     #[test]
     #[cfg(feature = "blake3")]
+    fn test_merkle_companion_writer_multi_dataset() {
+        use crate::file_writer::FileWriter;
+
+        // Create two large trees (>256 chunks each) that require companion datasets
+        let chunks1: Vec<Vec<u8>> = (0..300).map(|i| vec![(i % 256) as u8; 64]).collect();
+        let refs1: Vec<&[u8]> = chunks1.iter().map(|c| c.as_slice()).collect();
+        let tree1 = MerkleTree::from_chunks(&refs1, HashAlg::Blake3);
+
+        let chunks2: Vec<Vec<u8>> = (0..400).map(|i| vec![((i + 50) % 256) as u8; 64]).collect();
+        let refs2: Vec<&[u8]> = chunks2.iter().map(|c| c.as_slice()).collect();
+        let tree2 = MerkleTree::from_chunks(&refs2, HashAlg::Blake3);
+
+        // Both trees should require companion datasets (>256 chunks)
+        assert!(tree1.leaf_count() > INLINE_CHUNK_THRESHOLD);
+        assert!(tree2.leaf_count() > INLINE_CHUNK_THRESHOLD);
+
+        let mut fw = FileWriter::new();
+        let mut companion_writer = MerkleCompanionWriter::new();
+
+        // Add both trees to the batched writer
+        let result1 = companion_writer.add("dataset1", &tree1);
+        let result2 = companion_writer.add("dataset2", &tree2);
+
+        // Both should return Dataset results (queued for writing)
+        match result1 {
+            MerkleCompanionResult::Dataset { companion_hash } => {
+                assert_ne!(companion_hash, [0u8; HASH_SIZE]);
+            }
+            MerkleCompanionResult::Inline { .. } => {
+                panic!("Expected Dataset result for large tree1");
+            }
+        }
+
+        match result2 {
+            MerkleCompanionResult::Dataset { companion_hash } => {
+                assert_ne!(companion_hash, [0u8; HASH_SIZE]);
+            }
+            MerkleCompanionResult::Inline { .. } => {
+                panic!("Expected Dataset result for large tree2");
+            }
+        }
+
+        // Verify pending state
+        assert!(companion_writer.has_pending());
+        assert_eq!(companion_writer.pending_count(), 2);
+
+        // Create main datasets
+        let ds1 = fw.create_dataset("dataset1");
+        ds1.with_u8_data(&[1, 2, 3, 4]);
+        let ds2 = fw.create_dataset("dataset2");
+        ds2.with_u8_data(&[5, 6, 7, 8]);
+
+        // Write all companion datasets to single /merkle group
+        companion_writer.finish(&mut fw);
+
+        // Finish file and verify it's valid
+        let bytes = fw.finish().expect("file should build");
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
     fn test_merkle_attr_with_companion_hash() {
         let chunks = make_test_chunks();
         let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();

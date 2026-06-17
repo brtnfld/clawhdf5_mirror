@@ -835,3 +835,68 @@ fn provenance_verify_written_file() {
             .unwrap();
     assert_eq!(result, clawhdf5_format::provenance::VerifyResult::Ok);
 }
+
+// ---- h5py interop: merkle_root attribute ----
+
+#[test]
+#[ignore = "requires Python h5py module"]
+#[cfg(feature = "merkle")]
+fn h5py_reads_merkle_root_attribute() {
+    use clawhdf5_format::merkle::{HashAlg, MerkleAttr, MerkleTree, MERKLE_ATTR_NAME, MERKLE_ATTR_SIZE};
+
+    // Create a merkle tree from some test chunks
+    let chunks: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 64]).collect();
+    let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+    let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+    // Create attribute
+    let attr = MerkleAttr::from_tree(&tree);
+    let packed = attr.pack();
+    assert_eq!(packed.len(), MERKLE_ATTR_SIZE); // 97 bytes
+
+    // Write HDF5 file with merkle_root attribute
+    let mut fw = FileWriter::new();
+    fw.create_dataset("data")
+        .with_u8_data(&[1, 2, 3, 4])
+        .set_attr(MERKLE_ATTR_NAME, AttrValue::Bytes(packed.to_vec()));
+    let bytes = fw.finish().unwrap();
+
+    let path = std::env::temp_dir().join("clawhdf5_test_merkle_root.h5");
+    std::fs::write(&path, &bytes).unwrap();
+
+    // Verify h5py can read the 97-byte attribute
+    let script = format!(
+        r#"
+import h5py
+import json
+
+f = h5py.File('{}', 'r')
+ds = f['data']
+attr = ds.attrs['{}']
+
+# Verify attribute is readable and has correct size
+result = {{
+    'size': len(attr),
+    'dtype': str(attr.dtype),
+    'root_hash_hex': attr[:32].tobytes().hex(),
+    'alg_id': int(attr[32]),
+}}
+print(json.dumps(result))
+"#,
+        path.display(),
+        MERKLE_ATTR_NAME
+    );
+
+    let stdout = h5py_read(&path, &script);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    // Verify attribute size is 97 bytes
+    assert_eq!(v["size"], serde_json::json!(97));
+
+    // Verify root hash matches what we wrote (convert to hex manually)
+    let expected_root_hex: String = attr.root.iter().map(|b| format!("{:02x}", b)).collect();
+    assert_eq!(v["root_hash_hex"].as_str().unwrap(), expected_root_hex);
+
+    // Verify algorithm ID (BLAKE3 = 1)
+    assert_eq!(v["alg_id"], serde_json::json!(1));
+}

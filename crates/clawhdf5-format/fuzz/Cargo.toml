@@ -12,7 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.clawhdf5-format]
 path = ".."
-features = ["std", "checksum", "deflate"]
+features = ["std", "checksum", "deflate", "merkle"]
 
 [workspace]
 members = ["."]
@@ -55,4 +55,9 @@ doc = false
 [[bin]]
 name = "fuzz_full_file"
 path = "fuzz_targets/fuzz_full_file.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_merkle_attr"
+path = "fuzz_targets/fuzz_merkle_attr.rs"
 doc = false
