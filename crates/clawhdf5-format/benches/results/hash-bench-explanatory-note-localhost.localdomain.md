@@ -47,6 +47,12 @@ the same leaf-hashing helper the `MerkleTree` itself uses (P1.2 step 3) —
 so these throughput numbers characterize the actual function on the actual
 critical path, not a standalone copy of the algorithm.
 
+## How to read the plot
+
+`plot_hash_throughput.png`: grouped bars per algorithm at each chunk size,
+with 95% CI error bars (too narrow to see at this scale — see the CSV for
+exact bounds).
+
 ## How to read the CSV
 
 Each row is one (algorithm, chunk size) cell: `throughput_mbs` is the
