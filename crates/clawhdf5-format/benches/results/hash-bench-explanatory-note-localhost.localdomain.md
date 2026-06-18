@@ -1,7 +1,8 @@
 # P1.2 Hash Algorithm Benchmark — Explanatory Note
 
-This note accompanies `hash-bench-localhost.localdomain.csv`, per the S2-D2
-spec's "Benchmark validity and interpretation" requirement (p.52): every
+This note accompanies `hash-bench-localhost.localdomain.csv` and
+`hash-bench-raw-trials-localhost.localdomain.csv`, per the S2-D2 spec's
+"Benchmark validity and interpretation" requirement (p.52): every
 benchmark artifact needs a reproducible explanatory note covering exact
 reproduction steps, hardware, what is measured, how to read the results,
 and a root-cause explanation of any notable trend or anomaly.
@@ -49,30 +50,48 @@ critical path, not a standalone copy of the algorithm.
 
 ## How to read the plot
 
-`plot_hash_throughput.png`: one main log-scale point+errorbar plot
-comparing all three algorithms across chunk sizes, plus three small
-zoomed-in inset panels below it (one per algorithm, each individually
-y-scaled) — the main plot's 95% CIs are too narrow to see at that shared
-scale, so each inset re-plots its algorithm's own CI on a tight axis
-range where the whiskers are actually visible.
+- `plot_hash_throughput.png`: one main log-scale point+errorbar plot
+  comparing all three algorithms across chunk sizes, plus three small
+  zoomed-in inset panels below it (one per algorithm, each individually
+  y-scaled) — the main plot's 95% CIs are too narrow to see at that shared
+  scale, so each inset re-plots its algorithm's own CI on a tight axis
+  range where the whiskers are actually visible.
+- `plot_hash_throughput_spread.png`: a separate plot, one panel per
+  algorithm, showing the **raw spread of the 30 measured trials** rather
+  than the bootstrap CI on the median: a thin whisker for min/max and a
+  thick band for the IQR (25th-75th percentile), with the median marked
+  as a dot. This is a different statistic than the CI plot above — see
+  "How to read the CSV" below for the distinction — and is generally much
+  wider, since it reflects trial-to-trial variability directly rather than
+  uncertainty in the median estimate.
 
 ## How to read the CSV
 
-Each row is one (algorithm, chunk size) cell: `throughput_mbs` is the
-**median of the 30 measured trials**, with `ci95_low`/`ci95_high` from a
-**95% bootstrap confidence interval** (2000 resamples) — never a bare mean,
-per the statistical protocol.
+`hash-bench-localhost.localdomain.csv` (the spec-mandated artifact): each
+row is one (algorithm, chunk size) cell, `throughput_mbs` is the **median
+of the 30 measured trials**, with `ci95_low`/`ci95_high` from a **95%
+bootstrap confidence interval** (2000 resamples) — never a bare mean, per
+the statistical protocol. This CI describes how much the *median* would
+plausibly vary if the 30-trial experiment were rerun, not how spread out
+the raw trials themselves were.
+
+`hash-bench-raw-trials-localhost.localdomain.csv` (supplementary, not a
+spec-mandated column set): one row per individual trial — `alg,
+chunk_size_kb, trial, throughput_mbs` — the same 30 raw measurements per
+cell that feed into the summary CSV's median/CI, kept around so the raw
+spread (min/max, IQR) can also be reported, e.g. in
+`plot_hash_throughput_spread.png`.
 
 ## Expected trends and whether the data matches
 
-- **BLAKE3 throughput increases with chunk size** (6.6 GB/s at 64 KB → 10.5
-  GB/s at 256 KB → 12.2 GB/s at 1 MB). Matches expectation: BLAKE3 processes
+- **BLAKE3 throughput increases with chunk size** (6.7 GB/s at 64 KB → 10.6
+  GB/s at 256 KB → 12.5 GB/s at 1 MB). Matches expectation: BLAKE3 processes
   input in parallel 1 KB-leaf lanes internally (SIMD-width dependent), so
   larger inputs better amortize per-call setup cost and expose more
   parallelism — consistent with RQ4's framing of BLAKE3 as the
   parallelism-oriented design.
 - **SHA-256 and K12 throughput are flat across chunk sizes** (SHA-256:
-  ~2.70–2.72 GB/s; K12: ~1.57–1.58 GB/s). Matches expectation for both:
+  ~2.73–2.74 GB/s; K12: ~1.59–1.60 GB/s). Matches expectation for both:
   neither this `sha2` usage nor `k12`'s sponge construction exploits
   cross-chunk-size parallelism the way BLAKE3's tree does, so per-byte cost
   is roughly constant once warmed up.
@@ -80,7 +99,7 @@ per the statistical protocol.
 ## Anomaly: SHA-256 is faster than K12, despite K12 being the
 "very fast" candidate
 
-At every chunk size, SHA-256 (~2.7 GB/s) outperforms K12 (~1.58 GB/s) by
+At every chunk size, SHA-256 (~2.7 GB/s) outperforms K12 (~1.6 GB/s) by
 ~1.7x — the opposite of §5.3's framing of K12 as a faster SHA-3-family
 alternative to SHA-256 for throughput-bound deployments.
 
@@ -122,10 +141,14 @@ hardware acceleration when available.)
 
 ## Observation: CI width (as % of median) grows with chunk size for SHA-256 and K12
 
-Within the committed 64/256/1024 KB cells, SHA-256's CI width goes
-0.04% → 0.15% → 0.71% of the median, and K12's goes ~0.05% → 0.14% → 0.31%
-— both widening as chunk size increases, even though the underlying
-algorithms are unchanged.
+Within the committed 64/256/1024 KB cells (most recent run), SHA-256's CI
+width is ~0.04% → 0.04% → 0.30% of the median, and K12's is ~0.31% →
+0.30% → 0.25%. The exact figures are noisy run-to-run (rerunning the
+harness for the spread plot above shifted them somewhat from an earlier
+run, where SHA-256 went 0.04% → 0.15% → 0.71%), but the broader pattern —
+SHA-256 and K12 having visibly wider CIs at 1024 KB than at 64 KB in most
+runs, all still comfortably sub-1% — motivated checking whether this is a
+real, chunk-size-driven effect rather than noise.
 
 To see the actual shape of this trend (not just three points) and check
 for a sharp cache-capacity-wall effect, `CHUNK_SIZES_KB` was temporarily

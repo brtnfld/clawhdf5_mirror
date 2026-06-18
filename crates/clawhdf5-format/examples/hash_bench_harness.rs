@@ -174,6 +174,10 @@ struct Row {
     throughput_mbs: f64,
     ci95_low: f64,
     ci95_high: f64,
+    /// All 30 measured per-trial throughputs, kept alongside the summary
+    /// row so callers can also report raw spread (min/max/IQR) — not part
+    /// of the spec-mandated CSV columns, written to a separate sidecar file.
+    raw_samples: Vec<f64>,
 }
 
 fn bench_alg_size(alg: HashAlg, alg_name: &'static str, chunk_kb: usize, seed: u64) -> Row {
@@ -201,6 +205,7 @@ fn bench_alg_size(alg: HashAlg, alg_name: &'static str, chunk_kb: usize, seed: u
         throughput_mbs: med,
         ci95_low: lo,
         ci95_high: hi,
+        raw_samples: throughputs_mbs,
     }
 }
 
@@ -259,9 +264,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     fs::write(&out_path, csv)?;
 
+    let raw_out_path = format!("{results_dir}/hash-bench-raw-trials-{host}.csv");
+    let mut raw_csv = format!(
+        "# hostname={host} cpu_model=\"{cpu}\" ram_gb={:.1} date={}\n",
+        ram_gb(),
+        now_utc_iso()
+    );
+    raw_csv.push_str("alg,chunk_size_kb,trial,throughput_mbs\n");
+    for r in &rows {
+        for (i, sample) in r.raw_samples.iter().enumerate() {
+            raw_csv.push_str(&format!(
+                "{},{},{},{}\n",
+                csv_field(r.alg),
+                r.chunk_size_kb,
+                i,
+                sample,
+            ));
+        }
+    }
+    fs::write(&raw_out_path, raw_csv)?;
+
     println!();
     println!("Wrote {} rows to {out_path}", rows.len());
-    println!("Note: benches/results/ is gitignored — `git add -f` this file if you intend to commit it as a P1.2 artifact.");
+    println!("Wrote raw per-trial samples to {raw_out_path}");
+    println!("Note: benches/results/ is gitignored — `git add -f` these files if you intend to commit them as P1.2 artifacts.");
 
     Ok(())
 }
