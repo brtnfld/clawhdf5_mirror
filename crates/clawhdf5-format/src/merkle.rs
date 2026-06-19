@@ -2777,28 +2777,66 @@ mod tests {
         assert_eq!(MERKLE_ATTR_SIZE, 97);
     }
 
+    /// Verify that `from_chunks_parallel` and `from_chunks` produce identical roots.
+    ///
+    /// Tests with a 1,024-chunk synthetic dataset on at least 4 rayon threads.
     #[test]
     #[cfg(all(feature = "parallel", feature = "sha2", feature = "blake3", feature = "k12"))]
     fn test_parallel_build_correctness() {
-        // Verify that from_chunks_parallel and from_chunks produce identical
-        // Merkle roots for all three hash algorithms on a 1,024-chunk dataset,
-        // per P1.3b step 4 (spec requires ≥4 rayon threads; rayon uses all
-        // available threads by default, so this holds on any multi-core host).
-        let n = 1024;
-        let chunk_size = 1024;
-        let chunks: Vec<Vec<u8>> = (0..n)
-            .map(|i| (0..chunk_size).map(|j| ((i * 31 + j * 17) % 256) as u8).collect())
-            .collect();
-        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        use rayon::ThreadPoolBuilder;
 
-        for alg in [HashAlg::Sha256, HashAlg::Blake3, HashAlg::K12] {
-            let seq = MerkleTree::from_chunks(&refs, alg);
-            let par = MerkleTree::from_chunks_parallel(&refs, alg);
-            assert_eq!(
-                seq.root(),
-                par.root(),
-                "sequential and parallel roots differ for {alg:?}"
-            );
-        }
+        // Ensure at least 4 threads
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("failed to create thread pool");
+
+        pool.install(|| {
+            // Create 1024 synthetic chunks with varying sizes
+            let chunks: Vec<Vec<u8>> = (0..1024)
+                .map(|i| {
+                    // Vary chunk size from 64 to 1024 bytes
+                    let size = 64 + (i % 16) * 64;
+                    let mut chunk = vec![0u8; size];
+                    // Fill with predictable but varying pattern
+                    for (j, byte) in chunk.iter_mut().enumerate() {
+                        *byte = ((i * 31 + j * 17) % 256) as u8;
+                    }
+                    chunk
+                })
+                .collect();
+
+            let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+            // Test all three hash algorithms
+            for alg in [HashAlg::Sha256, HashAlg::Blake3, HashAlg::K12] {
+                let tree_seq = MerkleTree::from_chunks(&refs, alg);
+                let tree_par = MerkleTree::from_chunks_parallel(&refs, alg);
+
+                assert_eq!(
+                    tree_seq.root(),
+                    tree_par.root(),
+                    "Root mismatch for {:?}",
+                    alg
+                );
+
+                assert_eq!(
+                    tree_seq.nodes().len(),
+                    tree_par.nodes().len(),
+                    "Node count mismatch for {:?}",
+                    alg
+                );
+
+                for (i, (seq_node, par_node)) in
+                    tree_seq.nodes().iter().zip(tree_par.nodes().iter()).enumerate()
+                {
+                    assert_eq!(
+                        seq_node, par_node,
+                        "Node {} mismatch for {:?}",
+                        i, alg
+                    );
+                }
+            }
+        });
     }
 }
