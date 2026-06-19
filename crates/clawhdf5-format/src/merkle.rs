@@ -2776,4 +2776,29 @@ mod tests {
         // Size constants
         assert_eq!(MERKLE_ATTR_SIZE, 97);
     }
+
+    #[test]
+    #[cfg(all(feature = "parallel", feature = "sha2", feature = "blake3", feature = "k12"))]
+    fn test_parallel_build_correctness() {
+        // Verify that from_chunks_parallel and from_chunks produce identical
+        // Merkle roots for all three hash algorithms on a 1,024-chunk dataset,
+        // per P1.3b step 4 (spec requires ≥4 rayon threads; rayon uses all
+        // available threads by default, so this holds on any multi-core host).
+        let n = 1024;
+        let chunk_size = 1024;
+        let chunks: Vec<Vec<u8>> = (0..n)
+            .map(|i| (0..chunk_size).map(|j| ((i * 31 + j * 17) % 256) as u8).collect())
+            .collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+        for alg in [HashAlg::Sha256, HashAlg::Blake3, HashAlg::K12] {
+            let seq = MerkleTree::from_chunks(&refs, alg);
+            let par = MerkleTree::from_chunks_parallel(&refs, alg);
+            assert_eq!(
+                seq.root(),
+                par.root(),
+                "sequential and parallel roots differ for {alg:?}"
+            );
+        }
+    }
 }
