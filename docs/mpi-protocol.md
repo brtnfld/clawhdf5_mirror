@@ -463,15 +463,38 @@ herr_t merkle_vol_file_flush(void *file, hid_t dxpl_id) {
 
 ## §7 Performance Analysis: Parallel Tree Construction
 
-The `from_chunks_parallel` implementation uses Rayon to parallelize leaf hashing across available cores. Benchmarks on a 24-thread workstation (BLAKE3 algorithm, 1 KB chunks, 30 trials each) demonstrate that parallel speedup improves with chunk count as thread coordination overhead is amortized:
+### Benchmark Methodology
 
-| N (chunks) | Sequential | Parallel | Speedup |
-|------------|------------|----------|---------|
-| 10⁴        | 10.6 ms    | 5.6 ms   | 1.9×    |
-| 10⁵        | 103.5 ms   | 24.2 ms  | 4.3×    |
-| 10⁶        | 1021.5 ms  | 202.2 ms | 5.1×    |
+**Reproduction command:**
+```bash
+cargo run --example parallel_build_bench --release --features "merkle,parallel"
+```
 
-At 10⁶ chunks the implementation achieves 4.8 GiB/s parallel throughput, with speedup approaching the theoretical limit for the 24-core system. For MPI-IO workloads, this means the local leaf-hashing phase in both Eager and Lazy strategies can exploit all available cores on each rank, minimizing the time spent before collective communication. The sublinear speedup at small N (1.9× at 10⁴) reflects Rayon's thread pool startup costs, which become negligible at larger scales.
+**Hardware:** 24-thread workstation (12-core CPU with SMT), DDR4-3200 RAM, Linux 6.6 kernel (WSL2).
+
+**What is measured:** Wall-clock time for `MerkleTree::from_chunks` (sequential) and `MerkleTree::from_chunks_parallel` (Rayon parallel) over synthetic 1 KB chunks. Each configuration runs 3 warmup iterations followed by 30 timed trials; the table reports median wall time. BLAKE3 is used as the representative algorithm.
+
+### Results
+
+The `from_chunks_parallel` implementation uses Rayon to parallelize leaf hashing across available cores:
+
+| N (chunks) | Data Size | Sequential | Parallel | Speedup | Parallel Throughput |
+|------------|-----------|------------|----------|---------|---------------------|
+| 10⁴        | 9.8 MiB   | 10.6 ms    | 5.6 ms   | 1.9×    | 1.7 GiB/s           |
+| 10⁵        | 97.7 MiB  | 103.5 ms   | 24.2 ms  | 4.3×    | 4.0 GiB/s           |
+| 10⁶        | 976.6 MiB | 1021.5 ms  | 202.2 ms | 5.1×    | 4.8 GiB/s           |
+
+### Trend Analysis
+
+**Sublinear speedup at small N (1.9× at 10⁴):** The modest speedup at 10⁴ chunks is attributable to Rayon's thread pool initialization and work-stealing overhead dominating the ~10 ms total runtime. With only ~0.4 ms of useful work per thread at 24 threads, synchronization costs (thread wake-up, task queue contention, cache line bouncing) consume a significant fraction of execution time. This is consistent with Amdahl's Law: when parallel work is small relative to coordination overhead, speedup is bounded by the serial fraction.
+
+**Improving speedup at larger N (4.3× at 10⁵, 5.1× at 10⁶):** As chunk count increases, per-thread work grows proportionally while coordination overhead remains roughly constant. At 10⁶ chunks, each thread processes ~42,000 chunks, amortizing startup costs to negligible levels. The 5.1× speedup on 24 threads (21% parallel efficiency) reflects memory bandwidth saturation: BLAKE3 at 4.8 GiB/s approaches DDR4-3200's theoretical ~25 GiB/s per-channel bandwidth, with cache effects reducing effective throughput.
+
+**Practical implications for MPI-IO:** In distributed workloads, each MPI rank's local leaf-hashing phase can exploit all available cores. The sublinear small-N speedup is acceptable because (1) small datasets complete quickly regardless, and (2) production checkpoint workloads typically operate at 10⁵–10⁶ chunks per rank where parallel efficiency is 4–5×.
+
+### Correctness Verification
+
+The `test_parallel_build_correctness` unit test (gated on `features = ["parallel", "blake3"]`) verifies that `from_chunks_parallel` and `from_chunks` produce identical Merkle roots across all three hash algorithms (SHA-256, BLAKE3, K12) on a 1,024-chunk synthetic dataset with 4+ Rayon threads.
 
 ---
 

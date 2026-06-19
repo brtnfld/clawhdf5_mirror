@@ -5,7 +5,7 @@
 //! Output CSV columns: mode, n_chunks, wall_time_ms, n_threads, trial, hostname
 
 use clawhdf5_format::merkle::{HashAlg, MerkleTree};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::time::Instant;
 
@@ -27,10 +27,11 @@ fn main() {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let output_path = format!(
-        "crates/clawhdf5-format/benches/results/parallel-build-{}.csv",
-        hostname
-    );
+    // Use CARGO_MANIFEST_DIR to work from any working directory
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let results_dir = format!("{manifest_dir}/benches/results");
+    fs::create_dir_all(&results_dir).expect("Failed to create results directory");
+    let output_path = format!("{results_dir}/parallel-build-{hostname}.csv");
 
     // Get number of threads
     let n_threads = std::thread::available_parallelism()
