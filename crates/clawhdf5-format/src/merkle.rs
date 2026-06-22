@@ -56,6 +56,7 @@ const NULL_SENTINEL_DATA: &[u8] = b"null";
 
 /// Errors that can occur during Merkle tree operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MerkleError {
     /// Leaf hash does not match recomputed value.
     HashMismatch {
@@ -163,20 +164,16 @@ impl std::error::Error for MerkleError {}
 /// In Phase 1, all errors result in `Halt`. Before halting, callers should
 /// log the error context: file path, dataset name, chunk index, and error
 /// variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum VerifyResponse {
     /// Stop all operations immediately. Fail-closed policy (Phase 1 default).
+    #[default]
     Halt,
     /// Isolate the affected data for later inspection (Phase 2.2b).
     Quarantine,
     /// Log the error but continue operation (Phase 2.2b).
     Alert,
-}
-
-impl Default for VerifyResponse {
-    fn default() -> Self {
-        VerifyResponse::Halt
-    }
 }
 
 /// Returns the default response policy for a given error variant.
@@ -1599,10 +1596,10 @@ pub struct Dataset<'a> {
     pub metadata: &'a DatasetMetadata,
     /// Raw file buffer for reading chunk data
     pub file_data: &'a [u8],
-    /// Superblock offset size for parsing
-    pub offset_size: u8,
-    /// Superblock length size for parsing
-    pub length_size: u8,
+    /// Size of offsets (HDF5 spec: "Size of Offsets")
+    pub size_of_offsets: u8,
+    /// Size of lengths (HDF5 spec: "Size of Lengths")
+    pub size_of_lengths: u8,
 }
 
 /// Verify the companion dataset integrity (fast, sub-second check).
@@ -2117,6 +2114,97 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("50"));
         assert!(msg.contains("40"));
+    }
+
+    #[test]
+    fn test_default_response_returns_halt_for_all_variants() {
+        // Phase 1 (fail-closed): every error variant must return Halt
+        let errors: Vec<MerkleError> = vec![
+            MerkleError::HashMismatch { chunk_idx: 0 },
+            MerkleError::CompanionTampered,
+            MerkleError::SignatureInvalid,
+            MerkleError::MissingChunkGridMetadata,
+            MerkleError::HyperslabOutOfBounds { idx: 0 },
+            MerkleError::TreeTooDeep { depth: 50 },
+            MerkleError::NoncePending,
+            MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize },
+        ];
+
+        for err in &errors {
+            assert_eq!(
+                default_response(err),
+                VerifyResponse::Halt,
+                "Phase 1 fail-closed: {:?} should return Halt",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_response_default_is_halt() {
+        assert_eq!(VerifyResponse::default(), VerifyResponse::Halt);
+    }
+
+    /// Regression fixture for the verification API error variants.
+    ///
+    /// Documents the five expected `MerkleError` variants that the verification
+    /// functions (`verify_root`, `verify_chunk`, `verify_dataset`, `extend_merkle`,
+    /// `update_merkle`) can return during tamper detection:
+    ///
+    /// 1. `HashMismatch` - chunk data tampered (verify_chunk, verify_dataset)
+    /// 2. `CompanionTampered` - companion dataset tampered (verify_root)
+    /// 3. `NoncePending` - WAL has uncommitted entries (verify_chunk, extend/update)
+    /// 4. `HyperslabOutOfBounds` - invalid chunk index (verify_chunk, extend/update)
+    /// 5. `MissingChunkGridMetadata` - no Merkle metadata present (all functions)
+    ///
+    /// Phase 1 fail-closed policy: all variants return `Halt`.
+    ///
+    /// **P2.2b regression**: When Phase 2.2b changes the response policy (e.g.,
+    /// `NoncePending` → `Alert`, `HyperslabOutOfBounds` → `Quarantine`), this test
+    /// will fail, signaling the intentional policy change.
+    #[test]
+    fn test_verification_api_error_variants_regression() {
+        // The five expected MerkleError variants from the verification API
+        let verification_api_errors: [(MerkleError, &str); 5] = [
+            (
+                MerkleError::HashMismatch { chunk_idx: 512 },
+                "verify_chunk/verify_dataset: tampered chunk data",
+            ),
+            (
+                MerkleError::CompanionTampered,
+                "verify_root: tampered companion dataset",
+            ),
+            (
+                MerkleError::NoncePending,
+                "verify_chunk/extend/update: WAL uncommitted entry",
+            ),
+            (
+                MerkleError::HyperslabOutOfBounds { idx: 1024 },
+                "verify_chunk/extend/update: invalid chunk index",
+            ),
+            (
+                MerkleError::MissingChunkGridMetadata,
+                "all verify functions: no Merkle metadata",
+            ),
+        ];
+
+        // Phase 1 fail-closed: every verification error returns Halt
+        for (error, context) in &verification_api_errors {
+            assert_eq!(
+                default_response(error),
+                VerifyResponse::Halt,
+                "P1 fail-closed violated for {}: {:?}",
+                context,
+                error
+            );
+        }
+
+        // Verify we tested exactly 5 variants (regression guard)
+        assert_eq!(
+            verification_api_errors.len(),
+            5,
+            "Expected exactly 5 verification API error variants"
+        );
     }
 
     #[test]
@@ -3110,8 +3198,6 @@ mod tests {
     #[ignore = "Phase 3: verify_chunk not yet implemented"]
     #[cfg(feature = "std")]
     fn test_tampered_chunk_detected_by_verify_chunk() {
-        use crate::metadata_index::DatasetMetadata;
-
         let chunks = make_tampering_test_chunks();
         let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
 
@@ -3135,15 +3221,7 @@ mod tests {
         //    - verify_chunk(&dataset, 512) == Err(HashMismatch { chunk_idx: 512 })
         //    - verify_chunk(&dataset, 0) == Ok(true)  // untampered chunk
 
-        // Placeholder assertions (will be replaced with actual test)
-        let _metadata = DatasetMetadata {
-            name: "test".to_string(),
-            datatype: crate::Datatype::U8,
-            dataspace: crate::Dataspace::Simple { shape: vec![1024, 256], max_shape: None },
-            creation_props: Default::default(),
-            byte_offset: 0,
-            byte_length: 0,
-        };
+        // Placeholder: test structure ready for Phase 3 implementation
     }
 
     /// Verify that `verify_dataset` detects tampering by returning `HashMismatch`
