@@ -57,14 +57,30 @@ const NULL_SENTINEL_DATA: &[u8] = b"null";
 /// Errors that can occur during Merkle tree operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MerkleError {
+    /// Leaf hash does not match recomputed value.
+    HashMismatch {
+        /// Index of the chunk that failed verification.
+        chunk_idx: usize,
+    },
+    /// Companion integrity hash mismatch (possible tampering).
+    CompanionTampered,
+    /// Hybrid signature verification failed.
+    SignatureInvalid,
+    /// The `_merkle_root` attribute is absent from the dataset.
+    MissingChunkGridMetadata,
+    /// Chunk index exceeds dataset bounds.
+    HyperslabOutOfBounds {
+        /// The out-of-bounds chunk index.
+        idx: usize,
+    },
     /// Tree depth exceeds maximum allowed (40 levels, supporting up to 2^40 chunks).
     /// This prevents out-of-memory attacks from maliciously large inputs.
     TreeTooDeep {
         /// Requested depth.
-        requested: usize,
-        /// Maximum allowed depth.
-        max: usize,
+        depth: usize,
     },
+    /// WAL has uncommitted entry for this chunk.
+    NoncePending,
     /// Invalid attribute data during unpacking.
     InvalidAttribute {
         /// Reason for the failure.
@@ -97,12 +113,30 @@ pub enum CompanionVerifyResult {
 impl core::fmt::Display for MerkleError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            MerkleError::TreeTooDeep { requested, max } => {
+            MerkleError::HashMismatch { chunk_idx } => {
+                write!(f, "leaf hash mismatch at chunk index {}", chunk_idx)
+            }
+            MerkleError::CompanionTampered => {
+                write!(f, "companion integrity hash mismatch")
+            }
+            MerkleError::SignatureInvalid => {
+                write!(f, "hybrid signature verification failed")
+            }
+            MerkleError::MissingChunkGridMetadata => {
+                write!(f, "_merkle_root attribute absent from dataset")
+            }
+            MerkleError::HyperslabOutOfBounds { idx } => {
+                write!(f, "chunk index {} exceeds dataset bounds", idx)
+            }
+            MerkleError::TreeTooDeep { depth } => {
                 write!(
                     f,
                     "Merkle tree depth {} exceeds maximum allowed depth {}",
-                    requested, max
+                    depth, MAX_DEPTH
                 )
+            }
+            MerkleError::NoncePending => {
+                write!(f, "WAL has uncommitted entry for chunk")
             }
             MerkleError::InvalidAttribute { reason } => {
                 let msg = match reason {
@@ -118,6 +152,63 @@ impl core::fmt::Display for MerkleError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for MerkleError {}
+
+/// Response policy for detected Merkle verification errors.
+///
+/// **Phase 1 (fail-closed):** This is the seam that Phase 2.2b replaces with
+/// the full halt/quarantine/alert decision and rollback recovery. Defining it
+/// here ensures every verification call site has a single defined response
+/// path from the start.
+///
+/// In Phase 1, all errors result in `Halt`. Before halting, callers should
+/// log the error context: file path, dataset name, chunk index, and error
+/// variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VerifyResponse {
+    /// Stop all operations immediately. Fail-closed policy (Phase 1 default).
+    Halt,
+    /// Isolate the affected data for later inspection (Phase 2.2b).
+    Quarantine,
+    /// Log the error but continue operation (Phase 2.2b).
+    Alert,
+}
+
+impl Default for VerifyResponse {
+    fn default() -> Self {
+        VerifyResponse::Halt
+    }
+}
+
+/// Returns the default response policy for a given error variant.
+///
+/// **Phase 1 (fail-closed):** All variants return `Halt`. The error must be
+/// logged (file path, dataset, chunk index, variant) before halting.
+///
+/// **Phase 2.2b:** This function will be extended with the full
+/// halt/quarantine/alert decision tree and rollback-based recovery
+/// (`restore_to_version`).
+///
+/// # Logging Requirement
+///
+/// Callers must log the following before acting on the response:
+/// - File path
+/// - Dataset name
+/// - Chunk index (if applicable)
+/// - Error variant (via `Display` or `Debug`)
+#[must_use]
+pub fn default_response(e: &MerkleError) -> VerifyResponse {
+    // Phase 1: fail-closed for all error variants
+    match e {
+        MerkleError::HashMismatch { .. } => VerifyResponse::Halt,
+        MerkleError::CompanionTampered => VerifyResponse::Halt,
+        MerkleError::SignatureInvalid => VerifyResponse::Halt,
+        MerkleError::MissingChunkGridMetadata => VerifyResponse::Halt,
+        MerkleError::HyperslabOutOfBounds { .. } => VerifyResponse::Halt,
+        MerkleError::TreeTooDeep { .. } => VerifyResponse::Halt,
+        MerkleError::NoncePending => VerifyResponse::Halt,
+        MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
+    }
+}
 
 /// Hash algorithm selection for Merkle tree construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -310,10 +401,7 @@ impl MerkleTree {
 
         // Enforce maximum depth to prevent out-of-memory attacks (threat T7)
         if depth > MAX_DEPTH {
-            return Err(MerkleError::TreeTooDeep {
-                requested: depth,
-                max: MAX_DEPTH,
-            });
+            return Err(MerkleError::TreeTooDeep { depth });
         }
 
         let total_nodes = 2 * padded_count - 1;
@@ -1496,6 +1584,158 @@ pub fn write_merkle_companion(
 }
 
 // ============================================================================
+// Dataset Verification API
+// ============================================================================
+
+use crate::metadata_index::DatasetMetadata;
+
+/// Reference to a dataset for Merkle verification operations.
+///
+/// This wrapper provides access to dataset metadata and chunk data needed
+/// for verification. In a full implementation, this would hold references
+/// to the file buffer and parsed metadata.
+pub struct Dataset<'a> {
+    /// Dataset metadata (shape, datatype, attributes, etc.)
+    pub metadata: &'a DatasetMetadata,
+    /// Raw file buffer for reading chunk data
+    pub file_data: &'a [u8],
+    /// Superblock offset size for parsing
+    pub offset_size: u8,
+    /// Superblock length size for parsing
+    pub length_size: u8,
+}
+
+/// Verify the companion dataset integrity (fast, sub-second check).
+///
+/// Reads the `_merkle_root` attribute, re-hashes the companion dataset bytes,
+/// and compares against the stored companion-integrity hash. This detects
+/// tampering with the companion dataset but does **not** re-hash chunk data.
+///
+/// # Complexity
+///
+/// O(tree_nodes) hashing of companion bytes only — sub-second for typical datasets.
+///
+/// # Errors
+///
+/// - [`MerkleError::MissingChunkGridMetadata`] if `_merkle_root` attribute is absent
+/// - [`MerkleError::CompanionTampered`] if companion integrity hash mismatch
+pub fn verify_root(_d: &Dataset<'_>) -> Result<bool, MerkleError> {
+    // TODO: Phase 3 implementation
+    // 1. Read _merkle_root attribute
+    // 2. Load companion dataset bytes
+    // 3. Re-hash companion bytes
+    // 4. Compare against stored companion-integrity hash
+    Err(MerkleError::MissingChunkGridMetadata)
+}
+
+/// Verify a single chunk against its Merkle proof (O(log N) check).
+///
+/// Re-hashes the live chunk at index `idx`, reads the O(log N) sibling hashes
+/// from the companion dataset, and walks the proof path to the root, comparing
+/// the recomputed root to the stored value.
+///
+/// # WAL Interaction
+///
+/// If the WAL contains an uncommitted entry for `idx`, returns
+/// [`MerkleError::NoncePending`] immediately — the chunk may be partially
+/// written and the caller must replay or abort the WAL before verifying.
+///
+/// # Complexity
+///
+/// O(log N) sibling hash reads + O(log N) hash operations.
+///
+/// # Errors
+///
+/// - [`MerkleError::NoncePending`] if WAL has uncommitted entry for `idx`
+/// - [`MerkleError::HyperslabOutOfBounds`] if `idx` exceeds chunk count
+/// - [`MerkleError::HashMismatch`] if recomputed root doesn't match stored root
+/// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
+pub fn verify_chunk(_d: &Dataset<'_>, _idx: usize) -> Result<bool, MerkleError> {
+    // TODO: Phase 3 implementation
+    // 1. Check WAL for uncommitted entry at idx → NoncePending
+    // 2. Read chunk data at idx
+    // 3. Compute leaf hash
+    // 4. Read O(log N) sibling hashes from companion
+    // 5. Walk proof path to root
+    // 6. Compare recomputed root to stored root
+    Err(MerkleError::MissingChunkGridMetadata)
+}
+
+/// Verify all chunks in a dataset (full O(N) integrity check).
+///
+/// Re-hashes every chunk, rebuilds the entire Merkle tree from scratch, and
+/// compares the computed root to the stored root. This is the complete
+/// integrity verification.
+///
+/// # Complexity
+///
+/// O(N) chunk reads + O(N) leaf hashes + O(N) tree node computations.
+///
+/// # Errors
+///
+/// - [`MerkleError::HashMismatch`] if any chunk fails (includes `chunk_idx` of first failure)
+/// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
+pub fn verify_dataset(_d: &Dataset<'_>) -> Result<bool, MerkleError> {
+    // TODO: Phase 3 implementation
+    // 1. Read all chunks
+    // 2. Compute all leaf hashes
+    // 3. Build complete tree from leaves
+    // 4. Compare computed root to stored root
+    // 5. On mismatch, return HashMismatch with first failing chunk_idx
+    Err(MerkleError::MissingChunkGridMetadata)
+}
+
+/// Extend the Merkle tree with a new leaf hash (O(log N) update).
+///
+/// Appends a new leaf hash `h` at position `idx` and recomputes only the
+/// O(log N) nodes on the path to the root; leaves all other nodes unchanged.
+/// Used when writing new chunks to a dataset.
+///
+/// # Complexity
+///
+/// O(log N) node updates.
+///
+/// # Errors
+///
+/// - [`MerkleError::HyperslabOutOfBounds`] if `idx != current_chunk_count`
+/// - [`MerkleError::NoncePending`] if WAL has uncommitted entries
+pub fn extend_merkle(_d: &Dataset<'_>, _idx: usize, _h: [u8; 32]) -> Result<(), MerkleError> {
+    // TODO: Phase 3 implementation
+    // 1. Verify idx == current chunk count
+    // 2. Check WAL for pending entries
+    // 3. Insert leaf hash h at position idx
+    // 4. Recompute O(log N) nodes on path to root
+    // 5. Update _merkle_root attribute
+    // 6. Update companion dataset
+    Err(MerkleError::MissingChunkGridMetadata)
+}
+
+/// Update an existing chunk's hash in the Merkle tree (O(log N) update).
+///
+/// Same path recomputation as [`extend_merkle`] but for an in-place overwrite
+/// of an existing chunk. Replaces the leaf hash at `idx` and recomputes only
+/// the O(log N) affected nodes.
+///
+/// # Complexity
+///
+/// O(log N) node updates.
+///
+/// # Errors
+///
+/// - [`MerkleError::HyperslabOutOfBounds`] if `idx >= chunk_count`
+/// - [`MerkleError::NoncePending`] if WAL has uncommitted entries for this chunk
+pub fn update_merkle(_d: &Dataset<'_>, _idx: usize, _h: [u8; 32]) -> Result<(), MerkleError> {
+    // TODO: Phase 3 implementation
+    // 1. Verify idx < chunk_count
+    // 2. Check WAL for pending entries at idx
+    // 3. Replace leaf hash at idx with h
+    // 4. Recompute O(log N) nodes on path to root
+    // 5. Update _merkle_root attribute
+    // 6. Update companion dataset
+    Err(MerkleError::MissingChunkGridMetadata)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1873,10 +2113,7 @@ mod tests {
 
     #[test]
     fn test_merkle_error_display() {
-        let err = MerkleError::TreeTooDeep {
-            requested: 50,
-            max: 40,
-        };
+        let err = MerkleError::TreeTooDeep { depth: 50 };
         let msg = format!("{}", err);
         assert!(msg.contains("50"));
         assert!(msg.contains("40"));
@@ -2838,5 +3075,138 @@ mod tests {
                 }
             }
         });
+    }
+
+    // ========================================================================
+    // Tampering Detection Tests (Phase 3)
+    // ========================================================================
+    //
+    // These tests verify the verification API behavior when chunk data is
+    // tampered with on disk. They use raw file I/O to modify bytes, bypassing
+    // ClawHDF5, then confirm the expected error responses.
+    //
+    // Currently #[ignore] because verify_root/verify_chunk/verify_dataset
+    // are stubs. Remove #[ignore] once Phase 3 implementation is complete.
+
+    /// Test data for tampering tests: 1,024 synthetic chunks.
+    #[cfg(feature = "std")]
+    fn make_tampering_test_chunks() -> Vec<Vec<u8>> {
+        (0..1024)
+            .map(|i| {
+                // Each chunk is 256 bytes with predictable content
+                let mut chunk = vec![0u8; 256];
+                for (j, byte) in chunk.iter_mut().enumerate() {
+                    *byte = ((i * 31 + j * 17) % 256) as u8;
+                }
+                chunk
+            })
+            .collect()
+    }
+
+    /// Verify that tampering a single chunk causes `verify_chunk` to return
+    /// `HashMismatch` for that chunk, while `verify_root` still returns `Ok(true)`
+    /// (since it only checks companion integrity, not chunk data).
+    #[test]
+    #[ignore = "Phase 3: verify_chunk not yet implemented"]
+    #[cfg(feature = "std")]
+    fn test_tampered_chunk_detected_by_verify_chunk() {
+        use crate::metadata_index::DatasetMetadata;
+
+        let chunks = make_tampering_test_chunks();
+        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+        // TODO: Phase 3 implementation
+        // 1. Create HDF5 file with 1,024 chunks using FileWriter
+        // 2. Build Merkle tree and write companion dataset
+        // 3. Close file
+        // 4. Tamper one byte in chunk 512 using raw file I/O:
+        //    let mut file = std::fs::OpenOptions::new()
+        //        .read(true).write(true).open(&path)?;
+        //    file.seek(SeekFrom::Start(chunk_512_offset))?;
+        //    let mut byte = [0u8; 1];
+        //    file.read_exact(&mut byte)?;
+        //    byte[0] ^= 0xFF; // flip all bits
+        //    file.seek(SeekFrom::Start(chunk_512_offset))?;
+        //    file.write_all(&byte)?;
+        // 5. Re-open and parse file
+        // 6. Create Dataset reference
+        // 7. Verify:
+        //    - verify_root(&dataset) == Ok(true)  // companion untouched
+        //    - verify_chunk(&dataset, 512) == Err(HashMismatch { chunk_idx: 512 })
+        //    - verify_chunk(&dataset, 0) == Ok(true)  // untampered chunk
+
+        // Placeholder assertions (will be replaced with actual test)
+        let _metadata = DatasetMetadata {
+            name: "test".to_string(),
+            datatype: crate::Datatype::U8,
+            dataspace: crate::Dataspace::Simple { shape: vec![1024, 256], max_shape: None },
+            creation_props: Default::default(),
+            byte_offset: 0,
+            byte_length: 0,
+        };
+    }
+
+    /// Verify that `verify_dataset` detects tampering by returning `HashMismatch`
+    /// with the index of the first tampered chunk.
+    #[test]
+    #[ignore = "Phase 3: verify_dataset not yet implemented"]
+    #[cfg(feature = "std")]
+    fn test_tampered_chunk_detected_by_verify_dataset() {
+        let chunks = make_tampering_test_chunks();
+        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+        // TODO: Phase 3 implementation
+        // 1. Create HDF5 file with 1,024 chunks
+        // 2. Build Merkle tree and write companion dataset
+        // 3. Close file
+        // 4. Tamper one byte in chunk 512 using raw file I/O
+        // 5. Re-open and parse file
+        // 6. Verify:
+        //    - verify_dataset(&dataset) == Err(HashMismatch { chunk_idx: 512 })
+
+        // Placeholder: test structure ready for implementation
+    }
+
+    /// Verify that `verify_root` returns `Ok(true)` even when chunk data is
+    /// tampered, because it only checks companion dataset integrity.
+    #[test]
+    #[ignore = "Phase 3: verify_root not yet implemented"]
+    #[cfg(feature = "std")]
+    fn test_verify_root_ignores_chunk_tampering() {
+        let chunks = make_tampering_test_chunks();
+        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+        // TODO: Phase 3 implementation
+        // 1. Create HDF5 file with 1,024 chunks
+        // 2. Build Merkle tree and write companion dataset
+        // 3. Close file
+        // 4. Tamper chunk data (NOT companion dataset)
+        // 5. Re-open and parse file
+        // 6. Verify:
+        //    - verify_root(&dataset) == Ok(true)
+        //      (companion bytes unchanged, so integrity check passes)
+
+        // Placeholder: test structure ready for implementation
+    }
+
+    /// Verify that tampering the companion dataset causes `verify_root` to
+    /// return `Err(CompanionTampered)`.
+    #[test]
+    #[ignore = "Phase 3: verify_root not yet implemented"]
+    #[cfg(feature = "std")]
+    fn test_tampered_companion_detected_by_verify_root() {
+        let chunks = make_tampering_test_chunks();
+        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+        // TODO: Phase 3 implementation
+        // 1. Create HDF5 file with 1,024 chunks
+        // 2. Build Merkle tree and write companion dataset
+        // 3. Close file
+        // 4. Tamper one byte in companion dataset using raw file I/O
+        // 5. Re-open and parse file
+        // 6. Verify:
+        //    - verify_root(&dataset) == Err(CompanionTampered)
+
+        // Placeholder: test structure ready for implementation
     }
 }
