@@ -43,11 +43,14 @@ const COMPANION_IO_NS: &[usize] = &[16, 256, 1_024, 65_536];
 
 #[cfg(target_os = "linux")]
 fn peak_rss_mb() -> f64 {
+    // VmHWM ("high water mark") is the actual peak RSS the process has ever
+    // reached; VmRSS is only the current RSS at the time of the read, which
+    // would understate the peak if memory was freed before this was called.
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
+                .find(|l| l.starts_with("VmHWM:"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|v| v.parse::<f64>().ok())
         })
@@ -136,23 +139,31 @@ struct LoadedFile {
     n_chunks: usize,
 }
 
-fn load_chunks(path: &str) -> Result<LoadedFile, Box<dyn std::error::Error>> {
+/// Load `dataset_name`'s chunks if given; otherwise fall back to whichever
+/// known dataset name appears first, or the first dataset in the file.
+fn load_chunks(
+    path: &str,
+    dataset_name: Option<&str>,
+) -> Result<LoadedFile, Box<dyn std::error::Error>> {
     // Use high-level API to list datasets, low-level API to read raw chunk bytes.
     let hf = File::open(path)?;
     let root = hf.root();
     let names = root.datasets()?;
 
-    let dataset_name = names
-        .iter()
-        .find(|n| {
-            matches!(
-                n.as_str(),
-                "Rad" | "dataset_1mb" | "dataset_64kb" | "dataset_256kb"
-            )
-        })
-        .or_else(|| names.first())
-        .cloned()
-        .ok_or("no datasets found in root group")?;
+    let dataset_name = match dataset_name {
+        Some(name) => name.to_string(),
+        None => names
+            .iter()
+            .find(|n| {
+                matches!(
+                    n.as_str(),
+                    "Rad" | "dataset_1mb" | "dataset_64kb" | "dataset_256kb"
+                )
+            })
+            .or_else(|| names.first())
+            .cloned()
+            .ok_or("no datasets found in root group")?,
+    };
 
     let file_data = std::fs::read(path)?;
     let sig = find_signature(&file_data)?;
@@ -584,10 +595,16 @@ fn run_source(
         });
     }
 
-    // ── companion_io ─────────────────────────────────────────────────────────
-    // Measure write_merkle_companion at N ∈ {16, 256, 1024, 65536}.
-    // Uses synthetic 64-byte chunks so the result is independent of the
-    // source file size; only the companion write cost varies with N.
+}
+
+// ── companion_io ────────────────────────────────────────────────────────────
+// Measure write_merkle_companion at N ∈ {16, 256, 1024, 65536}. Uses synthetic
+// 64-byte chunks so the result is independent of the source file's own chunk
+// size; only the companion write cost varies with N. Run once per top-level
+// `source` (not once per synthetic chunk-size dataset) since it doesn't
+// depend on which P1.1 dataset is being swept in `run_source`.
+fn run_companion_io(source: &'static str, hostname: &str, disk_type: &str, rows: &mut Vec<CsvRow>) {
+    let alg = HashAlg::Blake3;
     for &nc in COMPANION_IO_NS {
         let syn_chunks: Vec<Vec<u8>> = (0..nc).map(|i| vec![(i & 0xFF) as u8; 64]).collect();
         let t = MerkleTree::from_chunks_owned(&syn_chunks, alg);
@@ -651,25 +668,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rows: Vec<CsvRow> = Vec::new();
 
-    // Synthetic file
-    println!("Loading synthetic file: {synthetic_path}");
-    let syn = load_chunks(synthetic_path)?;
-    println!(
-        "  {} chunks, avg {:.0} KB/chunk",
-        syn.n_chunks, syn.chunk_size_kb
-    );
-    run_source("synthetic", &syn, &host, &disk, &mut rows);
-    println!("  synthetic done ({} rows)", rows.len());
+    // Synthetic file: sweep all three P1.1 chunk-size datasets, matching the
+    // P1.2b baseline harness (`baselines_bench.rs`'s `P1_1_DATASETS`), so the
+    // Merkle numbers here are comparable chunk-size-by-chunk-size against the
+    // already-committed `baselines-$(hostname).csv`.
+    const P1_1_DATASETS: &[&str] = &["dataset_64kb", "dataset_256kb", "dataset_1mb"];
+    for &dataset in P1_1_DATASETS {
+        println!("Loading synthetic file: {synthetic_path} [{dataset}]");
+        let syn = load_chunks(synthetic_path, Some(dataset))?;
+        println!(
+            "  {} chunks, avg {:.0} KB/chunk",
+            syn.n_chunks, syn.chunk_size_kb
+        );
+        let prev = rows.len();
+        run_source("synthetic", &syn, &host, &disk, &mut rows);
+        println!("  {dataset} done ({} rows)", rows.len() - prev);
+    }
+    run_companion_io("synthetic", &host, &disk, &mut rows);
 
     // NOAA file
     println!("Loading NOAA file: {noaa_path}");
-    let noaa = load_chunks(noaa_path)?;
+    let noaa = load_chunks(noaa_path, None)?;
     println!(
         "  {} chunks, avg {:.0} KB/chunk",
         noaa.n_chunks, noaa.chunk_size_kb
     );
     let prev = rows.len();
     run_source("NOAA", &noaa, &host, &disk, &mut rows);
+    run_companion_io("NOAA", &host, &disk, &mut rows);
     println!("  NOAA done ({} rows)", rows.len() - prev);
 
     // Write CSV
