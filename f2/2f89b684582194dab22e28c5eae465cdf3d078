@@ -1,0 +1,21 @@
+crates/clawhdf5-format/src/subset_proof.rs
+  s_2180fb5293fe34::t_481e7e8b7b1506 48,60
+  s_2180fb5293fe34::t_72396f36e7955b 49-54
+  s_2180fb5293fe34::t_28071d2f67fb01 519-528
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.10",
+  "base_commit_sha": "f22f89b684582194dab22e28c5eae465cdf3d078",
+  "prompts": {},
+  "sessions": {
+    "s_2180fb5293fe34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "034f5cd4-7dd7-47ad-834e-4fa2d82e2e2b",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
