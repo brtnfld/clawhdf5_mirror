@@ -61,3 +61,8 @@ doc = false
 name = "fuzz_merkle_attr"
 path = "fuzz_targets/fuzz_merkle_attr.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_subset_proof"
+path = "fuzz_targets/fuzz_subset_proof.rs"
+doc = false

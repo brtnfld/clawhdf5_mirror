@@ -26,9 +26,7 @@ impl HDF5Memory {
     ) -> Vec<(usize, f32)> {
         self.ensure_hnsw_fresh();
         match self.hnsw.as_ref() {
-            Some(index)
-                if !index.is_empty() && index.dimension() == query_embedding.len() =>
-            {
+            Some(index) if !index.is_empty() && index.dimension() == query_embedding.len() => {
                 // Over-fetch so the merge sees a useful vector pool; cosine
                 // distance from the index converts back to similarity (1 - d).
                 let pool = (k * 8).max(64);
@@ -38,7 +36,13 @@ impl HDF5Memory {
                     .map(|(id, dist)| (id, 1.0 - dist))
                     .collect();
                 let kw_scores = bm25.search(query_text, self.cache.len());
-                hybrid::merge_vector_keyword(vec_scores, kw_scores, vector_weight, keyword_weight, k)
+                hybrid::merge_vector_keyword(
+                    vec_scores,
+                    kw_scores,
+                    vector_weight,
+                    keyword_weight,
+                    k,
+                )
             }
             _ => hybrid::hybrid_search(
                 query_embedding,

@@ -7,7 +7,7 @@
 //! To save results with system info:
 //!   ./benches/run_hash_bench.sh
 
-use clawhdf5_format::merkle::{hash_chunk, HashAlg};
+use clawhdf5_format::merkle::{HashAlg, hash_chunk};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// Chunk sizes to benchmark: 64 KB, 256 KB, 1 MB
@@ -20,7 +20,9 @@ const CHUNK_SIZES: &[(usize, &str)] = &[
 /// Generate reproducible test data of the given size.
 fn make_chunk(size: usize) -> Vec<u8> {
     // Use a simple pattern that's reproducible but not trivially compressible
-    (0..size).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect()
+    (0..size)
+        .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+        .collect()
 }
 
 fn bench_hash_algorithms(c: &mut Criterion) {
@@ -31,25 +33,19 @@ fn bench_hash_algorithms(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         // SHA-256
-        group.bench_with_input(
-            BenchmarkId::new("SHA-256", label),
-            &data,
-            |b, data| b.iter(|| hash_chunk(data, HashAlg::Sha256)),
-        );
+        group.bench_with_input(BenchmarkId::new("SHA-256", label), &data, |b, data| {
+            b.iter(|| hash_chunk(data, HashAlg::Sha256))
+        });
 
         // BLAKE3
-        group.bench_with_input(
-            BenchmarkId::new("BLAKE3", label),
-            &data,
-            |b, data| b.iter(|| hash_chunk(data, HashAlg::Blake3)),
-        );
+        group.bench_with_input(BenchmarkId::new("BLAKE3", label), &data, |b, data| {
+            b.iter(|| hash_chunk(data, HashAlg::Blake3))
+        });
 
         // KangarooTwelve (K12)
-        group.bench_with_input(
-            BenchmarkId::new("K12", label),
-            &data,
-            |b, data| b.iter(|| hash_chunk(data, HashAlg::K12)),
-        );
+        group.bench_with_input(BenchmarkId::new("K12", label), &data, |b, data| {
+            b.iter(|| hash_chunk(data, HashAlg::K12))
+        });
     }
 
     group.finish();
@@ -65,46 +61,34 @@ fn bench_raw_hash_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         // SHA-256 raw
-        group.bench_with_input(
-            BenchmarkId::new("SHA-256", label),
-            &data,
-            |b, data| {
-                use sha2::{Digest, Sha256};
-                b.iter(|| {
-                    let hash: [u8; 32] = Sha256::digest(data).into();
-                    hash
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("SHA-256", label), &data, |b, data| {
+            use sha2::{Digest, Sha256};
+            b.iter(|| {
+                let hash: [u8; 32] = Sha256::digest(data).into();
+                hash
+            })
+        });
 
         // BLAKE3 raw
-        group.bench_with_input(
-            BenchmarkId::new("BLAKE3", label),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let hash: [u8; 32] = blake3::hash(data).into();
-                    hash
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("BLAKE3", label), &data, |b, data| {
+            b.iter(|| {
+                let hash: [u8; 32] = blake3::hash(data).into();
+                hash
+            })
+        });
 
         // K12 raw
-        group.bench_with_input(
-            BenchmarkId::new("K12", label),
-            &data,
-            |b, data| {
-                use k12::digest::{ExtendableOutput, Update};
-                use k12::KangarooTwelve;
-                b.iter(|| {
-                    let mut hasher = KangarooTwelve::default();
-                    hasher.update(data);
-                    let mut output = [0u8; 32];
-                    hasher.finalize_xof_into(&mut output);
-                    output
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("K12", label), &data, |b, data| {
+            use k12::KangarooTwelve;
+            use k12::digest::{ExtendableOutput, Update};
+            b.iter(|| {
+                let mut hasher = KangarooTwelve::default();
+                hasher.update(data);
+                let mut output = [0u8; 32];
+                hasher.finalize_xof_into(&mut output);
+                output
+            })
+        });
     }
 
     group.finish();
@@ -149,8 +133,8 @@ fn bench_incremental_hash(c: &mut Criterion) {
 
     // K12 incremental
     group.bench_function("K12/1MB_in_64KB_blocks", |b| {
-        use k12::digest::{ExtendableOutput, Update};
         use k12::KangarooTwelve;
+        use k12::digest::{ExtendableOutput, Update};
         b.iter(|| {
             let mut hasher = KangarooTwelve::default();
             for block in &blocks {

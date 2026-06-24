@@ -18,8 +18,13 @@ rayon = { version = "1", optional = true }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0", features = ["mmap"] }
-clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["parallel", "fast-checksum", "baselines"] }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["parallel", "fast-checksum", "baselines", "merkle"] }
 clawhdf5-filters = { path = "../clawhdf5-filters", version = "2.1.0" }
+libc = "0.2"
+
+[[example]]
+name = "phase1_bench"
+required-features = []
 
 [[bench]]
 name = "mmap_bench"

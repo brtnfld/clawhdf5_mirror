@@ -186,25 +186,26 @@ pub fn read_fixed_array_chunks(
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
     let mut chunks = Vec::new();
-    let push_element = |i: usize, abs: usize, chunks: &mut Vec<ChunkInfo>| -> Result<(), FormatError> {
-        if let Some((address, chunk_size, filter_mask)) = parse_fa_element(
-            file_data,
-            abs,
-            header.client_id,
-            offset_size,
-            header.element_size,
-            chunk_byte_size,
-        )? {
-            let offsets = index_to_chunk_offsets(i, &num_chunks_per_dim, chunk_dimensions);
-            chunks.push(ChunkInfo {
-                chunk_size,
-                filter_mask,
-                offsets,
-                address,
-            });
-        }
-        Ok(())
-    };
+    let push_element =
+        |i: usize, abs: usize, chunks: &mut Vec<ChunkInfo>| -> Result<(), FormatError> {
+            if let Some((address, chunk_size, filter_mask)) = parse_fa_element(
+                file_data,
+                abs,
+                header.client_id,
+                offset_size,
+                header.element_size,
+                chunk_byte_size,
+            )? {
+                let offsets = index_to_chunk_offsets(i, &num_chunks_per_dim, chunk_dimensions);
+                chunks.push(ChunkInfo {
+                    chunk_size,
+                    filter_mask,
+                    offsets,
+                    address,
+                });
+            }
+            Ok(())
+        };
 
     // A data block is paged when it holds more elements than fit in one page.
     // `max_nelmts_bits` is an untrusted u8; a shift >= the pointer width would
@@ -232,9 +233,8 @@ pub fn read_fixed_array_chunks(
     // only the final page holds fewer elements. Uninitialized pages (bit clear)
     // still occupy their slot on disk but are zero-filled, so the bitmap — not a
     // 0xFF sentinel — is what marks a whole page as unallocated.
-    let stride_overflow = || {
-        FormatError::ChunkedReadError("Fixed Array page offset overflow".into())
-    };
+    let stride_overflow =
+        || FormatError::ChunkedReadError("Fixed Array page offset overflow".into());
     let npages = num_elements.div_ceil(page_nelmts);
     let bitmap_size = npages.div_ceil(8);
     let bitmap_start = elements_start;
@@ -720,10 +720,7 @@ mod tests {
         // Page 1 (elements 4,5,6,7) is uninitialized => skipped. The remaining
         // 7 chunks (0..4 and 8..11) come back with their original linear index.
         assert_eq!(chunks.len(), 7);
-        let mut got: Vec<(u64, u64)> = chunks
-            .iter()
-            .map(|c| (c.offsets[0], c.address))
-            .collect();
+        let mut got: Vec<(u64, u64)> = chunks.iter().map(|c| (c.offsets[0], c.address)).collect();
         got.sort();
         let expect: Vec<(u64, u64)> = [0usize, 1, 2, 3, 8, 9, 10]
             .iter()

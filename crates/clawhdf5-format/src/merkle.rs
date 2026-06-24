@@ -36,7 +36,7 @@ use alloc::borrow::Cow;
 use std::borrow::Cow;
 
 /// Size of hash output in bytes (256 bits).
-const HASH_SIZE: usize = 32;
+pub(crate) const HASH_SIZE: usize = 32;
 
 /// Domain separator for leaf node hashes.
 const LEAF_PREFIX: u8 = 0x00;
@@ -87,6 +87,11 @@ pub enum MerkleError {
         /// Reason for the failure.
         reason: InvalidAttrReason,
     },
+    /// A subset proof's claimed chunk-index set does not match the set
+    /// independently recomputed from the verifier's own requested selection
+    /// and chunk grid (see `subset_proof::verify_subset`). This means the
+    /// prover delivered a proof for a different region than was requested.
+    SelectionMismatch,
 }
 
 /// Reasons why a merkle attribute is invalid.
@@ -141,11 +146,19 @@ impl core::fmt::Display for MerkleError {
             }
             MerkleError::InvalidAttribute { reason } => {
                 let msg = match reason {
-                    InvalidAttrReason::WrongSize => "attribute size is not valid (expected 97 bytes for v0)",
+                    InvalidAttrReason::WrongSize => {
+                        "attribute size is not valid (expected 97 bytes for v0)"
+                    }
                     InvalidAttrReason::UnknownAlgorithm => "unknown algorithm identifier",
                     InvalidAttrReason::IntegrityMismatch => "integrity hash mismatch",
                 };
                 write!(f, "Invalid merkle attribute: {}", msg)
+            }
+            MerkleError::SelectionMismatch => {
+                write!(
+                    f,
+                    "subset proof's chunk set does not match the requested selection"
+                )
             }
         }
     }
@@ -204,6 +217,7 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::TreeTooDeep { .. } => VerifyResponse::Halt,
         MerkleError::NoncePending => VerifyResponse::Halt,
         MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
+        MerkleError::SelectionMismatch => VerifyResponse::Halt,
     }
 }
 
@@ -316,7 +330,7 @@ fn compute_sha256(data: &[u8]) -> [u8; HASH_SIZE] {
 /// Prevents timing attacks by always comparing all bytes regardless of
 /// where the first difference occurs.
 #[inline]
-fn constant_time_eq(a: &[u8; HASH_SIZE], b: &[u8; HASH_SIZE]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8; HASH_SIZE], b: &[u8; HASH_SIZE]) -> bool {
     let mut result = 0u8;
     for i in 0..HASH_SIZE {
         result |= a[i] ^ b[i];
@@ -662,6 +676,40 @@ impl MerkleTree {
     pub fn nodes(&self) -> &[[u8; HASH_SIZE]] {
         &self.nodes
     }
+
+    /// Replace the leaf at `leaf_idx` with `new_hash` and recompute the
+    /// O(log N) ancestor path to the root.
+    ///
+    /// This is the primitive behind `extend_merkle` (appending a new chunk)
+    /// and `update_merkle` (overwriting an existing chunk). Pass a hash
+    /// produced by [`hash_chunk`] / [`HashAlg::hash_leaf`] with the same
+    /// algorithm as the tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MerkleError::HyperslabOutOfBounds`] if `leaf_idx` is outside
+    /// the padded leaf range.
+    pub fn update_leaf(
+        &mut self,
+        leaf_idx: usize,
+        new_hash: [u8; HASH_SIZE],
+    ) -> Result<(), MerkleError> {
+        if leaf_idx >= self.padded_count {
+            return Err(MerkleError::HyperslabOutOfBounds { idx: leaf_idx });
+        }
+        let internal_nodes = self.padded_count - 1;
+        let mut node_idx = internal_nodes + leaf_idx;
+        self.nodes[node_idx] = new_hash;
+        // Walk toward the root, recomputing each ancestor from its two children.
+        while node_idx > 0 {
+            let parent = (node_idx - 1) / 2;
+            let left = 2 * parent + 1;
+            let right = 2 * parent + 2;
+            self.nodes[parent] = self.alg.hash_pair(&self.nodes[left], &self.nodes[right]);
+            node_idx = parent;
+        }
+        Ok(())
+    }
 }
 
 /// A Merkle inclusion proof for a single leaf.
@@ -764,8 +812,8 @@ fn hash_blake3(_data: &[u8]) -> [u8; HASH_SIZE] {
 
 #[cfg(feature = "k12")]
 fn hash_k12(data: &[u8]) -> [u8; HASH_SIZE] {
-    use k12::digest::{ExtendableOutput, Update};
     use k12::KangarooTwelve;
+    use k12::digest::{ExtendableOutput, Update};
 
     let mut hasher = KangarooTwelve::default();
     hasher.update(data);
@@ -826,8 +874,8 @@ fn hash_chunk_blake3(_data: &[u8]) -> [u8; HASH_SIZE] {
 #[cfg(feature = "k12")]
 #[inline]
 fn hash_chunk_k12(data: &[u8]) -> [u8; HASH_SIZE] {
-    use k12::digest::{ExtendableOutput, Update};
     use k12::KangarooTwelve;
+    use k12::digest::{ExtendableOutput, Update};
 
     let mut hasher = KangarooTwelve::default();
     hasher.update(&[LEAF_PREFIX]);
@@ -1246,11 +1294,12 @@ impl<'a> MerkleAttrRef<'a> {
         let algorithm = self.algorithm()?;
         let expected = MerkleAttr::compute_integrity(&self.root_array(), algorithm);
         // Safe: integrity() always returns exactly HASH_SIZE bytes for v0
-        let integrity_arr: &[u8; HASH_SIZE] = self.integrity().try_into().map_err(|_| {
-            MerkleError::InvalidAttribute {
-                reason: InvalidAttrReason::WrongSize,
-            }
-        })?;
+        let integrity_arr: &[u8; HASH_SIZE] =
+            self.integrity()
+                .try_into()
+                .map_err(|_| MerkleError::InvalidAttribute {
+                    reason: InvalidAttrReason::WrongSize,
+                })?;
         if !constant_time_eq(integrity_arr, &expected) {
             return Err(MerkleError::InvalidAttribute {
                 reason: InvalidAttrReason::IntegrityMismatch,
@@ -1355,7 +1404,10 @@ pub fn write_merkle_attr(
 ) -> Result<(), MerkleError> {
     let attr = MerkleAttr::from_tree(tree);
     let packed = attr.pack();
-    dataset.set_attr(MERKLE_ATTR_NAME, crate::type_builders::AttrValue::Bytes(packed.to_vec()));
+    dataset.set_attr(
+        MERKLE_ATTR_NAME,
+        crate::type_builders::AttrValue::Bytes(packed.to_vec()),
+    );
     Ok(())
 }
 
@@ -1411,7 +1463,9 @@ impl MerkleCompanionWriter {
     /// Create a new companion writer.
     #[must_use]
     pub fn new() -> Self {
-        Self { pending: Vec::new() }
+        Self {
+            pending: Vec::new(),
+        }
     }
 
     /// Add a merkle tree's nodes, returning the storage result.
@@ -1886,6 +1940,48 @@ mod tests {
 
     #[test]
     #[cfg(feature = "blake3")]
+    fn test_update_leaf_changes_root_and_path() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let mut tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+        let original_root = *tree.root();
+
+        // Updating leaf 0 with a different hash must change the root.
+        let new_hash = HashAlg::Blake3.hash_leaf(b"replacement");
+        tree.update_leaf(0, new_hash).unwrap();
+        assert_ne!(
+            tree.root(),
+            &original_root,
+            "root must change after leaf update"
+        );
+
+        // The updated leaf must no longer verify against the original data.
+        assert!(!tree.verify_chunk(0, &chunks[0]));
+
+        // Restoring the original hash must reproduce the original root.
+        let original_hash = HashAlg::Blake3.hash_leaf(&chunks[0]);
+        tree.update_leaf(0, original_hash).unwrap();
+        assert_eq!(
+            tree.root(),
+            &original_root,
+            "root must be restored after reverting leaf"
+        );
+    }
+
+    #[test]
+    fn test_update_leaf_out_of_bounds() {
+        let chunks: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let mut tree = MerkleTree::from_chunks(&refs, HashAlg::Sha256);
+        let result = tree.update_leaf(999, [0u8; 32]);
+        assert!(matches!(
+            result,
+            Err(crate::merkle::MerkleError::HyperslabOutOfBounds { idx: 999 })
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
     fn test_domain_separation() {
         // Verify that leaf and internal hashes use different prefixes
         let alg = HashAlg::Blake3;
@@ -1964,8 +2060,7 @@ mod tests {
         let chunks = make_test_chunks();
 
         // Pre-hash the leaves
-        let leaf_hashes: Vec<[u8; HASH_SIZE]> =
-            chunks.iter().map(|c| alg.hash_leaf(c)).collect();
+        let leaf_hashes: Vec<[u8; HASH_SIZE]> = chunks.iter().map(|c| alg.hash_leaf(c)).collect();
 
         // Build tree using the new build method
         let tree = MerkleTree::build(&leaf_hashes, alg).expect("build should succeed");
@@ -1988,8 +2083,7 @@ mod tests {
         // 5 leaves requires padding to 8
         let chunks: Vec<Vec<u8>> = (0..5).map(|i| format!("chunk{}", i).into_bytes()).collect();
 
-        let leaf_hashes: Vec<[u8; HASH_SIZE]> =
-            chunks.iter().map(|c| alg.hash_leaf(c)).collect();
+        let leaf_hashes: Vec<[u8; HASH_SIZE]> = chunks.iter().map(|c| alg.hash_leaf(c)).collect();
 
         let tree = MerkleTree::build(&leaf_hashes, alg).expect("build should succeed");
 
@@ -2028,8 +2122,7 @@ mod tests {
         let null_sentinel = alg.null_sentinel();
 
         // Build tree from leaf hashes
-        let tree =
-            MerkleTree::build(&[leaf0, leaf1, leaf2], alg).expect("build should succeed");
+        let tree = MerkleTree::build(&[leaf0, leaf1, leaf2], alg).expect("build should succeed");
 
         // Verify tree structure
         assert_eq!(tree.leaf_count(), 3);
@@ -2097,8 +2190,7 @@ mod tests {
         let alg = HashAlg::Blake3;
         let chunks = make_test_chunks();
 
-        let leaf_hashes: Vec<[u8; HASH_SIZE]> =
-            chunks.iter().map(|c| alg.hash_leaf(c)).collect();
+        let leaf_hashes: Vec<[u8; HASH_SIZE]> = chunks.iter().map(|c| alg.hash_leaf(c)).collect();
 
         let tree_build = MerkleTree::build(&leaf_hashes, alg).expect("build should succeed");
         let tree_from_leaf = MerkleTree::from_leaf_hashes(&leaf_hashes, alg);
@@ -2127,7 +2219,10 @@ mod tests {
             MerkleError::HyperslabOutOfBounds { idx: 0 },
             MerkleError::TreeTooDeep { depth: 50 },
             MerkleError::NoncePending,
-            MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize },
+            MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            },
+            MerkleError::SelectionMismatch,
         ];
 
         for err in &errors {
@@ -2354,9 +2449,7 @@ mod tests {
         let alg = HashAlg::Blake3;
 
         // Create 8 distinct leaf hashes
-        let leaves: Vec<[u8; HASH_SIZE]> = (0u8..8)
-            .map(|i| alg.hash_leaf(&[b'L', i]))
-            .collect();
+        let leaves: Vec<[u8; HASH_SIZE]> = (0u8..8).map(|i| alg.hash_leaf(&[b'L', i])).collect();
 
         // Build tree
         let tree = MerkleTree::build(&leaves, alg).expect("build should succeed");
@@ -2414,8 +2507,14 @@ mod tests {
 
     #[test]
     fn test_algorithm_id_roundtrip() {
-        assert_eq!(HashAlg::from_id(HashAlg::Sha256.to_id()), Some(HashAlg::Sha256));
-        assert_eq!(HashAlg::from_id(HashAlg::Blake3.to_id()), Some(HashAlg::Blake3));
+        assert_eq!(
+            HashAlg::from_id(HashAlg::Sha256.to_id()),
+            Some(HashAlg::Sha256)
+        );
+        assert_eq!(
+            HashAlg::from_id(HashAlg::Blake3.to_id()),
+            Some(HashAlg::Blake3)
+        );
         assert_eq!(HashAlg::from_id(HashAlg::K12.to_id()), Some(HashAlg::K12));
         assert_eq!(HashAlg::from_id(0xFF), None);
     }
@@ -2554,7 +2653,10 @@ mod tests {
             .expect("write_merkle_companion should succeed");
 
         match result {
-            MerkleCompanionResult::Inline { nodes, companion_hash } => {
+            MerkleCompanionResult::Inline {
+                nodes,
+                companion_hash,
+            } => {
                 // Verify expected size: 10 leaves padded to 16, so 31 nodes * 32 bytes
                 assert_eq!(nodes.len(), 31 * HASH_SIZE);
 
@@ -2637,7 +2739,10 @@ mod tests {
             .expect("write_merkle_companion should succeed");
 
         match result {
-            MerkleCompanionResult::Inline { nodes, companion_hash } => {
+            MerkleCompanionResult::Inline {
+                nodes,
+                companion_hash,
+            } => {
                 // 256 leaves = 256 padded (power of 2), so 511 nodes * 32 bytes
                 assert_eq!(nodes.len(), 511 * HASH_SIZE);
                 assert_ne!(companion_hash, [0u8; HASH_SIZE]);
@@ -2890,7 +2995,8 @@ mod tests {
         .expect("dataset header parse failed");
 
         let attrs = extract_attributes(&data_hdr, sb.length_size).expect("extract attrs failed");
-        let merkle_attr = find_attribute(&attrs, MERKLE_ATTR_NAME).expect("merkle_root attr not found");
+        let merkle_attr =
+            find_attribute(&attrs, MERKLE_ATTR_NAME).expect("merkle_root attr not found");
 
         // Verify attribute size
         assert_eq!(merkle_attr.raw_data.len(), MERKLE_ATTR_SIZE);
@@ -3106,7 +3212,12 @@ mod tests {
     ///
     /// Tests with a 1,024-chunk synthetic dataset on at least 4 rayon threads.
     #[test]
-    #[cfg(all(feature = "parallel", feature = "sha2", feature = "blake3", feature = "k12"))]
+    #[cfg(all(
+        feature = "parallel",
+        feature = "sha2",
+        feature = "blake3",
+        feature = "k12"
+    ))]
     fn test_parallel_build_correctness() {
         use rayon::ThreadPoolBuilder;
 
@@ -3152,14 +3263,13 @@ mod tests {
                     alg
                 );
 
-                for (i, (seq_node, par_node)) in
-                    tree_seq.nodes().iter().zip(tree_par.nodes().iter()).enumerate()
+                for (i, (seq_node, par_node)) in tree_seq
+                    .nodes()
+                    .iter()
+                    .zip(tree_par.nodes().iter())
+                    .enumerate()
                 {
-                    assert_eq!(
-                        seq_node, par_node,
-                        "Node {} mismatch for {:?}",
-                        i, alg
-                    );
+                    assert_eq!(seq_node, par_node, "Node {} mismatch for {:?}", i, alg);
                 }
             }
         });

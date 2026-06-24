@@ -360,7 +360,8 @@ fn build_multiblock_fractal_heap(
     let table_width: u16 = 4;
     let starting_block_size: u64 = 512;
     let dblock_header_size = 4 + 1 + os + block_offset_bytes + 4;
-    let block_capacity = |row: usize| block_size_for_row(starting_block_size, row) - dblock_header_size as u64;
+    let block_capacity =
+        |row: usize| block_size_for_row(starting_block_size, row) - dblock_header_size as u64;
 
     // ---- Pack objects into direct blocks (row-major over the doubling table) ----
     struct Blk {
@@ -527,7 +528,26 @@ fn block_size_for_row(starting_block_size: u64, row: usize) -> u64 {
 
 /// Size in bytes of the FRHP header for the given offset/length sizes.
 fn frhp_header_size(os: usize, ls: usize) -> usize {
-    4 + 1 + 2 + 2 + 1 + 4 + ls + os + ls + os + ls + ls + ls + ls + ls + ls + ls + ls + 2 + ls + ls
+    4 + 1
+        + 2
+        + 2
+        + 1
+        + 4
+        + ls
+        + os
+        + ls
+        + os
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + 2
+        + ls
+        + ls
         + 2
         + 2
         + os
@@ -655,8 +675,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // Pad to node_size
     btlf.resize(node_size as usize, 0);
 
-    let mut blob =
-        Vec::with_capacity(heap.blob.len() + bthd.len() + btlf.len());
+    let mut blob = Vec::with_capacity(heap.blob.len() + bthd.len() + btlf.len());
     blob.extend_from_slice(&heap.blob);
     blob.extend_from_slice(&bthd);
     blob.extend_from_slice(&btlf);
@@ -747,8 +766,7 @@ pub(crate) fn build_dense_links(links: &[LinkMessage], base_address: u64) -> Den
     btlf.extend_from_slice(&btlf_checksum.to_le_bytes());
     btlf.resize(node_size as usize, 0);
 
-    let mut blob =
-        Vec::with_capacity(heap.blob.len() + bthd.len() + btlf.len());
+    let mut blob = Vec::with_capacity(heap.blob.len() + bthd.len() + btlf.len());
     blob.extend_from_slice(&heap.blob);
     blob.extend_from_slice(&bthd);
     blob.extend_from_slice(&btlf);
@@ -1317,7 +1335,9 @@ impl FileWriter {
         // Rebuild the root link blob with real target addresses (same size as
         // the dummy used for layout); its LinkInfo goes in the OH.
         let root_link_blob = root_link_blob_addr.map(|addr| build_dense_links(&root_links, addr));
-        let root_dl = root_link_blob.as_ref().map(|b| b.link_info_message.as_slice());
+        let root_dl = root_link_blob
+            .as_ref()
+            .map(|b| b.link_info_message.as_slice());
         buf.extend_from_slice(&build_group_oh(
             &root_links,
             root_dl,

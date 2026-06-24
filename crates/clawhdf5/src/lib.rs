@@ -494,7 +494,9 @@ mod tests {
         let file = File::open(&path).unwrap();
         let ds = file.dataset("data").unwrap();
 
-        if let Ok(slice) = ds.read_f32_zerocopy() { assert_eq!(slice, &original[..]) }
+        if let Ok(slice) = ds.read_f32_zerocopy() {
+            assert_eq!(slice, &original[..])
+        }
         assert_eq!(ds.read_f32().unwrap(), original);
 
         std::fs::remove_file(&path).ok();

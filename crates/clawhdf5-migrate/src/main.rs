@@ -309,7 +309,8 @@ mod tests {
         insert_relation(&conn, 1, 1, "self");
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "test-agent".into(),
             embedder: "test-embed".into(),
@@ -319,7 +320,8 @@ mod tests {
         };
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
         assert_eq!(summary.chunks, 2);
         assert_eq!(summary.sessions, 1);
         assert_eq!(summary.entities, 1);
@@ -340,7 +342,8 @@ mod tests {
         insert_chunk(&conn, 3, "also active", &make_embedding(4, 3.0), 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, true, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, true, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.chunks.len(), 2);
 
         let opts = hdf5_writer::WriteOptions {
@@ -352,7 +355,8 @@ mod tests {
         };
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
         assert_eq!(summary.chunks, 2);
     }
 
@@ -367,7 +371,8 @@ mod tests {
         insert_chunk(&conn, 2, "deleted", &make_embedding(4, 2.0), 1);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.chunks.len(), 2);
     }
 
@@ -381,7 +386,8 @@ mod tests {
         insert_chunk(&conn, 1, "test", &make_embedding(16, 0.5), 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.embedding_dim, 16);
     }
 
@@ -395,7 +401,8 @@ mod tests {
         insert_chunk(&conn, 1, "test", &make_embedding(16, 0.5), 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, Some(8), &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, Some(8), &SchemaConfig::default()).unwrap();
         assert_eq!(data.embedding_dim, 8);
         // Embedding truncated to dim 8
         assert_eq!(data.chunks[0].embedding.len(), 8);
@@ -413,7 +420,8 @@ mod tests {
         insert_chunk(&conn, 1, "test", &emb, 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "t".into(),
             embedder: "t".into(),
@@ -424,7 +432,8 @@ mod tests {
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
         // Content-validate with the float16 tolerance enabled.
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, true, true).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, true, true).unwrap();
         assert_eq!(summary.chunks, 1);
 
         // Verify float16 values are within tolerance
@@ -453,7 +462,8 @@ mod tests {
         }
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
 
         let opts_compressed = hdf5_writer::WriteOptions {
             agent_id: "t".into(),
@@ -493,7 +503,8 @@ mod tests {
         drop(conn);
 
         // Simulate dry-run: read data but don't write
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.chunks.len(), 1);
         assert!(!h5_path.exists());
     }
@@ -505,7 +516,8 @@ mod tests {
         let db_path = create_test_db(&dir);
         let h5_path = dir.path().join("out.h5");
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.chunks.len(), 0);
         assert_eq!(data.sessions.len(), 0);
         assert_eq!(data.entities.len(), 0);
@@ -520,7 +532,8 @@ mod tests {
         };
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
         assert_eq!(summary.chunks, 0);
     }
 
@@ -543,7 +556,8 @@ mod tests {
         }
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.chunks.len(), 1000);
 
         let opts = hdf5_writer::WriteOptions {
@@ -573,7 +587,8 @@ mod tests {
         insert_session(&conn, "session-gamma", 21, 30);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.sessions.len(), 3);
 
         let opts = hdf5_writer::WriteOptions {
@@ -585,7 +600,8 @@ mod tests {
         };
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
         assert_eq!(summary.sessions, 3);
     }
 
@@ -605,7 +621,8 @@ mod tests {
         insert_relation(&conn, 2, 3, "uses");
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.entities.len(), 3);
         assert_eq!(data.relations.len(), 3);
 
@@ -618,7 +635,8 @@ mod tests {
         };
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
         assert_eq!(summary.entities, 3);
         assert_eq!(summary.relations, 3);
     }
@@ -634,7 +652,8 @@ mod tests {
         insert_chunk(&conn, 1, "test", &make_embedding(4, 1.0), 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "t".into(),
             embedder: "t".into(),
@@ -645,8 +664,8 @@ mod tests {
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
         // Validating against a source with an extra (unwritten) chunk must fail.
-        let mut bigger = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default())
-            .unwrap();
+        let mut bigger =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let mut extra = bigger.chunks[0].clone();
         extra.id = 999;
         bigger.chunks.push(extra);
@@ -666,7 +685,8 @@ mod tests {
         insert_chunk(&conn, 1, "test", &make_embedding(8, 1.0), 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "my-agent-42".into(),
             embedder: "openai-ada".into(),
@@ -712,7 +732,8 @@ mod tests {
         insert_chunk(&conn, 1, "test", &emb, 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "t".into(),
             embedder: "t".into(),
@@ -758,7 +779,8 @@ mod tests {
         drop(conn);
 
         // Skip deleted
-        let data = sqlite_reader::read_sqlite(&db_path, true, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, true, None, &SchemaConfig::default()).unwrap();
         assert_eq!(data.chunks.len(), 4); // chunk 3 is deleted
 
         let opts = hdf5_writer::WriteOptions {
@@ -770,7 +792,8 @@ mod tests {
         };
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
-        let summary = validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
+        let summary =
+            validate::validate_hdf5(h5_path.to_str().unwrap(), &data, false, false).unwrap();
         assert_eq!(summary.chunks, 4);
         assert_eq!(summary.sessions, 2);
         assert_eq!(summary.entities, 2);
@@ -789,7 +812,8 @@ mod tests {
         insert_session(&conn, "s1", 0, 10);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "t".into(),
             embedder: "t".into(),
@@ -800,8 +824,8 @@ mod tests {
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
         // Validating against a source whose session content differs must fail.
-        let mut tampered = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default())
-            .unwrap();
+        let mut tampered =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         tampered.sessions[0].summary = "DIFFERENT".into();
         let result = validate::validate_hdf5(h5_path.to_str().unwrap(), &tampered, false, false);
         assert!(result.is_err());
@@ -819,7 +843,8 @@ mod tests {
         insert_chunk(&conn, 1, "hello", &make_embedding(8, 1.0), 0);
         drop(conn);
 
-        let data = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
+        let data =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         let opts = hdf5_writer::WriteOptions {
             agent_id: "t".into(),
             embedder: "t".into(),
@@ -830,8 +855,8 @@ mod tests {
         hdf5_writer::write_hdf5(h5_path.to_str().unwrap(), &data, &opts).unwrap();
 
         // A source whose embedding differs (but counts match) must fail validation.
-        let mut tampered = sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default())
-            .unwrap();
+        let mut tampered =
+            sqlite_reader::read_sqlite(&db_path, false, None, &SchemaConfig::default()).unwrap();
         tampered.chunks[0].embedding[3] += 9.0;
         let result = validate::validate_hdf5(h5_path.to_str().unwrap(), &tampered, true, false);
         assert!(result.is_err());
@@ -856,7 +881,10 @@ mod tests {
             CREATE TABLE relations (src INTEGER, tgt INTEGER, relation TEXT, weight REAL, timestamp REAL);",
         )
         .unwrap();
-        let blob: Vec<u8> = make_embedding(4, 1.0).iter().flat_map(|v| v.to_le_bytes()).collect();
+        let blob: Vec<u8> = make_embedding(4, 1.0)
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         conn.execute(
             "INSERT INTO my_chunks VALUES (1, 'hi', ?1, 'api', 1.0, 's', '', 0)",
             rusqlite::params![blob],
@@ -908,7 +936,8 @@ mod tests {
         let base = hdf5_reader::read_hdf5(h5_path.to_str().unwrap()).unwrap();
         let max_id = base.chunks.iter().map(|c| c.id).max().unwrap_or(0);
         assert_eq!(max_id, 2);
-        let new = sqlite_reader::read_sqlite_filtered(&db_path, false, Some(4), &cfg, max_id).unwrap();
+        let new =
+            sqlite_reader::read_sqlite_filtered(&db_path, false, Some(4), &cfg, max_id).unwrap();
         assert_eq!(new.chunks.len(), 2); // only id 3 and 4
 
         let mut merged = base;

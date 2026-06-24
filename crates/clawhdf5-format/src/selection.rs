@@ -587,7 +587,7 @@ mod tests {
         // start=0 stride=1 count=1 block=4, version 3, enc_size 2, rank 1.
         let bytes = [
             0x02, 0, 0, 0, // type = HYPER
-            0x03, 0, 0, 0, // version 3
+            0x03, 0, 0, 0,    // version 3
             0x01, // flags = regular
             0x02, // enc_size = 2
             0x01, 0, 0, 0, // rank = 1

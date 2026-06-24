@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example uncompress_goes --release -- goes18_test.nc goes18_uncompressed.h5
 
-use clawhdf5::{File, FileBuilder, AttrValue};
+use clawhdf5::{AttrValue, File, FileBuilder};
 use clawhdf5_format::datatype::Datatype;
 use clawhdf5_format::group_v2;
 use clawhdf5_format::message_type::MessageType;
@@ -12,8 +12,14 @@ use clawhdf5_format::superblock::Superblock;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let input_path = args.get(1).cloned().unwrap_or_else(|| "goes18_test.nc".to_string());
-    let output_path = args.get(2).cloned().unwrap_or_else(|| "goes18_uncompressed.h5".to_string());
+    let input_path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "goes18_test.nc".to_string());
+    let output_path = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "goes18_uncompressed.h5".to_string());
 
     println!("=== GOES Data Uncompressor ===\n");
     println!("Input:  {}", input_path);
@@ -81,7 +87,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         i32_data.push(val as i32);
                     }
 
-                    println!("  Read {} elements, first 5: {:?}", num_elements, &i32_data[..5.min(num_elements)]);
+                    println!(
+                        "  Read {} elements, first 5: {:?}",
+                        num_elements,
+                        &i32_data[..5.min(num_elements)]
+                    );
 
                     // Create chunked dataset (250x250 to match original)
                     builder
@@ -160,7 +170,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder.write(&output_path)?;
 
     let output_size = std::fs::metadata(&output_path)?.len();
-    println!("  Written: {} bytes ({:.2} KB)", output_size, output_size as f64 / 1024.0);
+    println!(
+        "  Written: {} bytes ({:.2} KB)",
+        output_size,
+        output_size as f64 / 1024.0
+    );
 
     // Verify the output
     println!("\n--- Verifying output ---");
@@ -171,11 +185,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for name in &verify_datasets {
         let ds = verify_file.dataset(name)?;
-        println!("  {}: shape={:?}, dtype={:?}", name, ds.shape()?, ds.dtype()?);
+        println!(
+            "  {}: shape={:?}, dtype={:?}",
+            name,
+            ds.shape()?,
+            ds.dtype()?
+        );
     }
 
     println!("\n=== Done! ===");
-    println!("You can now run chunk modification tests on: {}", output_path);
+    println!(
+        "You can now run chunk modification tests on: {}",
+        output_path
+    );
 
     Ok(())
 }

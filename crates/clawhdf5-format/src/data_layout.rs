@@ -821,7 +821,8 @@ mod tests {
         let blob = [
             0x00u8, // block version 0
             0x01, 0, 0, 0, 0, 0, 0, 0, // nused = 1
-            0x73, 0x72, 0x63, 0x5f, 0x65, 0x78, 0x74, 0x2e, 0x68, 0x35, 0x00, // "src_ext.h5\0"
+            0x73, 0x72, 0x63, 0x5f, 0x65, 0x78, 0x74, 0x2e, 0x68, 0x35,
+            0x00, // "src_ext.h5\0"
             0x64, 0x61, 0x74, 0x61, 0x00, // "data\0"
             0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // source sel = ALL
             0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // virtual sel = ALL
@@ -846,7 +847,7 @@ mod tests {
         // One entry whose source selection (ALL) is truncated to 8 of 16 bytes.
         let blob = [
             0x01u8, // version 1
-            0x01, 0, 0, 0, 0, 0, 0, 0, // nused = 1
+            0x01, 0, 0, 0, 0, 0, 0, 0,    // nused = 1
             0x04, // same-file marker
             0x78, 0x00, // "x\0"
             0x03, 0, 0, 0, 0x01, 0, 0, 0, // ALL header, truncated (8 of 16 bytes)

@@ -91,7 +91,14 @@ impl Default for SchemaConfig {
             },
             sessions: TableSchema {
                 table: "sessions".into(),
-                columns: vec!["id", "start_idx", "end_idx", "channel", "timestamp", "summary"],
+                columns: vec![
+                    "id",
+                    "start_idx",
+                    "end_idx",
+                    "channel",
+                    "timestamp",
+                    "summary",
+                ],
             },
             entities: TableSchema {
                 table: "entities".into(),

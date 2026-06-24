@@ -842,7 +842,9 @@ fn provenance_verify_written_file() {
 #[ignore = "requires Python h5py module"]
 #[cfg(feature = "merkle")]
 fn h5py_reads_merkle_root_attribute() {
-    use clawhdf5_format::merkle::{HashAlg, MerkleAttr, MerkleTree, MERKLE_ATTR_NAME, MERKLE_ATTR_SIZE};
+    use clawhdf5_format::merkle::{
+        HashAlg, MERKLE_ATTR_NAME, MERKLE_ATTR_SIZE, MerkleAttr, MerkleTree,
+    };
 
     // Create a merkle tree from some test chunks
     let chunks: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 64]).collect();

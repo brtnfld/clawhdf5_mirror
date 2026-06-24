@@ -56,7 +56,11 @@ fn main() {
     let mut results: Vec<(String, usize, f64, usize, usize, String)> = Vec::new();
 
     for &n in &n_values {
-        println!("--- N = {} chunks ({}) ---", n, format_bytes(n * chunk_size));
+        println!(
+            "--- N = {} chunks ({}) ---",
+            n,
+            format_bytes(n * chunk_size)
+        );
 
         // Generate chunks
         print!("  Generating chunks... ");
@@ -130,7 +134,12 @@ fn main() {
     let mut file = File::create(&output_path).expect("Failed to create output file");
     writeln!(file, "mode,n_chunks,wall_time_ms,n_threads,trial,hostname").unwrap();
     for (mode, n, time_ms, threads, trial, host) in &results {
-        writeln!(file, "{},{},{:.3},{},{},{}", mode, n, time_ms, threads, trial, host).unwrap();
+        writeln!(
+            file,
+            "{},{},{:.3},{},{},{}",
+            mode, n, time_ms, threads, trial, host
+        )
+        .unwrap();
     }
 
     println!("Results saved to: {}", output_path);

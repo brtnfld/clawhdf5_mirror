@@ -321,9 +321,9 @@ fn roundtrip_through_file_writer() {
                 && let clawhdf5_format::link_message::LinkTarget::Hard {
                     object_header_address,
                 } = link.link_target
-                {
-                    ds_addr = Some(object_header_address);
-                }
+            {
+                ds_addr = Some(object_header_address);
+            }
         }
     }
     let ds_addr = ds_addr.expect("compound_ds link not found");

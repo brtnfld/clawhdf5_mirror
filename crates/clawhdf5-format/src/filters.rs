@@ -1225,7 +1225,10 @@ mod tests {
             0x02, 0x00, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc6, 0x00,
         ];
-        assert_eq!(scaleoffset_decompress(&raw, &cd, 0).unwrap(), i32_le(&[0, 1, 2, 3]));
+        assert_eq!(
+            scaleoffset_decompress(&raw, &cd, 0).unwrap(),
+            i32_le(&[0, 1, 2, 3])
+        );
     }
 
     #[test]
@@ -1353,8 +1356,12 @@ mod tests {
     fn nbit_compound_with_array_member() {
         // Compound { a: array(2,) of i32 prec 16 @0; b: u32@8 prec 8 }, 2 elements.
         // data = [([-1,100],200), ([1000,-32768],7)].
-        let cd = [20u32, 0, 2, 3, 12, 2, 0, 2, 8, 1, 4, 0, 16, 0, 8, 1, 4, 0, 8, 0];
-        let raw = [0xff, 0xff, 0x00, 0x64, 0xc8, 0x03, 0xe8, 0x80, 0x00, 0x07, 0x00];
+        let cd = [
+            20u32, 0, 2, 3, 12, 2, 0, 2, 8, 1, 4, 0, 16, 0, 8, 1, 4, 0, 8, 0,
+        ];
+        let raw = [
+            0xff, 0xff, 0x00, 0x64, 0xc8, 0x03, 0xe8, 0x80, 0x00, 0x07, 0x00,
+        ];
         #[rustfmt::skip]
         let expected: Vec<u8> = vec![
             0xff,0xff,0x00,0x00, 0x64,0x00,0x00,0x00, 0xc8,0x00,0x00,0x00, // ([-1,100], 200)

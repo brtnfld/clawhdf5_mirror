@@ -15,7 +15,7 @@ fn hash_pair_blake3(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 }
 
 fn hash_pair_sha256(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut combined = [0u8; 65];
     combined[0] = INTERNAL_PREFIX;
     combined[1..33].copy_from_slice(left);
@@ -138,7 +138,9 @@ fn main() {
     assert_eq!(&root8, tree8.root(), "Eight-leaf root mismatch");
 
     println!("  \"eight_leaf_blake3\": {{");
-    println!("    \"inputs\": [\"L\\\\x00\", \"L\\\\x01\", \"L\\\\x02\", \"L\\\\x03\", \"L\\\\x04\", \"L\\\\x05\", \"L\\\\x06\", \"L\\\\x07\"],");
+    println!(
+        "    \"inputs\": [\"L\\\\x00\", \"L\\\\x01\", \"L\\\\x02\", \"L\\\\x03\", \"L\\\\x04\", \"L\\\\x05\", \"L\\\\x06\", \"L\\\\x07\"],"
+    );
     println!("    \"leaf_hashes\": [");
     for (i, leaf) in leaves.iter().enumerate() {
         let comma = if i < 7 { "," } else { "" };
@@ -162,7 +164,11 @@ fn main() {
     let root2_sha = hash_pair_sha256(&leaf0_sha, &leaf1_sha);
     let tree2_sha = MerkleTree::build(&[leaf0_sha, leaf1_sha], HashAlg::Sha256).unwrap();
 
-    assert_eq!(&root2_sha, tree2_sha.root(), "SHA-256 two-leaf root mismatch");
+    assert_eq!(
+        &root2_sha,
+        tree2_sha.root(),
+        "SHA-256 two-leaf root mismatch"
+    );
 
     println!("  \"two_leaf_sha256\": {{");
     println!("    \"inputs\": [\"leaf zero\", \"leaf one\"],");

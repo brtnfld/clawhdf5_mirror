@@ -1030,14 +1030,8 @@ mod tests {
             Datatype::Compound { size, members } => {
                 assert_eq!(size, 20);
                 assert_eq!(members.len(), 3);
-                assert_eq!(
-                    (members[0].name.as_str(), members[0].byte_offset),
-                    ("x", 0)
-                );
-                assert_eq!(
-                    (members[1].name.as_str(), members[1].byte_offset),
-                    ("y", 8)
-                );
+                assert_eq!((members[0].name.as_str(), members[0].byte_offset), ("x", 0));
+                assert_eq!((members[1].name.as_str(), members[1].byte_offset), ("y", 8));
                 assert_eq!(
                     (members[2].name.as_str(), members[2].byte_offset),
                     ("id", 16)
@@ -1076,7 +1070,10 @@ mod tests {
                 dimensions,
             } => {
                 assert_eq!(dimensions, vec![3]);
-                assert!(matches!(*base_type, Datatype::FloatingPoint { size: 8, .. }));
+                assert!(matches!(
+                    *base_type,
+                    Datatype::FloatingPoint { size: 8, .. }
+                ));
             }
             other => panic!("expected Array, got {other:?}"),
         }

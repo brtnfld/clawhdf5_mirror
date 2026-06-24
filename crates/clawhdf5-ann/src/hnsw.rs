@@ -380,7 +380,13 @@ impl HnswIndex {
 
         // Phase 1: greedy descent from the top down to node_level + 1.
         for layer in (node_level + 1..=ep_level).rev() {
-            ep = greedy_closest(&self.vectors, &self.graph[layer], &self.vectors[id], ep, self.metric);
+            ep = greedy_closest(
+                &self.vectors,
+                &self.graph[layer],
+                &self.vectors[id],
+                ep,
+                self.metric,
+            );
         }
 
         // Phase 2: search and connect from min(node_level, ep_level) down to 0.
@@ -1013,11 +1019,14 @@ fn get_attr_i64(attrs: &[(String, AttrValue)], name: &str) -> Result<i64, Format
 /// Like [`get_attr_i64`] but returns `None` when the attribute is absent or not
 /// an integer, instead of erroring. Used for optional/back-compat attributes.
 fn get_attr_i64_opt(attrs: &[(String, AttrValue)], name: &str) -> Option<i64> {
-    attrs.iter().find(|(n, _)| n == name).and_then(|(_, v)| match v {
-        AttrValue::I64(val) => Some(*val),
-        AttrValue::U64(val) => Some(*val as i64),
-        _ => None,
-    })
+    attrs
+        .iter()
+        .find(|(n, _)| n == name)
+        .and_then(|(_, v)| match v {
+            AttrValue::I64(val) => Some(*val),
+            AttrValue::U64(val) => Some(*val as i64),
+            _ => None,
+        })
 }
 
 fn get_attr_string(attrs: &[(String, AttrValue)], name: &str) -> Result<String, FormatError> {

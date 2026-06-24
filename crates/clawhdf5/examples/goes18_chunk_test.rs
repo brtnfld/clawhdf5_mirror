@@ -4,11 +4,11 @@
 
 use clawhdf5::File;
 use clawhdf5_format::chunked_read::ChunkInfo;
-use clawhdf5_format::data_layout::DataLayout;
-use clawhdf5_format::filter_pipeline::FilterPipeline;
-use clawhdf5_format::fixed_array::{read_fixed_array_chunks, FixedArrayHeader};
-use clawhdf5_format::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunks};
 use clawhdf5_format::chunked_read::collect_chunk_info;
+use clawhdf5_format::data_layout::DataLayout;
+use clawhdf5_format::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunks};
+use clawhdf5_format::filter_pipeline::FilterPipeline;
+use clawhdf5_format::fixed_array::{FixedArrayHeader, read_fixed_array_chunks};
 use clawhdf5_format::group_v2;
 use clawhdf5_format::message_type::MessageType;
 use clawhdf5_format::object_header::ObjectHeader;
@@ -20,7 +20,10 @@ use std::io::{Seek, SeekFrom, Write};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).cloned().unwrap_or_else(|| "goes18_sample.nc".to_string());
+    let path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "goes18_sample.nc".to_string());
     let dataset_override = args.get(2).cloned();
 
     println!("=== HDF5 Chunk Modification Test ===\n");
@@ -93,7 +96,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref p) = pipeline {
         println!("  Filters: {} filters applied", p.filters.len());
         for f in &p.filters {
-            println!("    - Filter ID {}: {}", f.filter_id, f.name.as_deref().unwrap_or("unnamed"));
+            println!(
+                "    - Filter ID {}: {}",
+                f.filter_id,
+                f.name.as_deref().unwrap_or("unnamed")
+            );
         }
     }
 
@@ -120,12 +127,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chunks: Vec<ChunkInfo> = match (*version, *chunk_index_type) {
                 (3, _) => {
                     // B-tree v1
-                    collect_chunk_info(&file_data, addr, rank + 1, superblock.offset_size, superblock.length_size)?
+                    collect_chunk_info(
+                        &file_data,
+                        addr,
+                        rank + 1,
+                        superblock.offset_size,
+                        superblock.length_size,
+                    )?
                 }
                 (4, Some(1)) => {
                     // Single chunk
                     vec![ChunkInfo {
-                        chunk_size: spatial_dims.iter().map(|&d| d as u64).product::<u64>() as u32 * elem_size as u32,
+                        chunk_size: spatial_dims.iter().map(|&d| d as u64).product::<u64>() as u32
+                            * elem_size as u32,
                         filter_mask: 0,
                         offsets: vec![0; rank],
                         address: addr,
@@ -171,7 +185,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!(
                         "Unsupported chunk index: version={}, type={:?}",
                         version, chunk_index_type
-                    ).into());
+                    )
+                    .into());
                 }
             };
 
@@ -199,7 +214,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, chunk) in chunks.iter().take(5).enumerate() {
         println!(
             "  Chunk {}: addr=0x{:x}, size={} bytes, offsets={:?}, filtered={}",
-            i, chunk.address, chunk.chunk_size, chunk.offsets,
+            i,
+            chunk.address,
+            chunk.chunk_size,
+            chunk.offsets,
             chunk.filter_mask != 0
         );
     }
@@ -224,14 +242,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let checksum: u64 = chunk_data.iter().map(|&b| b as u64).sum();
                 total_bytes += chunk.chunk_size as u64;
                 if i < 3 || i == chunks.len() - 1 {
-                    println!("  Chunk {}: {} bytes, checksum={}", i, chunk.chunk_size, checksum);
+                    println!(
+                        "  Chunk {}: {} bytes, checksum={}",
+                        i, chunk.chunk_size, checksum
+                    );
                 } else if i == 3 {
                     println!("  ... iterating {} more chunks ...", chunks.len() - 4);
                 }
             }
         }
-        println!("\nTotal chunk data read: {} bytes ({:.2} MB)",
-            total_bytes, total_bytes as f64 / 1_048_576.0);
+        println!(
+            "\nTotal chunk data read: {} bytes ({:.2} MB)",
+            total_bytes,
+            total_bytes as f64 / 1_048_576.0
+        );
 
         println!("\n=== TEST COMPLETE (read-only due to compression) ===");
         return Ok(());
@@ -293,7 +317,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check other chunks weren't corrupted
     let mut errors = 0;
     for (i, chunk) in chunks.iter().enumerate() {
-        if i == target_idx { continue; }
+        if i == target_idx {
+            continue;
+        }
         let s = chunk.address as usize;
         let e = s + chunk.chunk_size as usize;
         if e <= file_data_after.len() {

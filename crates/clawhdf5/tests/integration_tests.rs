@@ -715,7 +715,9 @@ fn multiple_chunked_datasets_share_file_cache() {
     use clawhdf5_format::datatype::{CharacterSet, Datatype, StringPadding};
 
     // 1-D chunked + compressed fixed-length strings (payload > compress threshold).
-    let strings: Vec<String> = (0..64).map(|i| format!("entry-{i:06}-{}", "x".repeat(80))).collect();
+    let strings: Vec<String> = (0..64)
+        .map(|i| format!("entry-{i:06}-{}", "x".repeat(80)))
+        .collect();
     let max_len = strings.iter().map(|s| s.len()).max().unwrap();
     let mut sraw = Vec::new();
     for s in &strings {
@@ -743,7 +745,9 @@ fn multiple_chunked_datasets_share_file_cache() {
     {
         let ds = b.create_dataset("mat");
         ds.with_f32_data(&mat).with_shape(&[n as u64, d as u64]);
-        ds.with_chunks(&[10, d as u64]).with_shuffle().with_deflate(6);
+        ds.with_chunks(&[10, d as u64])
+            .with_shuffle()
+            .with_deflate(6);
     }
     let bytes = b.finish().unwrap();
     let file = File::from_bytes(bytes).unwrap();
@@ -755,7 +759,10 @@ fn multiple_chunked_datasets_share_file_cache() {
     let got_mat = file.dataset("mat").unwrap().read_f32().unwrap();
     assert_eq!(got_mat, mat);
     // Read the 1-D one again to confirm the cache rebinds back correctly.
-    assert_eq!(file.dataset("strs").unwrap().read_string().unwrap(), strings);
+    assert_eq!(
+        file.dataset("strs").unwrap().read_string().unwrap(),
+        strings
+    );
 }
 
 #[test]
@@ -850,8 +857,14 @@ fn dense_group_links_roundtrip() {
         );
     }
     // The small (compact) group still works.
-    assert_eq!(file.dataset("small/a").unwrap().read_f64().unwrap(), vec![1.0]);
-    assert_eq!(file.dataset("small/b").unwrap().read_f64().unwrap(), vec![2.0]);
+    assert_eq!(
+        file.dataset("small/a").unwrap().read_f64().unwrap(),
+        vec![1.0]
+    );
+    assert_eq!(
+        file.dataset("small/b").unwrap().read_f64().unwrap(),
+        vec![2.0]
+    );
 }
 
 #[test]
@@ -908,7 +921,10 @@ fn dense_links_multiblock_fractal_heap_roundtrip() {
     b.add_group(g.finish());
     let file = File::from_bytes(b.finish().unwrap()).unwrap();
 
-    assert_eq!(file.group("big").unwrap().datasets().unwrap().len(), n as usize);
+    assert_eq!(
+        file.group("big").unwrap().datasets().unwrap().len(),
+        n as usize
+    );
     for i in [0, 1, 1234, n - 1] {
         assert_eq!(
             file.dataset(&format!("big/dataset_number_{i:05}"))

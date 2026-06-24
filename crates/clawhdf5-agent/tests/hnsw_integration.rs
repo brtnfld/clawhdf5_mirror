@@ -80,8 +80,7 @@ fn hnsw_matches_bruteforce_oracle() {
     oracle.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let oracle_ids: std::collections::HashSet<usize> =
         oracle.iter().take(k).map(|(i, _)| *i).collect();
-    let hnsw_ids: std::collections::HashSet<usize> =
-        results.iter().map(|r| r.index).collect();
+    let hnsw_ids: std::collections::HashSet<usize> = results.iter().map(|r| r.index).collect();
 
     let overlap = oracle_ids.intersection(&hnsw_ids).count();
     assert!(
@@ -127,17 +126,19 @@ fn incremental_inserts_after_search_are_found() {
     // First batch, then a search to force the index to build.
     for i in 0..40 {
         let v = make_vector(&mut seed, dim);
-        mem.save(entry(&format!("a{i}"), v, &format!("a{i}"))).unwrap();
+        mem.save(entry(&format!("a{i}"), v, &format!("a{i}")))
+            .unwrap();
     }
     let _ = mem.hybrid_search(&make_vector(&mut seed, dim), "", 1.0, 0.0, 5);
 
     // Now insert a distinctive vector incrementally and confirm we can find it.
     let needle = vec![10.0f32; dim];
-    let idx = mem
-        .save(entry("needle", needle.clone(), "needle"))
-        .unwrap();
+    let idx = mem.save(entry("needle", needle.clone(), "needle")).unwrap();
     let hits = mem.hybrid_search(&needle, "", 1.0, 0.0, 1);
-    assert_eq!(hits[0].index, idx, "incrementally inserted vector must be found");
+    assert_eq!(
+        hits[0].index, idx,
+        "incrementally inserted vector must be found"
+    );
 }
 
 #[test]
@@ -158,6 +159,9 @@ fn save_batch_then_search_is_consistent() {
     // Exact-match queries should resolve to themselves after a batch insert.
     for probe in [0usize, 17, 49] {
         let hits = mem.hybrid_search(&vectors[probe], "", 1.0, 0.0, 1);
-        assert_eq!(hits[0].index, probe, "batch-inserted vector {probe} not found");
+        assert_eq!(
+            hits[0].index, probe,
+            "batch-inserted vector {probe} not found"
+        );
     }
 }

@@ -94,7 +94,14 @@ pub fn read_raw_data_full(
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
     read_raw_data_full_impl(
-        file_data, layout, dataspace, datatype, pipeline, offset_size, length_size, None,
+        file_data,
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        offset_size,
+        length_size,
+        None,
     )
 }
 
@@ -112,7 +119,14 @@ pub fn read_raw_data_full_with_resolver(
     resolver: Option<&VdsSourceResolver>,
 ) -> Result<Vec<u8>, FormatError> {
     read_raw_data_full_impl(
-        file_data, layout, dataspace, datatype, pipeline, offset_size, length_size, resolver,
+        file_data,
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        offset_size,
+        length_size,
+        resolver,
     )
 }
 
@@ -465,12 +479,12 @@ fn read_virtual_data(
         FormatError::ChunkedReadError("virtual dataset has no mapping global heap".into())
     })?;
     let coll = GlobalHeapCollection::parse(file_data, addr as usize, length_size)?;
-    let obj = coll
-        .get_object(global_heap_index as u16)
-        .ok_or(FormatError::GlobalHeapObjectNotFound {
-            collection_address: addr,
-            index: global_heap_index as u16,
-        })?;
+    let obj =
+        coll.get_object(global_heap_index as u16)
+            .ok_or(FormatError::GlobalHeapObjectNotFound {
+                collection_address: addr,
+                index: global_heap_index as u16,
+            })?;
     let mappings = parse_vds_mappings(&obj.data, length_size)?;
 
     for m in &mappings {
@@ -1815,13 +1829,19 @@ mod tests {
             0xff, 0xff, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x80,
             0x00, 0x00,
         ];
-        assert_eq!(read_as_i32(&raw, &arr).unwrap(), vec![-1, 100, 1000, -32768]);
+        assert_eq!(
+            read_as_i32(&raw, &arr).unwrap(),
+            vec![-1, 100, 1000, -32768]
+        );
         // Nested array-of-array unwraps recursively.
         let nested = Datatype::Array {
             base_type: Box::new(arr),
             dimensions: vec![2],
         };
-        assert_eq!(read_as_i32(&raw, &nested).unwrap(), vec![-1, 100, 1000, -32768]);
+        assert_eq!(
+            read_as_i32(&raw, &nested).unwrap(),
+            vec![-1, 100, 1000, -32768]
+        );
     }
 
     fn make_f64_le_type() -> Datatype {

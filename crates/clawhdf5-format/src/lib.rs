@@ -95,6 +95,8 @@ pub mod property_list;
 pub mod selection;
 pub mod shared_message;
 pub mod signature;
+#[cfg(feature = "merkle")]
+pub mod subset_proof;
 pub mod superblock;
 pub mod symbol_table;
 pub mod type_builders;

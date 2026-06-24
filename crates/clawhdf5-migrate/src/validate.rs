@@ -77,10 +77,9 @@ pub fn validate_hdf5(
         }
         for (k, (&a, &b)) in s.embedding.iter().zip(g.embedding.iter()).enumerate() {
             if (a - b).abs() > emb_abs + emb_rel * a.abs() {
-                return Err(format!(
-                    "chunk[{i}].embedding[{k}] mismatch: source {a}, HDF5 {b}"
-                )
-                .into());
+                return Err(
+                    format!("chunk[{i}].embedding[{k}] mismatch: source {a}, HDF5 {b}").into(),
+                );
             }
         }
         rows_checked += 1;
@@ -108,7 +107,12 @@ pub fn validate_hdf5(
         }
         rows_checked += 1;
     }
-    for (i, (s, g)) in source.relations.iter().zip(got.relations.iter()).enumerate() {
+    for (i, (s, g)) in source
+        .relations
+        .iter()
+        .zip(got.relations.iter())
+        .enumerate()
+    {
         if s.src != g.src || s.tgt != g.tgt || s.relation != g.relation {
             return Err(format!("relation[{i}] mismatch").into());
         }

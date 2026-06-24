@@ -555,13 +555,12 @@ mod tests {
         buf.push(2); // version
         buf.push(flags);
 
-        if has_timestamps
-            && let Some((at, mt, ct, bt)) = timestamps {
-                buf.extend_from_slice(&at.to_le_bytes());
-                buf.extend_from_slice(&mt.to_le_bytes());
-                buf.extend_from_slice(&ct.to_le_bytes());
-                buf.extend_from_slice(&bt.to_le_bytes());
-            }
+        if has_timestamps && let Some((at, mt, ct, bt)) = timestamps {
+            buf.extend_from_slice(&at.to_le_bytes());
+            buf.extend_from_slice(&mt.to_le_bytes());
+            buf.extend_from_slice(&ct.to_le_bytes());
+            buf.extend_from_slice(&bt.to_le_bytes());
+        }
 
         if flags & 0x10 != 0 {
             buf.extend_from_slice(&8u16.to_le_bytes()); // max_compact

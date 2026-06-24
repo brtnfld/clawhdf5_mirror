@@ -2,3 +2,7 @@
 Cargo.lock
 benchmarks/longmemeval/*.json
 benches/results/
+
+# Local-only reference/tooling artifacts, not part of the repo's source.
+/S2_D2_Yr2.pdf
+/.github/instructions/codacy.instructions.md

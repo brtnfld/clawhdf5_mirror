@@ -4,8 +4,8 @@
 
 use clawhdf5_format::file_writer::FileWriter;
 use clawhdf5_format::merkle::{
-    hash_chunk, write_merkle_companion, HashAlg, MerkleAttr, MerkleCompanionResult,
-    MERKLE_ATTR_NAME,
+    HashAlg, MERKLE_ATTR_NAME, MerkleAttr, MerkleCompanionResult, hash_chunk,
+    write_merkle_companion,
 };
 use clawhdf5_format::type_builders::AttrValue;
 use std::fs;
@@ -71,7 +71,10 @@ fn main() {
     fs::write(output_path, &file_bytes).expect("write file");
 
     println!("\nWrote {} bytes to {}", file_bytes.len(), output_path);
-    println!("Verify with: python3 -c \"import h5py; f=h5py.File('{}', 'r'); print(list(f.keys())); print(list(f['merkle'].keys()))\"", output_path);
+    println!(
+        "Verify with: python3 -c \"import h5py; f=h5py.File('{}', 'r'); print(list(f.keys())); print(list(f['merkle'].keys()))\"",
+        output_path
+    );
 }
 
 mod hex {

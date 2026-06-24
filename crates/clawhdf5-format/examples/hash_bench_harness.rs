@@ -165,7 +165,9 @@ fn bootstrap_median_ci(samples: &[f64], seed: u64) -> (f64, f64, f64) {
 /// Deterministic, non-trivially-compressible chunk data — same pattern as
 /// `hash_bench.rs::make_chunk`.
 fn make_chunk(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect()
+    (0..size)
+        .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+        .collect()
 }
 
 struct Row {
@@ -248,7 +250,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ram_gb(),
         now_utc_iso()
     );
-    csv.push_str("alg,chunk_size_kb,throughput_mbs,ci95_low,ci95_high,platform,hostname,cpu_model\n");
+    csv.push_str(
+        "alg,chunk_size_kb,throughput_mbs,ci95_low,ci95_high,platform,hostname,cpu_model\n",
+    );
     for r in &rows {
         csv.push_str(&format!(
             "{},{},{},{},{},{},{},{}\n",
@@ -287,7 +291,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Wrote {} rows to {out_path}", rows.len());
     println!("Wrote raw per-trial samples to {raw_out_path}");
-    println!("Note: benches/results/ is gitignored — `git add -f` these files if you intend to commit them as P1.2 artifacts.");
+    println!(
+        "Note: benches/results/ is gitignored — `git add -f` these files if you intend to commit them as P1.2 artifacts."
+    );
 
     Ok(())
 }

@@ -214,9 +214,9 @@ print('ok')
                 && let clawhdf5_format::link_message::LinkTarget::Hard {
                     object_header_address,
                 } = link.link_target
-                {
-                    refs_addr = Some(object_header_address);
-                }
+            {
+                refs_addr = Some(object_header_address);
+            }
         }
     }
 

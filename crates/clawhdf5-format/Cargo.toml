@@ -77,3 +77,7 @@ required-features = ["merkle"]
 [[example]]
 name = "parallel_build_bench"
 required-features = ["merkle", "parallel"]
+
+[[example]]
+name = "gen_subset_vectors"
+required-features = ["merkle"]

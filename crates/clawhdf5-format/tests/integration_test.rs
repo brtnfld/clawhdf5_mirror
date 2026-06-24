@@ -706,7 +706,10 @@ fn scaleoffset_float_escale_reads_as_raw() {
     let (raw, datatype, _) = read_chunked_dataset(file_data, "x");
     let values = read_as_f64(&raw, &datatype).unwrap();
     let expect: Vec<f64> = (0..20).map(|i| i as f64 * 0.25).collect();
-    assert_eq!(values, expect, "E-scale (raw + masked filter) must read verbatim");
+    assert_eq!(
+        values, expect,
+        "E-scale (raw + masked filter) must read verbatim"
+    );
 }
 
 #[test]
@@ -717,26 +720,48 @@ fn v4_virtual_dataset_cycle_errors_not_overflow() {
     let offset = find_signature(file_data).unwrap();
     let sb = Superblock::parse(file_data, offset).unwrap();
     let addr = resolve_path_any(file_data, &sb, "virt").unwrap();
-    let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
+    let hdr =
+        ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
     let ds = Dataspace::parse(
-        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Dataspace).unwrap().data,
+        &hdr.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Dataspace)
+            .unwrap()
+            .data,
         sb.length_size,
     )
     .unwrap();
     let (dt, _) = Datatype::parse(
-        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Datatype).unwrap().data,
+        &hdr.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Datatype)
+            .unwrap()
+            .data,
     )
     .unwrap();
     let layout = DataLayout::parse(
-        &hdr.messages.iter().find(|m| m.msg_type == MessageType::DataLayout).unwrap().data,
+        &hdr.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data,
         sb.offset_size,
         sb.length_size,
     )
     .unwrap();
     let r = read_raw_data_full(
-        file_data, &layout, &ds, &dt, None, sb.offset_size, sb.length_size,
+        file_data,
+        &layout,
+        &ds,
+        &dt,
+        None,
+        sb.offset_size,
+        sb.length_size,
     );
-    assert!(r.is_err(), "cyclic virtual dataset must error, not overflow");
+    assert!(
+        r.is_err(),
+        "cyclic virtual dataset must error, not overflow"
+    );
 }
 
 #[test]
@@ -751,16 +776,28 @@ fn v4_virtual_dataset_external_file_read() {
     let addr = resolve_path_any(virt, &sb, "virt").unwrap();
     let hdr = ObjectHeader::parse(virt, addr as usize, sb.offset_size, sb.length_size).unwrap();
     let ds = Dataspace::parse(
-        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Dataspace).unwrap().data,
+        &hdr.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Dataspace)
+            .unwrap()
+            .data,
         sb.length_size,
     )
     .unwrap();
     let (dt, _) = Datatype::parse(
-        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Datatype).unwrap().data,
+        &hdr.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Datatype)
+            .unwrap()
+            .data,
     )
     .unwrap();
     let layout = DataLayout::parse(
-        &hdr.messages.iter().find(|m| m.msg_type == MessageType::DataLayout).unwrap().data,
+        &hdr.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data,
         sb.offset_size,
         sb.length_size,
     )
@@ -790,7 +827,14 @@ fn v4_virtual_dataset_external_file_read() {
 
     // With no resolver, an external source is a clean error (not wrong data).
     let no_resolver = read_raw_data_full_with_resolver(
-        virt, &layout, &ds, &dt, None, sb.offset_size, sb.length_size, None,
+        virt,
+        &layout,
+        &ds,
+        &dt,
+        None,
+        sb.offset_size,
+        sb.length_size,
+        None,
     );
     assert!(no_resolver.is_err());
 }
@@ -805,9 +849,18 @@ fn v4_paged_fixed_array_read() {
     let values = read_as_i32(&raw, &datatype).unwrap();
     assert_eq!(values.len(), 1025 * 16);
     for k in 0..1025usize {
-        assert_eq!(values[k * 16], k as i32, "chunk-start mismatch at chunk {k}");
+        assert_eq!(
+            values[k * 16],
+            k as i32,
+            "chunk-start mismatch at chunk {k}"
+        );
         for j in 1..16 {
-            assert_eq!(values[k * 16 + j], 0, "non-start element nonzero at {}", k * 16 + j);
+            assert_eq!(
+                values[k * 16 + j],
+                0,
+                "non-start element nonzero at {}",
+                k * 16 + j
+            );
         }
     }
 }
