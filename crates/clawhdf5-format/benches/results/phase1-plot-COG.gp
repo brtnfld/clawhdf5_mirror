@@ -96,9 +96,9 @@ $OUTLIERS << EOD
 EOD
 
 set logscale y
-plot $EXT using 1:2:3:4:5 with candlesticks lw 1 lc rgb '#ff7f0e' title 'extend\_merkle (IQR box)' whiskerbars 0.5, \
+plot $EXT using 1:2:3:4:5 with candlesticks lw 1 lc rgb '#ff7f0e' title 'extend\_merkle' whiskerbars 0.5, \
      $EXT using 1:6:6:6:6 with candlesticks lw 2 lc rgb '#ff7f0e' notitle, \
-     $UPD using 1:2:3:4:5 with candlesticks lw 1 lc rgb '#8c564b' title 'update\_merkle (IQR box)' whiskerbars 0.5, \
+     $UPD using 1:2:3:4:5 with candlesticks lw 1 lc rgb '#8c564b' title 'update\_merkle' whiskerbars 0.5, \
      $UPD using 1:6:6:6:6 with candlesticks lw 2 lc rgb '#8c564b' notitle, \
      $OUTLIERS using 1:2 with points pt 6 ps 0.4 lc rgb '#000000' notitle
 
