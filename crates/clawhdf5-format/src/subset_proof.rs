@@ -45,12 +45,19 @@ impl ChunkGridParams {
     }
 
     /// Number of chunks per dimension, `ceil(dims[d] / chunk_shape[d])`.
+    ///
+    /// A zero entry in `chunk_shape` is structurally invalid (internal callers
+    /// reject it via `validate_grid_shape` before ever reaching the
+    /// `O(total_chunks)` sweep); rather than divide-by-zero, such an axis
+    /// reports `0` chunks here so direct callers of this public method can't
+    /// be panicked by a malformed `ChunkGridParams` (its fields are all
+    /// `pub`, so construction isn't restricted to [`ChunkGridParams::new`]).
     #[must_use]
     pub fn n_chunks_per_dim(&self) -> Vec<u64> {
         self.dims
             .iter()
             .zip(self.chunk_shape.iter())
-            .map(|(&d, &c)| d.div_ceil(c))
+            .map(|(&d, &c)| if c == 0 { 0 } else { d.div_ceil(c) })
             .collect()
     }
 
@@ -506,6 +513,17 @@ mod tests {
         let n_per_dim_2d = vec![2u64, 3u64];
         // coord (1, 2) in a 2x3 grid -> 1*3 + 2 = 5
         assert_eq!(row_major_index(&[1, 2], &n_per_dim_2d), 5);
+    }
+
+    #[test]
+    fn test_n_chunks_per_dim_rejects_zero_chunk_shape_without_panicking() {
+        // `ChunkGridParams`'s fields are all `pub`, so a caller can construct
+        // one with a zero `chunk_shape` entry directly (bypassing every
+        // `validate_grid_shape` gate inside this module) and then call the
+        // public accessors straight away.
+        let grid = ChunkGridParams::new(vec![10, 10], vec![2, 0], HashAlg::Blake3);
+        assert_eq!(grid.n_chunks_per_dim(), vec![5, 0]);
+        assert_eq!(grid.total_chunk_count(), 0);
     }
 
     #[test]
