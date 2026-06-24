@@ -59,9 +59,13 @@ Seven scenarios, each run against the Merkle-tree primitives
   + root comparison).
 - **full_rebuild** — the same tree build, timed on its own (separate label
   for the RQ3 line chart; mechanically identical cost to `verify_dataset`).
-- **verify_chunk** — verify a single chunk's Merkle proof
-  (`tree.verify_chunk(0, ...)`), the partial-verification primitive this
-  whole design exists to make cheap.
+- **verify_chunk** — `tree.verify_chunk(0, ...)`: re-hash the chunk's bytes
+  and compare against the leaf hash stored at that index in the tree's own
+  node array (`MerkleTree::leaf_hash`, an O(1) lookup). This does **not**
+  walk a sibling proof path to the root — that's a separate API
+  (`generate_proof`/`verify_proof`), not exercised by this scenario — so as
+  measured here, verify_chunk's cost is O(chunk_size), not O(chunk_size +
+  log N). See the "Expected trends" note below for why this matters.
 - **flat_verify** — the P1.2b baseline: one SHA-256 pass over the entire
   dataset's bytes (`FlatHashBackend::verify_dataset`), representing the
   status quo "no partial verification" approach.
@@ -89,8 +93,11 @@ size; `0.0625` for the synthetic 64-byte `companion_io` chunks),
 `wall_time_ms`, `peak_rss_mb` (the process's `VmHWM` high-water-mark,
 sampled after each trial — not the trial's own incremental allocation),
 `companion_bytes` (0 for all scenarios except `companion_io`, where it is
-exactly `(2N-1) * 32`), `trial` (1-30), `hostname`, `disk_type`. There is no
-pre-computed median/CI column in this file (unlike `hash-bench-*.csv`) —
+`(2 * next_power_of_two(N) - 1) * 32` — collapsing to `(2N-1) * 32` only
+because every `N` used in this scenario (16, 256, 1,024, 65,536) is already
+a power of two, so padding is a no-op), `trial` (1-30), `hostname`,
+`disk_type`. There is no pre-computed median/CI column in this file
+(unlike `hash-bench-*.csv`) —
 aggregate the 30 trials per `(source, scenario, n_chunks, chunk_size_kb)`
 group yourself, e.g. with the median.
 
@@ -122,23 +129,26 @@ Median `wall_time_ms` per cell:
   more discrete hash invocations even though the bytes hashed are constant.
   This is the real, expected storage-vs-verification-granularity tradeoff
   the spec's RQ1/RQ3 are measuring.
-- **verify_chunk is dominated by leaf content size, not tree depth — this
-  inverts naive O(log N) intuition and is worth calling out explicitly.**
-  Looking only at chunk *count*, verify_chunk should get slower as N grows
-  (deeper tree, more sibling hashes on the path). The data shows the
-  opposite: 0.0830 ms at N=3,413 (1 MB chunks) vs. 0.0100 ms at N=54,608
-  (64 KB chunks). Root cause: `verify_chunk` re-hashes the leaf's own chunk
-  content before walking the proof path, and that leaf-hash call is O(chunk
-  size) — a 1 MB chunk costs far more to hash than a 64 KB chunk, dwarfing
-  the difference in path length (log2(3,413) ≈ 12 vs. log2(54,608) ≈ 16, a
-  ~33% difference in sibling-hash count, negligible next to a 16x difference
-  in leaf bytes hashed). Since this dataset fixes total bytes and varies
-  chunk size inversely with chunk count, "more chunks" here always means
-  "smaller chunks," so the leaf-hashing term dominates and the curve runs
-  opposite to the textbook O(log N) shape. This is a real property of the
-  benchmark's parameterization, not a bug — verify_chunk's true asymptotic
-  behavior is O(chunk_size + log N), and in this regime the first term
-  wins.
+- **verify_chunk gets *faster* as chunk count grows — the inverse of naive
+  O(log N) intuition, but expected once you check what this method actually
+  does.** Looking only at chunk *count*, one might expect verify_chunk to
+  get slower as N grows (deeper tree → more proof-path work). The data
+  shows the opposite: 0.0830 ms at N=3,413 (1 MB chunks) vs. 0.0100 ms at
+  N=54,608 (64 KB chunks). Root cause, confirmed by reading
+  `MerkleTree::verify_chunk` in `merkle.rs`: it re-hashes the chunk's full
+  content and compares the result against the leaf hash already stored at
+  that index — an O(1) array lookup, not a sibling-path walk to the root.
+  So there is no log(N) term here at all to be dominated; verify_chunk's
+  cost in this benchmark is essentially pure O(chunk_size). Since this
+  dataset fixes total bytes (~3.33 GB) and varies chunk size inversely with
+  chunk count, "more chunks" here always means "smaller chunks," and
+  smaller chunks are cheaper to re-hash — hence the inverted curve. This is
+  a real property of both the benchmark's parameterization and this
+  specific API's design (not a bug): a verifier that only needs to check a
+  chunk against a Merkle tree it already holds in full doesn't need the
+  proof path at all. The O(log N) proof-path cost only applies to the
+  separate `generate_proof`/`verify_proof` API (for a verifier holding just
+  the root), which this scenario does not measure.
 - **extend_merkle/update_merkle track each other almost exactly, as
   expected** (both literally call the same `MerkleTree::update_leaf`), but
   their absolute scaling with N is much steeper than the O(log N) the
@@ -155,26 +165,28 @@ cost rises by ~94x (0.004 ms → 0.3765 ms).
 
 Root cause: the timed closure is `let mut t = tree.clone(); t.update_leaf(...)`,
 and `tree.clone()` is a full copy of the tree's internal node array — O(N)
-in the number of leaves, not O(log N). The node array size at each N is:
+in the number of leaves, not O(log N). `MerkleTree::build` pads the leaf
+count up to the next power of two before sizing the node array
+(`2 * leaf_count.next_power_of_two() - 1` nodes), so the clone size must be
+computed from the *padded* leaf count, not the raw chunk count:
 
-| N (leaves) | nodes = 2N-1 | clone size |
-|---|---|---|
-| 3,413 | 6,825 | ~213 KB |
-| 13,652 | 27,303 | ~853 KB |
-| 54,608 | 109,215 | ~3.33 MB |
+| N (leaves) | padded to | nodes = 2·padded-1 | clone size |
+|---|---|---|---|
+| 3,413 | 4,096 | 8,191 | ~256 KB |
+| 13,652 | 16,384 | 32,767 | ~1.00 MB |
+| 54,608 | 65,536 | 131,071 | ~4.00 MB |
 
-This matches the observed timings closely: the clone is cheap and roughly
-flat while it fits comfortably in L2/L3 cache (213 KB → 853 KB, 0.004 ms →
-0.015 ms, a ~3.75x rise for a ~4x size increase — sub-linear, cache-resident
-behavior), then jumps disproportionately once the array (~3.33 MB) exceeds
-the cache slice available and the clone becomes memory-bandwidth-bound
-(853 KB → 3.33 MB, 0.015 ms → 0.3765 ms — a ~25x time increase for only a
-~4x size increase). The harness is therefore measuring `clone() + O(log N)
-update`, where the clone's O(N) cost dominates and the cache-capacity
-threshold — not tree depth — explains the super-linear jump at the largest
-N. The true cost of `update_leaf` alone (without the clone) is expected to
-remain flat/O(log N) regardless of N; this benchmark's numbers should not
-be quoted as that primitive's cost in isolation.
+This matches the observed timings closely: the clone is cheap and
+sub-linear while it stays at or below the CPU's per-core L2 size (256 KB →
+1.00 MB, 0.004 ms → 0.015 ms, a ~3.75x rise for a 4x size increase), then
+jumps disproportionately once the array (~4.00 MB) clears L2 entirely and
+spills into L3 (1.00 MB → 4.00 MB, 0.015 ms → 0.3765 ms — a ~25x time
+increase for only a 4x size increase). The harness is therefore measuring
+`clone() + O(log N) update`, where the clone's O(N) cost dominates and the
+L2-capacity threshold — not tree depth — explains the super-linear jump at
+the largest N. The true cost of `update_leaf` alone (without the clone) is
+expected to remain flat/O(log N) regardless of N; this benchmark's numbers
+should not be quoted as that primitive's cost in isolation.
 
 ## Anomaly 2 (non-anomaly, confirms design): companion_bytes is identical across the inline/dataset storage transition
 
