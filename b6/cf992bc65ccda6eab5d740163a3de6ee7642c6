@@ -1,0 +1,146 @@
+crates/clawhdf5-format/src/file_writer.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 363-364,531-550,678,769,1338-1340
+crates/clawhdf5/examples/uncompress_goes.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 5,15-22,90-94,173-177,188-193,197-200
+crates/clawhdf5-format/src/object_header.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 558-563
+crates/clawhdf5-format/tests/integration_test.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 709-712,723-724,726-730,735-739,743-747,753-763,779-783,788-792,796-800,830-837,852-856,858-863
+crates/clawhdf5-format/Cargo.toml
+  s_100507eb297aba::t_d0c8b6eb06bc75 80-83
+crates/clawhdf5-ann/src/hnsw.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 383-389,1022-1029
+crates/clawhdf5/tests/integration_tests.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 718-720,748-750,762-765,860-867,924-927
+crates/clawhdf5-format/src/lib.rs
+  s_100507eb297aba::t_84b1046e933b69 98-99
+crates/clawhdf5-format/src/filters.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 1228-1231,1359-1364
+crates/clawhdf5-agent/src/search.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 29,39-45
+crates/clawhdf5-format/tests/derive_tests.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 324-326
+crates/clawhdf5-format/tests/writer_h5py_tests.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 845-847
+crates/clawhdf5/examples/goes18_chunk_test.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 7,10-11,23-26,99-103,130-136,141-142,188-189,217-220,245-248,254-258,320-322
+crates/clawhdf5/examples/phase1_bench.rs
+  s_100507eb297aba::t_d07b89f118c478 16,30-32
+  s_100507eb297aba::t_5d89234d58db83 599-600
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 17-18,20-22,24,27,29,63-67,74-76,86-88,102-107,117-121,134,136,141,148-151,159,162,164-166,171-173,177-179,198-200,210-213,216-222,227-230,233-239,242-248,259,268-272,274-278,286-288,290-291,293-295,327-336,379-381,410-412,437-438,451-454,456-465,474-477,479-488,498-501,503-512,522-525,527-536,546-549,551-560,569-572,574-583,592,608-611,613-622,639,657-660,667-670
+  s_100507eb297aba::t_a2370b203a155e 1-15,19,23,25-26,28,33-62,68-73,77-85,89-101,108-116,122-133,135,137-139,144-147,152-155,160-161,163,167-170,174-176,180-181,183-197,201-209,214-215,223-226,231-232,240-241,249-258,260-267,273,279-285,289,292,296-326,337-378,382-409,413-436,439-450,455,466-473,478,489-497,502,513-521,526,537-545,550,561-568,573,584-591,593-598,601-607,612,623-638,640-656,661-666,671-695
+  s_100507eb297aba::t_e4190c9d2946a9 182
+  s_100507eb297aba::t_2617de26e758cb 140,142-143,156-158
+crates/clawhdf5-agent/src/gpu_search.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 119-125,127
+crates/clawhdf5-format/tests/reference_tests.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 217-219
+crates/clawhdf5-migrate/src/sqlite_reader.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 94-101
+crates/clawhdf5-format/examples/write_merkle_test.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 7-8,74-77
+crates/clawhdf5/src/lib.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 497-499
+crates/clawhdf5-py/src/lib.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 135
+scripts/check-nostd.sh
+  s_2180fb5293fe34::t_970879050f37ca 2,14,23,29
+crates/clawhdf5-format/examples/hash_bench_harness.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 168-170,253-255,294-296
+crates/clawhdf5-format/src/subset_proof.rs
+  s_2180fb5293fe34::t_103ca3de4828b4 236-237
+  s_2180fb5293fe34::t_cec14115639ee8 294-296
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 20,195-199,436-438,465-467,485,547-551,655,669
+  s_2180fb5293fe34::t_150e2d7ab42800 637-646
+  s_2180fb5293fe34::t_b67501f1a74324 651-654,656-668,670-672
+  s_2180fb5293fe34::t_d23d167231d5b5 360-361,363-370,384-386,396-398,410-418,430
+  s_2180fb5293fe34::t_72798a8a9cc9c3 593-602
+  s_2180fb5293fe34::t_a27ec077868964 332,340,342-347,349-350,357-358,381-383,390
+  s_100507eb297aba::t_a8f4b11b5863e6 163
+  s_100507eb297aba::t_59c68c3b3486a5 1-19,21-162,164-194,200-207,210,216-218,232-234,241-249,270-290,297-311,359,362,371-380,387-389,391-395,399,404-409,419-429,431-435,439-464,468-484,486-527,538-546,552-561,572-592,603-636,647-650,831-835,873
+  s_2180fb5293fe34::t_fd7c0791142c18 528-537
+  s_2180fb5293fe34::t_0e01792225d80e 238,240
+  s_2180fb5293fe34::t_b085bffafe33c8 673-687,698-704,706-715,732-738,740-748,752,763-769,771-779,784,795-801,803-811,816,827-830
+  s_2180fb5293fe34::t_01f61e92f128d2 688-697,705,716-731,739,749-751,753-762,770,780-783,785-794,802,812-815,817-826
+  s_2180fb5293fe34::t_f8076360f21a80 325-331,333-339,348,351-356
+  s_2180fb5293fe34::t_1ff7602e4a2dd2 208-209,211-215,219-224,231,235,250-269
+  s_2180fb5293fe34::t_b16a5ccb6b44e7 225-230,239
+  s_2180fb5293fe34::t_894e07e540fd51 291-293
+  s_2180fb5293fe34::t_c903e5a479bd0b 562-571
+  s_2180fb5293fe34::t_a1fc3dfea97c3b 836-872
+  s_2180fb5293fe34::t_726fdc0ea4e03c 312-318,320-324,341
+  s_2180fb5293fe34::t_4b262ef29665e3 400-403
+  s_2180fb5293fe34::t_976eb1ece687e2 319
+crates/clawhdf5-migrate/src/main.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 312-313,323-324,345-346,358-359,374-375,389-390,404-405,423-424,435-436,465-466,506-507,519-520,535-536,559-560,590-591,603-604,624-625,638-639,655-656,667-668,688-689,735-736,782-783,795-796,815-816,827-828,846-847,858-859,884-887,939-940
+crates/clawhdf5-migrate/src/validate.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 80-82,110-115
+crates/clawhdf5-format/benches/hash_bench.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 10,23-25,36-38,41-43,46-48,64-70,73-78,81-91,137
+crates/clawhdf5-format/fuzz/Cargo.toml
+  s_2180fb5293fe34::t_f67e6662ca2edb 64-68
+crates/clawhdf5/Cargo.toml
+  s_100507eb297aba::t_62763ba5b4f953 23
+  s_100507eb297aba::t_c4f8c72ca70053 25-27
+  s_100507eb297aba::t_1a168464adffb4 21
+crates/clawhdf5-format/src/merkle.rs
+  s_2180fb5293fe34::t_f974e8afa5b223 90-94
+  s_100507eb297aba::t_a69187e01c52a1 39
+  s_2180fb5293fe34::t_411488694b0390 220
+  s_2180fb5293fe34::t_9a07bc2e7d9954 2225
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 816,878
+  s_100507eb297aba::t_5955aa1745d168 333
+  s_2180fb5293fe34::t_d296db270762d2 157-162
+  s_100507eb297aba::t_ba07121edda988 1941,1943-1982,2510,2513-2514,2517
+  s_100507eb297aba::t_783a9b33540563 679-712,1468
+crates/clawhdf5-format/examples/gen_subset_vectors.rs
+  s_2180fb5293fe34::t_3ae609b215f69d 182-193
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 7-9,41-45,77-80,105-107,116-119,146-149,177-180
+  s_2180fb5293fe34::t_5ec5791217f294 151-162
+  s_100507eb297aba::t_1270b2771ff9fe 1-6,10-40,46-76,81-104,108-115,120,133-145,150,163-176,181,194-199
+  s_2180fb5293fe34::t_59c91f19c1ee21 121-132
+crates/clawhdf5-format/examples/gen_merkle_vectors.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 18,141-143,167-171
+crates/clawhdf5-format/fuzz/fuzz_targets/fuzz_subset_proof.rs
+  s_2180fb5293fe34::t_3b9268760d933b 1-146
+test-vectors/subset-vectors.json
+  s_100507eb297aba::t_26d00ef6b6a88a 1-271
+test-vectors/morton-vectors.json
+  s_100507eb297aba::t_5614b91bd1ebb8 1-13
+crates/clawhdf5-format/src/data_layout.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 824-825,850
+.gitignore
+  s_2180fb5293fe34::t_12ce29e66220f0 5-8
+crates/clawhdf5-accel/src/avx512.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 16-51,53,61-92,94,102-125,127
+crates/clawhdf5-format/src/datatype.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 1033-1034,1073-1076
+crates/clawhdf5-format/examples/parallel_build_bench.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 59-63,137-142
+crates/clawhdf5-agent/tests/hnsw_integration.rs
+  s_2180fb5293fe34::t_bc0b31aeb98c3c 83,129-130,136,138-141,162-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.10",
+  "base_commit_sha": "b6cf992bc65ccda6eab5d740163a3de6ee7642c6",
+  "prompts": {},
+  "sessions": {
+    "s_100507eb297aba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5fc5dde4-6c29-44f3-b58f-ee97338040f3",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    },
+    "s_2180fb5293fe34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "034f5cd4-7dd7-47ad-834e-4fa2d82e2e2b",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
