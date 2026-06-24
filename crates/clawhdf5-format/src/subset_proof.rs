@@ -157,10 +157,90 @@ fn coord_to_leaf_index(coord: &[u64], n_per_dim: &[u64], order: LeafOrder) -> u6
     }
 }
 
+/// Inclusive chunk-coordinate bounds `(lo, hi)` per dimension covering every
+/// chunk that could possibly overlap `sel`, or `None` if the selection touches
+/// no chunk in this grid. Derived from the selection's element-space bounding
+/// box, this lets [`chunk_coords_for_selection`] sweep only the enclosing
+/// sub-grid instead of the whole grid.
+///
+/// `chunk_shape` must be non-zero on every axis (the sole caller validates this
+/// via [`checked_padded_leaf_count`]); a zero axis is treated as "no chunks" to
+/// stay panic-free if this helper is ever reused.
+fn selection_chunk_bounds(
+    sel: &Selection,
+    n_per_dim: &[u64],
+    chunk_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    let ndim = n_per_dim.len();
+
+    // Element-space half-open bounding box `[lo, hi_excl)` per dimension.
+    let (el_lo, el_hi_excl): (Vec<u64>, Vec<u64>) = match sel {
+        // Whole dataspace: every chunk is in range.
+        Selection::All => {
+            return Some((vec![0u64; ndim], n_per_dim.iter().map(|&n| n - 1).collect()));
+        }
+        Selection::None => return None,
+        Selection::Hyperslab {
+            start,
+            stride,
+            count,
+            block,
+        } => {
+            let mut lo = Vec::with_capacity(ndim);
+            let mut hi = Vec::with_capacity(ndim);
+            for d in 0..ndim {
+                if count[d] == 0 || block[d] == 0 {
+                    return None; // empty on this axis ⇒ empty overall
+                }
+                lo.push(start[d]);
+                hi.push(start[d] + (count[d] - 1) * stride[d] + block[d]);
+            }
+            (lo, hi)
+        }
+        Selection::Points(pts) => {
+            if pts.is_empty() {
+                return None;
+            }
+            let mut lo = vec![u64::MAX; ndim];
+            let mut hi_incl = vec![0u64; ndim];
+            for pt in pts {
+                for d in 0..ndim {
+                    lo[d] = lo[d].min(pt[d]);
+                    hi_incl[d] = hi_incl[d].max(pt[d]);
+                }
+            }
+            (lo, hi_incl.iter().map(|&h| h + 1).collect())
+        }
+    };
+
+    // Map the element box onto inclusive chunk-coordinate bounds, clamped to
+    // the grid. Any axis whose box falls entirely outside the grid ⇒ no chunks.
+    let mut lo = Vec::with_capacity(ndim);
+    let mut hi = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        if chunk_shape[d] == 0 || el_hi_excl[d] == 0 || el_lo[d] >= n_per_dim[d] * chunk_shape[d] {
+            return None;
+        }
+        let lo_chunk = el_lo[d] / chunk_shape[d];
+        let hi_chunk = ((el_hi_excl[d] - 1) / chunk_shape[d]).min(n_per_dim[d] - 1);
+        if lo_chunk > hi_chunk {
+            return None;
+        }
+        lo.push(lo_chunk);
+        hi.push(hi_chunk);
+    }
+    Some((lo, hi))
+}
+
 /// Enumerate every chunk coordinate (as an N-dim index tuple) that overlaps
-/// `sel`, by sweeping the full chunk grid and reusing
-/// [`Selection::intersects_chunk`]. `O(total_chunks)`; adequate for Phase 1
-/// correctness, not yet optimized for very large grids.
+/// `sel`, reusing [`Selection::intersects_chunk`]. Rather than sweeping the
+/// full chunk grid, this sweeps only the selection's chunk-space bounding box
+/// (see [`selection_chunk_bounds`]), reducing the cost from `O(total_chunks)`
+/// to `O(bounding_box_chunks)` — a large win for a small selection in a big
+/// grid. The `intersects_chunk` filter is retained inside the box so strided
+/// hyperslabs and sparse point sets still exclude non-overlapping chunks. The
+/// emitted coordinates and their row-major order are identical to the
+/// full-grid sweep.
 fn chunk_coords_for_selection(
     sel: &Selection,
     n_per_dim: &[u64],
@@ -171,8 +251,13 @@ fn chunk_coords_for_selection(
         return vec![];
     }
 
+    let (lo, hi) = match selection_chunk_bounds(sel, n_per_dim, chunk_shape) {
+        Some(bounds) => bounds,
+        None => return vec![],
+    };
+
     let mut coords = Vec::new();
-    let mut counter = vec![0u64; ndim];
+    let mut counter = lo.clone();
     loop {
         let chunk_offset: Vec<u64> = counter
             .iter()
@@ -183,7 +268,7 @@ fn chunk_coords_for_selection(
             coords.push(counter.clone());
         }
 
-        // Odometer increment, least-significant (last) axis first.
+        // Odometer increment over the inclusive box [lo, hi], last axis first.
         let mut d = ndim;
         loop {
             if d == 0 {
@@ -191,10 +276,10 @@ fn chunk_coords_for_selection(
             }
             d -= 1;
             counter[d] += 1;
-            if counter[d] < n_per_dim[d] {
+            if counter[d] <= hi[d] {
                 break;
             }
-            counter[d] = 0;
+            counter[d] = lo[d];
         }
     }
 }
@@ -524,6 +609,78 @@ mod tests {
         let grid = ChunkGridParams::new(vec![10, 10], vec![2, 0], HashAlg::Blake3);
         assert_eq!(grid.n_chunks_per_dim(), vec![5, 0]);
         assert_eq!(grid.total_chunk_count(), 0);
+    }
+
+    #[test]
+    fn test_bounded_sweep_matches_full_grid_sweep() {
+        // Reference: the original O(total_chunks) full-grid sweep that the
+        // bounding-box optimization replaced. The optimized
+        // `chunk_coords_for_selection` must return identical coordinates (same
+        // set AND same row-major order) for every selection shape.
+        fn brute_force(sel: &Selection, n_per_dim: &[u64], chunk_shape: &[u64]) -> Vec<Vec<u64>> {
+            let ndim = n_per_dim.len();
+            if ndim == 0 || n_per_dim.contains(&0) {
+                return vec![];
+            }
+            let mut coords = Vec::new();
+            let mut counter = vec![0u64; ndim];
+            loop {
+                let chunk_offset: Vec<u64> = counter
+                    .iter()
+                    .zip(chunk_shape.iter())
+                    .map(|(&c, &s)| c * s)
+                    .collect();
+                if sel.intersects_chunk(&chunk_offset, chunk_shape) {
+                    coords.push(counter.clone());
+                }
+                let mut d = ndim;
+                loop {
+                    if d == 0 {
+                        return coords;
+                    }
+                    d -= 1;
+                    counter[d] += 1;
+                    if counter[d] < n_per_dim[d] {
+                        break;
+                    }
+                    counter[d] = 0;
+                }
+            }
+        }
+
+        // A large-ish 2D grid so a small selection's bounding box is a tiny
+        // fraction of the full grid.
+        let n_per_dim = [20u64, 16u64];
+        let chunk_shape = [4u64, 8u64]; // element extent 80 x 128
+
+        let cases: Vec<Selection> = vec![
+            Selection::All,
+            Selection::None,
+            // Small contiguous slab far from the origin.
+            Selection::slice(&[50..60, 70..90]),
+            // Strided hyperslab: blocks of 2, stride 10 — leaves gaps so the
+            // intersects_chunk filter must still exclude chunks inside the box.
+            Selection::Hyperslab {
+                start: vec![3, 5],
+                stride: vec![10, 20],
+                count: vec![4, 3],
+                block: vec![2, 4],
+            },
+            // Sparse points spread across the grid.
+            Selection::Points(vec![vec![1, 2], vec![77, 5], vec![40, 120], vec![0, 0]]),
+            // Selection partly past the grid edge — clamping must not panic.
+            Selection::slice(&[70..100, 120..200]),
+            // Selection entirely past the grid edge ⇒ no chunks.
+            Selection::slice(&[500..600, 0..8]),
+        ];
+
+        for sel in &cases {
+            assert_eq!(
+                chunk_coords_for_selection(sel, &n_per_dim, &chunk_shape),
+                brute_force(sel, &n_per_dim, &chunk_shape),
+                "bounded sweep diverged from full-grid sweep for {sel:?}",
+            );
+        }
     }
 
     #[test]

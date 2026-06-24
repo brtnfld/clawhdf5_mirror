@@ -699,13 +699,22 @@ impl MerkleTree {
         }
         let internal_nodes = self.padded_count - 1;
         let mut node_idx = internal_nodes + leaf_idx;
-        self.nodes[node_idx] = new_hash;
+        // The upfront `padded_count` check plus the tree invariant
+        // (`nodes.len() == 2 * padded_count - 1`) make every index below
+        // reachable, but a corrupt or externally constructed tree could
+        // violate that invariant. Use bounds-checked access so such a tree
+        // surfaces a typed error rather than panicking, matching the
+        // defensive style of the rest of this module.
+        let oob = || MerkleError::HyperslabOutOfBounds { idx: leaf_idx };
+        *self.nodes.get_mut(node_idx).ok_or_else(oob)? = new_hash;
         // Walk toward the root, recomputing each ancestor from its two children.
         while node_idx > 0 {
             let parent = (node_idx - 1) / 2;
             let left = 2 * parent + 1;
             let right = 2 * parent + 2;
-            self.nodes[parent] = self.alg.hash_pair(&self.nodes[left], &self.nodes[right]);
+            let l = *self.nodes.get(left).ok_or_else(oob)?;
+            let r = *self.nodes.get(right).ok_or_else(oob)?;
+            *self.nodes.get_mut(parent).ok_or_else(oob)? = self.alg.hash_pair(&l, &r);
             node_idx = parent;
         }
         Ok(())
