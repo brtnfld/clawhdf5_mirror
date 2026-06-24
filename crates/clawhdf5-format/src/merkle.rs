@@ -1647,58 +1647,195 @@ pub fn write_merkle_companion(
 // Dataset Verification API
 // ============================================================================
 
-use crate::metadata_index::DatasetMetadata;
-
-/// Reference to a dataset for Merkle verification operations.
+/// A dataset with Merkle verification data.
 ///
-/// This wrapper provides access to dataset metadata and chunk data needed
-/// for verification. In a full implementation, this would hold references
-/// to the file buffer and parsed metadata.
+/// This struct provides access to the Merkle tree metadata, tree nodes,
+/// and chunk data needed for verification and update operations.
+///
+/// # Non-Power-of-Two Chunk Counts
+///
+/// HDF5 datasets often have non-power-of-two chunk counts. The Merkle tree
+/// always pads to the next power of two using the **null sentinel** hash
+/// (`H(0x02 || "null")`). For example, a 900-chunk dataset produces a tree
+/// with 1024 leaf slots:
+///
+/// - Slots 0-899: actual chunk hashes
+/// - Slots 900-1023: null sentinel hashes
+///
+/// During verification, `chunks.len()` may be less than the tree's `leaf_count`
+/// (which equals `padded_count`). The verification functions check that
+/// `chunks.len() <= tree.leaf_count()` to ensure the tree has enough leaves
+/// for all provided chunks.
+///
+/// The current implementation stores `leaf_count == padded_count` because
+/// the original chunk count is not preserved in `MerkleAttr`. A future version
+/// may store the actual chunk count to enable verification that exactly N
+/// chunks are present.
+#[derive(Debug, Clone)]
 pub struct Dataset<'a> {
-    /// Dataset metadata (shape, datatype, attributes, etc.)
-    pub metadata: &'a DatasetMetadata,
-    /// Raw file buffer for reading chunk data
-    pub file_data: &'a [u8],
-    /// Size of offsets (HDF5 spec: "Size of Offsets")
-    pub size_of_offsets: u8,
-    /// Size of lengths (HDF5 spec: "Size of Lengths")
-    pub size_of_lengths: u8,
+    /// The parsed `_merkle_root` attribute containing root hash and algorithm.
+    pub merkle_attr: MerkleAttr,
+    /// Tree node hashes (flattened). For inline storage (≤256 chunks), this
+    /// comes from the `merkle_nodes` attribute. For larger trees, from the
+    /// companion dataset under `/merkle/<dataset_name>`.
+    /// Owned to support mutation via extend/update operations.
+    pub tree_nodes: Vec<u8>,
+    /// References to chunk data for verification. Each slice is one chunk.
+    pub chunks: Vec<&'a [u8]>,
+}
+
+impl<'a> Dataset<'a> {
+    /// Create a new Dataset for verification.
+    ///
+    /// # Arguments
+    /// * `merkle_attr` - The parsed `_merkle_root` attribute
+    /// * `tree_nodes` - Flattened tree node hashes (from inline attr or companion dataset)
+    /// * `chunks` - References to chunk data
+    #[must_use]
+    pub fn new(merkle_attr: MerkleAttr, tree_nodes: &[u8], chunks: Vec<&'a [u8]>) -> Self {
+        Self {
+            merkle_attr,
+            tree_nodes: tree_nodes.to_vec(),
+            chunks,
+        }
+    }
+
+    /// Create a Dataset from owned tree nodes (avoids copy).
+    #[must_use]
+    pub fn from_owned(merkle_attr: MerkleAttr, tree_nodes: Vec<u8>, chunks: Vec<&'a [u8]>) -> Self {
+        Self {
+            merkle_attr,
+            tree_nodes,
+            chunks,
+        }
+    }
+
+    /// Get the number of chunks in this dataset.
+    #[inline]
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Reconstruct the MerkleTree from stored nodes.
+    ///
+    /// # Errors
+    ///
+    /// - [`MerkleError::MissingChunkGridMetadata`] if tree_nodes is empty
+    /// - [`MerkleError::InvalidAttribute`] if tree_nodes has invalid size or
+    ///   does not represent a valid complete binary tree
+    pub fn reconstruct_tree(&self) -> Result<MerkleTree, MerkleError> {
+        if self.tree_nodes.is_empty() {
+            return Err(MerkleError::MissingChunkGridMetadata);
+        }
+
+        // Tree nodes are stored as flattened [u8; 32] hashes
+        if !self.tree_nodes.len().is_multiple_of(HASH_SIZE) {
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            });
+        }
+
+        let node_count = self.tree_nodes.len() / HASH_SIZE;
+
+        // SAFETY: Validate that node_count represents a valid complete binary tree.
+        // For a complete binary tree: node_count = 2 * padded_count - 1
+        // This means node_count must be odd (since 2n-1 is always odd for n≥1).
+        if node_count.is_multiple_of(2) {
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            });
+        }
+
+        // padded_count = ceil(node_count / 2) = (node_count + 1) / 2 for odd node_count
+        let padded_count = node_count.div_ceil(2);
+
+        // padded_count must be a power of 2 (Merkle trees pad to power-of-two)
+        if !padded_count.is_power_of_two() {
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            });
+        }
+
+        // Verify expected size matches actual size (defense against truncation)
+        let expected_node_count = 2 * padded_count - 1;
+        let expected_size = expected_node_count * HASH_SIZE;
+        if self.tree_nodes.len() != expected_size {
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            });
+        }
+
+        let mut nodes = Vec::with_capacity(node_count);
+        for i in 0..node_count {
+            let start = i * HASH_SIZE;
+            let mut hash = [0u8; HASH_SIZE];
+            hash.copy_from_slice(&self.tree_nodes[start..start + HASH_SIZE]);
+            nodes.push(hash);
+        }
+
+        // NOTE: This assumes the tree is fully utilized (leaf_count == padded_count).
+        // For partially-filled trees, the actual leaf_count should be stored in
+        // the MerkleAttr or companion metadata. This is acceptable for now since
+        // we always pad to power-of-two during tree construction.
+        let leaf_count = padded_count;
+
+        Ok(MerkleTree {
+            nodes,
+            leaf_count,
+            padded_count,
+            alg: self.merkle_attr.algorithm,
+        })
+    }
 }
 
 /// Verify the companion dataset integrity (fast, sub-second check).
 ///
-/// Reads the `_merkle_root` attribute, re-hashes the companion dataset bytes,
-/// and compares against the stored companion-integrity hash. This detects
-/// tampering with the companion dataset but does **not** re-hash chunk data.
+/// Re-hashes the tree nodes and compares against the stored companion-integrity
+/// hash in the `_merkle_root` attribute. This detects tampering with the
+/// Merkle tree data but does **not** re-hash chunk data.
+///
+/// For datasets with ≤256 chunks (inline storage), this verifies the
+/// `merkle_nodes` attribute. For larger datasets, this verifies the
+/// companion dataset under `/merkle/<dataset_name>`.
 ///
 /// # Complexity
 ///
-/// O(tree_nodes) hashing of companion bytes only — sub-second for typical datasets.
+/// O(tree_nodes) hashing — sub-second for typical datasets.
 ///
-/// # Errors
+/// # Returns
 ///
-/// - [`MerkleError::MissingChunkGridMetadata`] if `_merkle_root` attribute is absent
-/// - [`MerkleError::CompanionTampered`] if companion integrity hash mismatch
-pub fn verify_root(_d: &Dataset<'_>) -> Result<bool, MerkleError> {
-    // TODO: Phase 3 implementation
-    // 1. Read _merkle_root attribute
-    // 2. Load companion dataset bytes
-    // 3. Re-hash companion bytes
-    // 4. Compare against stored companion-integrity hash
-    Err(MerkleError::MissingChunkGridMetadata)
+/// * `Ok(true)` - Companion data matches stored hash (or no companion for inline trees)
+/// * `Err(CompanionTampered)` - Hash mismatch indicates tampering
+/// * `Err(MissingChunkGridMetadata)` - No merkle attribute found
+pub fn verify_root(d: &Dataset<'_>) -> Result<bool, MerkleError> {
+    // If the tree has a companion hash, verify it
+    if d.merkle_attr.has_companion() {
+        let result = d.merkle_attr.verify_companion(&d.tree_nodes);
+        match result {
+            CompanionVerifyResult::Valid => Ok(true),
+            CompanionVerifyResult::HashMismatch => Err(MerkleError::CompanionTampered),
+            CompanionVerifyResult::NoCompanion => Ok(true), // No companion to verify
+        }
+    } else {
+        // No companion hash stored - tree is inline or empty
+        // Verify integrity of the merkle attribute itself
+        let packed = d.merkle_attr.pack();
+        let attr_ref = MerkleAttrRef::from_slice(&packed).map_err(|_| {
+            MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            }
+        })?;
+        attr_ref.verify_integrity()?;
+        Ok(true)
+    }
 }
 
 /// Verify a single chunk against its Merkle proof (O(log N) check).
 ///
 /// Re-hashes the live chunk at index `idx`, reads the O(log N) sibling hashes
-/// from the companion dataset, and walks the proof path to the root, comparing
+/// from the tree nodes, and walks the proof path to the root, comparing
 /// the recomputed root to the stored value.
-///
-/// # WAL Interaction
-///
-/// If the WAL contains an uncommitted entry for `idx`, returns
-/// [`MerkleError::NoncePending`] immediately — the chunk may be partially
-/// written and the caller must replay or abort the WAL before verifying.
 ///
 /// # Complexity
 ///
@@ -1706,19 +1843,37 @@ pub fn verify_root(_d: &Dataset<'_>) -> Result<bool, MerkleError> {
 ///
 /// # Errors
 ///
-/// - [`MerkleError::NoncePending`] if WAL has uncommitted entry for `idx`
 /// - [`MerkleError::HyperslabOutOfBounds`] if `idx` exceeds chunk count
 /// - [`MerkleError::HashMismatch`] if recomputed root doesn't match stored root
 /// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
-pub fn verify_chunk(_d: &Dataset<'_>, _idx: usize) -> Result<bool, MerkleError> {
-    // TODO: Phase 3 implementation
-    // 1. Check WAL for uncommitted entry at idx → NoncePending
-    // 2. Read chunk data at idx
-    // 3. Compute leaf hash
-    // 4. Read O(log N) sibling hashes from companion
-    // 5. Walk proof path to root
-    // 6. Compare recomputed root to stored root
-    Err(MerkleError::MissingChunkGridMetadata)
+pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
+    // TODO: Check WAL for uncommitted entries affecting this chunk.
+    // If the WAL has a pending write for this chunk index, return
+    // MerkleError::NoncePending to signal that verification cannot proceed
+    // until the WAL is flushed. This requires integration with clawhdf5-agent.
+
+    // 1. Bounds check against actual chunks
+    if idx >= d.chunk_count() {
+        return Err(MerkleError::HyperslabOutOfBounds { idx });
+    }
+
+    // 2. Get chunk data
+    let chunk_data = d.chunks[idx];
+
+    // 3. Reconstruct tree
+    let tree = d.reconstruct_tree()?;
+
+    // 4. Validate chunk count vs tree leaf count
+    if d.chunk_count() > tree.leaf_count() {
+        return Err(MerkleError::MissingChunkGridMetadata);
+    }
+
+    // 5. Verify chunk against tree (uses constant-time comparison internally)
+    if tree.verify_chunk(idx, chunk_data) {
+        Ok(true)
+    } else {
+        Err(MerkleError::HashMismatch { chunk_idx: idx })
+    }
 }
 
 /// Verify all chunks in a dataset (full O(N) integrity check).
@@ -1735,64 +1890,159 @@ pub fn verify_chunk(_d: &Dataset<'_>, _idx: usize) -> Result<bool, MerkleError> 
 ///
 /// - [`MerkleError::HashMismatch`] if any chunk fails (includes `chunk_idx` of first failure)
 /// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
-pub fn verify_dataset(_d: &Dataset<'_>) -> Result<bool, MerkleError> {
-    // TODO: Phase 3 implementation
-    // 1. Read all chunks
-    // 2. Compute all leaf hashes
-    // 3. Build complete tree from leaves
-    // 4. Compare computed root to stored root
-    // 5. On mismatch, return HashMismatch with first failing chunk_idx
-    Err(MerkleError::MissingChunkGridMetadata)
+pub fn verify_dataset(d: &Dataset<'_>) -> Result<bool, MerkleError> {
+    if d.chunks.is_empty() {
+        return Err(MerkleError::MissingChunkGridMetadata);
+    }
+
+    // 1. Reconstruct stored tree once (used for both root and leaf comparison)
+    let stored_tree = d.reconstruct_tree()?;
+
+    // 2. Validate chunk count vs tree leaf count
+    // The tree stores padded_count as leaf_count (assumes fully utilized).
+    // If chunks.len() > leaf_count, we have more chunks than the tree knows about.
+    if d.chunks.len() > stored_tree.leaf_count() {
+        return Err(MerkleError::MissingChunkGridMetadata);
+    }
+
+    // 3. Compare each chunk's computed hash against stored leaf hash
+    // This finds mismatches without rebuilding from chunks.
+    // For non-power-of-two chunk counts, trailing tree leaves contain the
+    // null sentinel hash (H(0x02 || "null")), which won't match any real chunk.
+    for (idx, chunk) in d.chunks.iter().enumerate() {
+        let computed_hash = d.merkle_attr.algorithm.hash_leaf(chunk);
+        if let Some(stored_hash) = stored_tree.leaf_hash(idx)
+            && !constant_time_eq(&computed_hash, stored_hash)
+        {
+            return Err(MerkleError::HashMismatch { chunk_idx: idx });
+        }
+    }
+
+    // 4. All leaf hashes match - verify root integrity
+    // (protects against internal node corruption in stored tree)
+    if constant_time_eq(stored_tree.root(), &d.merkle_attr.root) {
+        Ok(true)
+    } else {
+        // Stored tree root doesn't match attribute - tree data corrupted
+        Err(MerkleError::CompanionTampered)
+    }
 }
 
-/// Extend the Merkle tree with a new leaf hash (O(log N) update).
+/// Extend the Merkle tree with a new leaf hash.
 ///
-/// Appends a new leaf hash `h` at position `idx` and recomputes only the
-/// O(log N) nodes on the path to the root; leaves all other nodes unchanged.
-/// Used when writing new chunks to a dataset.
+/// Appends a new leaf hash `h` at position `idx`. Used when writing new
+/// chunks to a dataset.
 ///
 /// # Complexity
 ///
-/// O(log N) node updates.
+/// **Current:** O(N) full tree rebuild. The implementation extracts all leaf
+/// hashes and rebuilds the tree from scratch.
+///
+/// **Future optimization:** O(log N) incremental path update by modifying
+/// only the nodes on the path from the new leaf to the root.
 ///
 /// # Errors
 ///
 /// - [`MerkleError::HyperslabOutOfBounds`] if `idx != current_chunk_count`
-/// - [`MerkleError::NoncePending`] if WAL has uncommitted entries
-pub fn extend_merkle(_d: &Dataset<'_>, _idx: usize, _h: [u8; 32]) -> Result<(), MerkleError> {
-    // TODO: Phase 3 implementation
-    // 1. Verify idx == current chunk count
-    // 2. Check WAL for pending entries
-    // 3. Insert leaf hash h at position idx
-    // 4. Recompute O(log N) nodes on path to root
-    // 5. Update _merkle_root attribute
-    // 6. Update companion dataset
-    Err(MerkleError::MissingChunkGridMetadata)
+/// - [`MerkleError::MissingChunkGridMetadata`] if tree is empty
+pub fn extend_merkle(d: &mut Dataset<'_>, idx: usize, h: [u8; 32]) -> Result<(), MerkleError> {
+    // TODO: Check WAL for uncommitted entries. If there's a pending write,
+    // return MerkleError::NoncePending. Requires clawhdf5-agent integration.
+
+    // 1. Verify idx == current chunk count (append only)
+    let current_count = d.chunk_count();
+    if idx != current_count {
+        return Err(MerkleError::HyperslabOutOfBounds { idx });
+    }
+
+    // 2. Reconstruct tree, add new leaf, and rebuild
+    // For simplicity, we rebuild the tree with the new leaf
+    // A more efficient implementation would use incremental updates
+    let tree = d.reconstruct_tree()?;
+
+    // Get existing leaf hashes
+    let mut leaf_hashes: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(current_count + 1);
+    for i in 0..tree.leaf_count() {
+        if let Some(hash) = tree.leaf_hash(i) {
+            leaf_hashes.push(*hash);
+        }
+    }
+    leaf_hashes.push(h);
+
+    // Rebuild tree with new leaf
+    let new_tree = MerkleTree::from_leaf_hashes(&leaf_hashes, d.merkle_attr.algorithm);
+
+    // 3. Update tree_nodes
+    let mut flat_nodes = Vec::with_capacity(new_tree.nodes().len() * HASH_SIZE);
+    for node in new_tree.nodes() {
+        flat_nodes.extend_from_slice(node);
+    }
+    d.tree_nodes = flat_nodes;
+
+    // 4. Update merkle_attr with new root
+    let companion_hash = compute_sha256(&d.tree_nodes);
+    d.merkle_attr = MerkleAttr::from_tree_with_companion(&new_tree, companion_hash);
+
+    Ok(())
 }
 
-/// Update an existing chunk's hash in the Merkle tree (O(log N) update).
+/// Update an existing chunk's hash in the Merkle tree.
 ///
-/// Same path recomputation as [`extend_merkle`] but for an in-place overwrite
-/// of an existing chunk. Replaces the leaf hash at `idx` and recomputes only
-/// the O(log N) affected nodes.
+/// Replaces the leaf hash at `idx` for an in-place overwrite of an existing
+/// chunk.
 ///
 /// # Complexity
 ///
-/// O(log N) node updates.
+/// **Current:** O(N) full tree rebuild. The implementation extracts all leaf
+/// hashes, replaces the one at `idx`, and rebuilds the tree from scratch.
+///
+/// **Future optimization:** O(log N) incremental path update by modifying
+/// only the nodes on the path from the updated leaf to the root.
 ///
 /// # Errors
 ///
 /// - [`MerkleError::HyperslabOutOfBounds`] if `idx >= chunk_count`
-/// - [`MerkleError::NoncePending`] if WAL has uncommitted entries for this chunk
-pub fn update_merkle(_d: &Dataset<'_>, _idx: usize, _h: [u8; 32]) -> Result<(), MerkleError> {
-    // TODO: Phase 3 implementation
-    // 1. Verify idx < chunk_count
-    // 2. Check WAL for pending entries at idx
-    // 3. Replace leaf hash at idx with h
-    // 4. Recompute O(log N) nodes on path to root
-    // 5. Update _merkle_root attribute
-    // 6. Update companion dataset
-    Err(MerkleError::MissingChunkGridMetadata)
+/// - [`MerkleError::MissingChunkGridMetadata`] if tree is empty
+pub fn update_merkle(d: &mut Dataset<'_>, idx: usize, h: [u8; 32]) -> Result<(), MerkleError> {
+    // TODO: Check WAL for uncommitted entries. If there's a pending write,
+    // return MerkleError::NoncePending. Requires clawhdf5-agent integration.
+
+    // 1. Bounds check
+    let current_count = d.chunk_count();
+    if idx >= current_count {
+        return Err(MerkleError::HyperslabOutOfBounds { idx });
+    }
+
+    // 2. Reconstruct tree
+    let tree = d.reconstruct_tree()?;
+
+    // 3. Get all leaf hashes and replace the one at idx
+    let mut leaf_hashes: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(tree.leaf_count());
+    for i in 0..tree.leaf_count() {
+        if i == idx {
+            leaf_hashes.push(h);
+        } else if let Some(hash) = tree.leaf_hash(i) {
+            leaf_hashes.push(*hash);
+        } else {
+            return Err(MerkleError::MissingChunkGridMetadata);
+        }
+    }
+
+    // 4. Rebuild tree with updated leaf
+    let new_tree = MerkleTree::from_leaf_hashes(&leaf_hashes, d.merkle_attr.algorithm);
+
+    // 5. Update tree_nodes
+    let mut flat_nodes = Vec::with_capacity(new_tree.nodes().len() * HASH_SIZE);
+    for node in new_tree.nodes() {
+        flat_nodes.extend_from_slice(node);
+    }
+    d.tree_nodes = flat_nodes;
+
+    // 6. Update merkle_attr with new root
+    let companion_hash = compute_sha256(&d.tree_nodes);
+    d.merkle_attr = MerkleAttr::from_tree_with_companion(&new_tree, companion_hash);
+
+    Ok(())
 }
 
 // ============================================================================
@@ -3285,15 +3535,12 @@ mod tests {
     }
 
     // ========================================================================
-    // Tampering Detection Tests (Phase 3)
+    // Tampering Detection Tests
     // ========================================================================
     //
-    // These tests verify the verification API behavior when chunk data is
-    // tampered with on disk. They use raw file I/O to modify bytes, bypassing
-    // ClawHDF5, then confirm the expected error responses.
-    //
-    // Currently #[ignore] because verify_root/verify_chunk/verify_dataset
-    // are stubs. Remove #[ignore] once Phase 3 implementation is complete.
+    // These tests verify the verification API behavior when chunk data or
+    // tree nodes are tampered with. They create a Dataset directly and
+    // modify data to confirm the expected error responses.
 
     /// Test data for tampering tests: 1,024 synthetic chunks.
     #[cfg(feature = "std")]
@@ -3310,100 +3557,258 @@ mod tests {
             .collect()
     }
 
+    /// Helper to create a Dataset from chunks.
+    #[cfg(feature = "blake3")]
+    fn make_dataset_from_chunks<'a>(chunks: &'a [Vec<u8>]) -> Dataset<'a> {
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        // Flatten tree nodes
+        let mut flat_nodes = Vec::with_capacity(tree.nodes().len() * HASH_SIZE);
+        for node in tree.nodes() {
+            flat_nodes.extend_from_slice(node);
+        }
+
+        // Create merkle attr with companion hash
+        let companion_hash = compute_sha256(&flat_nodes);
+        let merkle_attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+
+        Dataset::from_owned(merkle_attr, flat_nodes, refs)
+    }
+
     /// Verify that tampering a single chunk causes `verify_chunk` to return
-    /// `HashMismatch` for that chunk, while `verify_root` still returns `Ok(true)`
-    /// (since it only checks companion integrity, not chunk data).
+    /// `HashMismatch` for that chunk, while untampered chunks pass.
     #[test]
-    #[ignore = "Phase 3: verify_chunk not yet implemented"]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "blake3")]
     fn test_tampered_chunk_detected_by_verify_chunk() {
         let chunks = make_tampering_test_chunks();
-        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let dataset = make_dataset_from_chunks(&chunks);
 
-        // TODO: Phase 3 implementation
-        // 1. Create HDF5 file with 1,024 chunks using FileWriter
-        // 2. Build Merkle tree and write companion dataset
-        // 3. Close file
-        // 4. Tamper one byte in chunk 512 using raw file I/O:
-        //    let mut file = std::fs::OpenOptions::new()
-        //        .read(true).write(true).open(&path)?;
-        //    file.seek(SeekFrom::Start(chunk_512_offset))?;
-        //    let mut byte = [0u8; 1];
-        //    file.read_exact(&mut byte)?;
-        //    byte[0] ^= 0xFF; // flip all bits
-        //    file.seek(SeekFrom::Start(chunk_512_offset))?;
-        //    file.write_all(&byte)?;
-        // 5. Re-open and parse file
-        // 6. Create Dataset reference
-        // 7. Verify:
-        //    - verify_root(&dataset) == Ok(true)  // companion untouched
-        //    - verify_chunk(&dataset, 512) == Err(HashMismatch { chunk_idx: 512 })
-        //    - verify_chunk(&dataset, 0) == Ok(true)  // untampered chunk
+        // Untampered chunk should verify
+        assert!(verify_chunk(&dataset, 0).is_ok());
+        assert!(verify_chunk(&dataset, 512).is_ok());
 
-        // Placeholder: test structure ready for Phase 3 implementation
+        // Create a tampered dataset by modifying chunk 512
+        let mut tampered_chunks = chunks.clone();
+        tampered_chunks[512][0] ^= 0xFF; // flip all bits in first byte
+
+        let tampered_refs: Vec<&[u8]> = tampered_chunks.iter().map(|c| c.as_slice()).collect();
+        let tampered_dataset = Dataset {
+            merkle_attr: dataset.merkle_attr.clone(),
+            tree_nodes: dataset.tree_nodes.clone(),
+            chunks: tampered_refs,
+        };
+
+        // Tampered chunk should fail
+        let result = verify_chunk(&tampered_dataset, 512);
+        assert!(matches!(result, Err(MerkleError::HashMismatch { chunk_idx: 512 })));
+
+        // Untampered chunk should still pass
+        assert!(verify_chunk(&tampered_dataset, 0).is_ok());
     }
 
     /// Verify that `verify_dataset` detects tampering by returning `HashMismatch`
     /// with the index of the first tampered chunk.
     #[test]
-    #[ignore = "Phase 3: verify_dataset not yet implemented"]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "blake3")]
     fn test_tampered_chunk_detected_by_verify_dataset() {
         let chunks = make_tampering_test_chunks();
-        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let dataset = make_dataset_from_chunks(&chunks);
 
-        // TODO: Phase 3 implementation
-        // 1. Create HDF5 file with 1,024 chunks
-        // 2. Build Merkle tree and write companion dataset
-        // 3. Close file
-        // 4. Tamper one byte in chunk 512 using raw file I/O
-        // 5. Re-open and parse file
-        // 6. Verify:
-        //    - verify_dataset(&dataset) == Err(HashMismatch { chunk_idx: 512 })
+        // Untampered dataset should verify
+        assert!(verify_dataset(&dataset).is_ok());
 
-        // Placeholder: test structure ready for implementation
+        // Create a tampered dataset by modifying chunk 512
+        let mut tampered_chunks = chunks.clone();
+        tampered_chunks[512][0] ^= 0xFF;
+
+        let tampered_refs: Vec<&[u8]> = tampered_chunks.iter().map(|c| c.as_slice()).collect();
+        let tampered_dataset = Dataset {
+            merkle_attr: dataset.merkle_attr.clone(),
+            tree_nodes: dataset.tree_nodes.clone(),
+            chunks: tampered_refs,
+        };
+
+        // Tampered dataset should fail with the correct chunk index
+        let result = verify_dataset(&tampered_dataset);
+        assert!(matches!(result, Err(MerkleError::HashMismatch { chunk_idx: 512 })));
     }
 
     /// Verify that `verify_root` returns `Ok(true)` even when chunk data is
-    /// tampered, because it only checks companion dataset integrity.
+    /// tampered, because it only checks tree node integrity.
     #[test]
-    #[ignore = "Phase 3: verify_root not yet implemented"]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "blake3")]
     fn test_verify_root_ignores_chunk_tampering() {
         let chunks = make_tampering_test_chunks();
-        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let dataset = make_dataset_from_chunks(&chunks);
 
-        // TODO: Phase 3 implementation
-        // 1. Create HDF5 file with 1,024 chunks
-        // 2. Build Merkle tree and write companion dataset
-        // 3. Close file
-        // 4. Tamper chunk data (NOT companion dataset)
-        // 5. Re-open and parse file
-        // 6. Verify:
-        //    - verify_root(&dataset) == Ok(true)
-        //      (companion bytes unchanged, so integrity check passes)
+        // Untampered dataset should verify
+        assert!(verify_root(&dataset).is_ok());
 
-        // Placeholder: test structure ready for implementation
+        // Create a tampered dataset by modifying chunk data (NOT tree nodes)
+        let mut tampered_chunks = chunks.clone();
+        tampered_chunks[512][0] ^= 0xFF;
+
+        let tampered_refs: Vec<&[u8]> = tampered_chunks.iter().map(|c| c.as_slice()).collect();
+        let tampered_dataset = Dataset {
+            merkle_attr: dataset.merkle_attr.clone(),
+            tree_nodes: dataset.tree_nodes.clone(), // tree nodes unchanged
+            chunks: tampered_refs,
+        };
+
+        // verify_root should still pass (it only checks tree nodes, not chunk data)
+        assert!(verify_root(&tampered_dataset).is_ok());
     }
 
-    /// Verify that tampering the companion dataset causes `verify_root` to
+    /// Verify that tampering the tree nodes causes `verify_root` to
     /// return `Err(CompanionTampered)`.
     #[test]
-    #[ignore = "Phase 3: verify_root not yet implemented"]
-    #[cfg(feature = "std")]
+    #[cfg(feature = "blake3")]
     fn test_tampered_companion_detected_by_verify_root() {
         let chunks = make_tampering_test_chunks();
-        let _refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let dataset = make_dataset_from_chunks(&chunks);
 
-        // TODO: Phase 3 implementation
-        // 1. Create HDF5 file with 1,024 chunks
-        // 2. Build Merkle tree and write companion dataset
-        // 3. Close file
-        // 4. Tamper one byte in companion dataset using raw file I/O
-        // 5. Re-open and parse file
-        // 6. Verify:
-        //    - verify_root(&dataset) == Err(CompanionTampered)
+        // Untampered dataset should verify
+        assert!(verify_root(&dataset).is_ok());
 
-        // Placeholder: test structure ready for implementation
+        // Create a tampered dataset by modifying tree nodes
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let mut tampered_nodes = dataset.tree_nodes.clone();
+        tampered_nodes[0] ^= 0xFF; // tamper first byte of first node
+
+        let tampered_dataset = Dataset {
+            merkle_attr: dataset.merkle_attr.clone(), // still has original companion hash
+            tree_nodes: tampered_nodes,
+            chunks: refs,
+        };
+
+        // verify_root should fail with CompanionTampered
+        let result = verify_root(&tampered_dataset);
+        assert!(matches!(result, Err(MerkleError::CompanionTampered)));
+    }
+
+    // ========================================================================
+    // Malformed tree_nodes Validation Tests
+    // ========================================================================
+
+    /// Verify that reconstruct_tree rejects tree_nodes that aren't a multiple of HASH_SIZE.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_reconstruct_tree_rejects_non_multiple_size() {
+        let merkle_attr = MerkleAttr {
+            root: [0u8; 32],
+            algorithm: HashAlg::Blake3,
+            integrity: [0u8; 32],
+            companion_hash: [1u8; 32],
+        };
+
+        // 33 bytes is not a multiple of 32
+        let bad_nodes = vec![0u8; 33];
+        let dataset = Dataset::from_owned(merkle_attr, bad_nodes, vec![]);
+        let result = dataset.reconstruct_tree();
+        assert!(matches!(
+            result,
+            Err(MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize })
+        ));
+    }
+
+    /// Verify that reconstruct_tree rejects tree_nodes with even node count.
+    /// A complete binary tree always has 2n-1 nodes (odd).
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_reconstruct_tree_rejects_even_node_count() {
+        let merkle_attr = MerkleAttr {
+            root: [0u8; 32],
+            algorithm: HashAlg::Blake3,
+            integrity: [0u8; 32],
+            companion_hash: [1u8; 32],
+        };
+
+        // 2 nodes (64 bytes) - even count is invalid
+        let bad_nodes = vec![0u8; 64];
+        let dataset = Dataset::from_owned(merkle_attr, bad_nodes, vec![]);
+        let result = dataset.reconstruct_tree();
+        assert!(matches!(
+            result,
+            Err(MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize })
+        ));
+    }
+
+    /// Verify that reconstruct_tree rejects tree_nodes where padded_count is not power of 2.
+    /// For 5 nodes: padded_count = (5+1)/2 = 3, which is not a power of 2.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_reconstruct_tree_rejects_non_power_of_two_leaves() {
+        let merkle_attr = MerkleAttr {
+            root: [0u8; 32],
+            algorithm: HashAlg::Blake3,
+            integrity: [0u8; 32],
+            companion_hash: [1u8; 32],
+        };
+
+        // 5 nodes (160 bytes) -> padded_count = 3, not a power of 2
+        let bad_nodes = vec![0u8; 160];
+        let dataset = Dataset::from_owned(merkle_attr, bad_nodes, vec![]);
+        let result = dataset.reconstruct_tree();
+        assert!(matches!(
+            result,
+            Err(MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize })
+        ));
+    }
+
+    /// Verify that reconstruct_tree accepts valid tree sizes.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_reconstruct_tree_accepts_valid_sizes() {
+        let merkle_attr = MerkleAttr {
+            root: [0u8; 32],
+            algorithm: HashAlg::Blake3,
+            integrity: [0u8; 32],
+            companion_hash: [1u8; 32],
+        };
+
+        // Valid sizes: 1 node (1 leaf), 3 nodes (2 leaves), 7 nodes (4 leaves), etc.
+        for &leaf_count in &[1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+            let node_count = 2 * leaf_count - 1;
+            let nodes = vec![0u8; node_count * HASH_SIZE];
+            let dataset = Dataset::from_owned(merkle_attr.clone(), nodes, vec![]);
+            assert!(
+                dataset.reconstruct_tree().is_ok(),
+                "Should accept {} nodes ({} leaves)",
+                node_count,
+                leaf_count
+            );
+        }
+    }
+
+    /// Verify that verify_dataset rejects when chunks.len() > tree.leaf_count().
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_verify_dataset_rejects_too_many_chunks() {
+        // Create a tree for 2 leaves (3 nodes)
+        let chunk0 = b"chunk0".to_vec();
+        let chunk1 = b"chunk1".to_vec();
+        let refs: Vec<&[u8]> = vec![chunk0.as_slice(), chunk1.as_slice()];
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut flat_nodes = Vec::with_capacity(tree.nodes().len() * HASH_SIZE);
+        for node in tree.nodes() {
+            flat_nodes.extend_from_slice(node);
+        }
+
+        let companion_hash = compute_sha256(&flat_nodes);
+        let merkle_attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+
+        // Try to verify with 3 chunks but tree only has 2 leaves
+        let chunk2 = b"chunk2".to_vec();
+        let too_many_refs: Vec<&[u8]> = vec![
+            chunk0.as_slice(),
+            chunk1.as_slice(),
+            chunk2.as_slice(),
+        ];
+
+        let dataset = Dataset::from_owned(merkle_attr, flat_nodes, too_many_refs);
+        let result = verify_dataset(&dataset);
+        assert!(matches!(result, Err(MerkleError::MissingChunkGridMetadata)));
     }
 }

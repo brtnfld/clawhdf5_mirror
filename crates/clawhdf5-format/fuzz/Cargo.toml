@@ -12,7 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.clawhdf5-format]
 path = ".."
-features = ["std", "checksum", "deflate", "merkle"]
+features = ["std", "checksum", "deflate", "merkle", "blake3"]
 
 [workspace]
 members = ["."]
@@ -65,4 +65,9 @@ doc = false
 [[bin]]
 name = "fuzz_subset_proof"
 path = "fuzz_targets/fuzz_subset_proof.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_merkle_tree"
+path = "fuzz_targets/fuzz_merkle_tree.rs"
 doc = false
