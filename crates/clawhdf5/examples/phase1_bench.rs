@@ -35,7 +35,13 @@ use std::io::Write as IoWrite;
 use std::time::Instant;
 
 const TRIALS: usize = 30;
-const COMPANION_IO_NS: &[usize] = &[16, 256, 1_024, 65_536];
+/// Discarded warmup iterations run (and not recorded) before the `TRIALS`
+/// measured iterations, matching `hash_bench_harness.rs`/`baselines_bench.rs`
+/// and the Statistical Protocol ("minimum 30 trials after 5 discarded
+/// warmups"). Without this, cold-start effects (page faults, allocator
+/// growth, frequency-scaling ramp) leak into trial 1 of every cell.
+const WARMUP_TRIALS: usize = 5;
+const COMPANION_SERIALIZATION_NS: &[usize] = &[16, 256, 1_024, 65_536];
 
 // ---------------------------------------------------------------------------
 // RSS measurement
@@ -427,8 +433,12 @@ fn ram_gb() -> f64 {
 // Scenario runners
 // ---------------------------------------------------------------------------
 
-/// Time a closure for `TRIALS` iterations, returning per-trial ms values.
+/// Run `WARMUP_TRIALS` discarded iterations, then time `TRIALS` measured
+/// iterations, returning per-trial ms values for the measured set only.
 fn time_trials<F: FnMut()>(mut f: F) -> Vec<f64> {
+    for _ in 0..WARMUP_TRIALS {
+        f();
+    }
     (0..TRIALS)
         .map(|_| {
             let t = Instant::now();
@@ -478,7 +488,11 @@ fn run_source(
     }
 
     // ── verify_chunk ────────────────────────────────────────────────────────
-    // Single-chunk Merkle proof verification (O(log N)).
+    // Re-hash the chunk and compare against the leaf hash already stored in
+    // this tree's own node array — an O(1) lookup against a tree the
+    // verifier already holds in full, not a sibling-proof walk to the root.
+    // See `verify_proof` below for the O(chunk_size + log N) proof-path
+    // scenario this one does NOT measure.
     for (trial, ms) in time_trials(|| {
         let ok = tree.verify_chunk(0, &lf.chunks[0]);
         assert!(ok);
@@ -489,6 +503,35 @@ fn run_source(
         rows.push(CsvRow {
             source,
             scenario: "verify_chunk",
+            n_chunks: n,
+            chunk_size_kb: kb,
+            wall_time_ms: ms,
+            peak_rss_mb: peak_rss_mb(),
+            companion_bytes: 0,
+            trial: trial + 1,
+            hostname: hostname.into(),
+            disk_type: disk_type.into(),
+        });
+    }
+
+    // ── verify_proof ────────────────────────────────────────────────────────
+    // The actual O(chunk_size + log N) proof-path verification: generate an
+    // inclusion proof (sibling hashes, leaf to root) and verify it against
+    // only the root hash, the scenario for a verifier that does NOT hold the
+    // full tree (e.g. checking a chunk received in transit) — distinct from
+    // verify_chunk's O(1) lookup against a locally held tree above.
+    let proof_root = *tree.root();
+    for (trial, ms) in time_trials(|| {
+        let proof = tree.proof(0).unwrap();
+        let ok = MerkleTree::verify_proof_standalone(&proof_root, 0, &lf.chunks[0], &proof);
+        assert!(ok);
+    })
+    .into_iter()
+    .enumerate()
+    {
+        rows.push(CsvRow {
+            source,
+            scenario: "verify_proof",
             n_chunks: n,
             chunk_size_kb: kb,
             wall_time_ms: ms,
@@ -572,6 +615,32 @@ fn run_source(
         });
     }
 
+    // ── update_leaf_inplace ─────────────────────────────────────────────────
+    // Isolates update_leaf's true O(log N) cost from the O(N) tree.clone()
+    // that dominates extend_merkle/update_merkle above (see Anomaly 1 in the
+    // explanatory note): clone the tree once, outside the timed region, then
+    // repeatedly call update_leaf in place on that same tree.
+    let mut inplace_tree = tree.clone();
+    for (trial, ms) in time_trials(|| {
+        inplace_tree.update_leaf(0, updated_hash).unwrap();
+    })
+    .into_iter()
+    .enumerate()
+    {
+        rows.push(CsvRow {
+            source,
+            scenario: "update_leaf_inplace",
+            n_chunks: n,
+            chunk_size_kb: kb,
+            wall_time_ms: ms,
+            peak_rss_mb: peak_rss_mb(),
+            companion_bytes: 0,
+            trial: trial + 1,
+            hostname: hostname.into(),
+            disk_type: disk_type.into(),
+        });
+    }
+
     // ── full_rebuild ─────────────────────────────────────────────────────────
     // Build the complete tree from scratch (same operation as verify_dataset
     // but labelled separately for Figure 5 / RQ3 line chart).
@@ -597,15 +666,25 @@ fn run_source(
 
 }
 
-// ── companion_io ────────────────────────────────────────────────────────────
+// ── companion_serialization ─────────────────────────────────────────────────
 // Measure write_merkle_companion at N ∈ {16, 256, 1024, 65536}. Uses synthetic
 // 64-byte chunks so the result is independent of the source file's own chunk
 // size; only the companion write cost varies with N. Run once per top-level
 // `source` (not once per synthetic chunk-size dataset) since it doesn't
 // depend on which P1.1 dataset is being swept in `run_source`.
-fn run_companion_io(source: &'static str, hostname: &str, disk_type: &str, rows: &mut Vec<CsvRow>) {
+//
+// Named "serialization", not "io": `write_merkle_companion` is called with
+// a fresh in-memory `FileWriter` (no path is ever passed to it here), so
+// this measures the cost of building the inline attribute or
+// companion-dataset structure in memory, never a real disk write or fsync.
+fn run_companion_serialization(
+    source: &'static str,
+    hostname: &str,
+    disk_type: &str,
+    rows: &mut Vec<CsvRow>,
+) {
     let alg = HashAlg::Blake3;
-    for &nc in COMPANION_IO_NS {
+    for &nc in COMPANION_SERIALIZATION_NS {
         let syn_chunks: Vec<Vec<u8>> = (0..nc).map(|i| vec![(i & 0xFF) as u8; 64]).collect();
         let t = MerkleTree::from_chunks_owned(&syn_chunks, alg);
 
@@ -628,7 +707,7 @@ fn run_companion_io(source: &'static str, hostname: &str, disk_type: &str, rows:
         {
             rows.push(CsvRow {
                 source,
-                scenario: "companion_io",
+                scenario: "companion_serialization",
                 n_chunks: nc,
                 chunk_size_kb: 0.0625, // 64-byte synthetic chunks
                 wall_time_ms: ms,
@@ -684,7 +763,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_source("synthetic", &syn, &host, &disk, &mut rows);
         println!("  {dataset} done ({} rows)", rows.len() - prev);
     }
-    run_companion_io("synthetic", &host, &disk, &mut rows);
+    run_companion_serialization("synthetic", &host, &disk, &mut rows);
 
     // NOAA file
     println!("Loading NOAA file: {noaa_path}");
@@ -695,7 +774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let prev = rows.len();
     run_source("NOAA", &noaa, &host, &disk, &mut rows);
-    run_companion_io("NOAA", &host, &disk, &mut rows);
+    run_companion_serialization("NOAA", &host, &disk, &mut rows);
     println!("  NOAA done ({} rows)", rows.len() - prev);
 
     // Write CSV
