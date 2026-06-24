@@ -1,0 +1,22 @@
+scripts/check-nostd.sh
+  s_2180fb5293fe34::t_58b5c69127b92b 23
+  s_2180fb5293fe34::t_96131f5a149483 29
+  s_2180fb5293fe34::t_7e972a098013eb 14
+  s_2180fb5293fe34::t_e6aaf1be25645d 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "6bb06fb272887f423176449021116a7471934f86",
+  "prompts": {},
+  "sessions": {
+    "s_2180fb5293fe34": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "034f5cd4-7dd7-47ad-834e-4fa2d82e2e2b",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
