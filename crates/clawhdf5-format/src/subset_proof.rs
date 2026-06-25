@@ -531,6 +531,11 @@ pub fn verify_subset(
         }
 
         let mut node_idx = internal_nodes + leaf_idx;
+        // Guard against overflow in sibling_idx calculation below. In practice,
+        // node_idx cannot approach usize::MAX because internal_nodes + leaf_idx
+        // is bounded by 2*n_total - 1 where n_total is the number of chunks,
+        // which is itself bounded by practical storage limits.
+        debug_assert!(node_idx < usize::MAX, "node_idx overflow guard");
         let mut current = computed_leaf_hash;
         let mut level_leaf_idx = leaf_idx;
         while node_idx > 0 {
@@ -582,6 +587,11 @@ mod tests {
     fn test_morton_index_3d_reference() {
         // Standard 3D Z-order: bit k of axis d -> output bit k*3 + d.
         // (1,2,3): x=001 y=010 z=011 -> bits set at 0(x0),2(z0),4(y1),5(z1) = 0b110101 = 0x35.
+        //
+        // NOTE: The S2-D2-Yr2 TeX draft's worked example (line 3052) states
+        // MortonIndex(1,2,3) = 0x15, but this is an arithmetic error in the spec.
+        // Applying the stated bit-interleaving rule correctly yields 0x35.
+        // See test-vectors/morton-vectors.json for full documentation.
         assert_eq!(morton_index(&[1, 2, 3]), 0x35);
         assert_eq!(morton_index(&[0, 0, 0]), 0);
         assert_eq!(morton_index(&[1, 0, 0]), 1);

@@ -138,10 +138,17 @@ impl Selection {
 
                     // Compute the full extent of the hyperslab in this dimension
                     let sel_start = start[d];
+                    // Use saturating arithmetic to prevent overflow on adversarial inputs.
+                    // If the selection extends beyond u64::MAX, we saturate — which is
+                    // correct behavior since any finite chunk_end will be < u64::MAX.
                     let sel_end = if count[d] == 0 {
                         sel_start
                     } else {
-                        start[d] + (count[d] - 1) * stride[d] + block[d]
+                        start[d].saturating_add(
+                            (count[d] - 1)
+                                .saturating_mul(stride[d])
+                                .saturating_add(block[d]),
+                        )
                     };
 
                     // No overlap if chunk is entirely before or after selection
