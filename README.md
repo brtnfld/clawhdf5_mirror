@@ -8,7 +8,7 @@
 [![LongMemEval](https://img.shields.io/badge/LongMemEval-Hit@5%2046%25%20BM25--only-blue.svg)](BENCHMARKS.md#longmemeval-results)
 [![Footprint](https://img.shields.io/badge/footprint-6.5%20KB%2Frecord-lightgrey.svg)](BENCHMARKS.md#memory-footprint)
 
-ClawhDF5 is a pure-Rust HDF5 implementation combined with a research-grade agent memory engine. It gives AI agents persistent, searchable, cryptographically verifiable memory — all stored in a single portable file.
+ClawHDF5 is a pure-Rust HDF5 implementation combined with a research-grade agent memory engine. It gives AI agents persistent, searchable, cryptographically verifiable memory — all stored in a single portable file.
 
 ```
 cargo add clawhdf5-agent --features agent
