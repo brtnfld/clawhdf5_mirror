@@ -25,8 +25,35 @@ path = "src/bin/consolidation_efficiency.rs"
 name = "ephemeral_perf"
 path = "src/bin/ephemeral_perf.rs"
 
+# ---------------------------------------------------------------------------
+# h5bench-equivalent Criterion benchmarks
+# ---------------------------------------------------------------------------
+
+[[bench]]
+name = "h5bench_write"
+harness = false
+
+[[bench]]
+name = "h5bench_read"
+harness = false
+
+[[bench]]
+name = "h5bench_meta"
+harness = false
+
 [dependencies]
 clawhdf5-agent = { path = "../clawhdf5-agent" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# Optional: libhdf5 C wrapper for side-by-side comparison (requires system libhdf5).
+# Enable with: cargo bench -p clawhdf5-bench --features libhdf5-compare
+hdf5 = { version = "0.8", optional = true }
+
+[dev-dependencies]
+clawhdf5 = { path = "../clawhdf5" }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+# When enabled, benchmarks add matching libhdf5 variants for side-by-side comparison.
+libhdf5-compare = ["hdf5"]
