@@ -7,7 +7,9 @@
 use alloc::{string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
-use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
+use crate::chunked_write::{
+    ChunkOptions, PrecompressedChunks, build_chunked_data_from_precompressed, precompress_chunks,
+};
 use crate::data_layout::VdsMapping;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
@@ -1157,6 +1159,9 @@ impl FileWriter {
         struct DataBlob {
             data: Vec<u8>,
             oh_bytes: Vec<u8>,
+            /// Cached compressed chunks for chunked datasets; reused in Pass 2
+            /// to avoid re-compressing the same data.
+            precompressed: Option<PrecompressedChunks>,
         }
 
         let mut dummy_blobs: Vec<DataBlob> = Vec::new();
@@ -1185,19 +1190,22 @@ impl FileWriter {
                 dummy_blobs.push(DataBlob {
                     data: gcol_bytes, // store heap blob here temporarily
                     oh_bytes: oh,
+                    precompressed: None,
                 });
             } else if is_chunked[i] {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let elem_size = d.dt.type_size() as usize;
-                let result = build_chunked_data_at_ext(
+                // Compress once in Pass 1; cache the result so Pass 2 can skip
+                // re-compression and just rebuild the index with real addresses.
+                let pre = precompress_chunks(
                     &d.raw,
                     &d.ds.dimensions,
                     &chunk_dims,
                     elem_size,
                     &d.chunk_options,
-                    dummy_cursor,
-                    d.maxshape.as_deref(),
                 )?;
+                let result =
+                    build_chunked_data_from_precompressed(&pre, dummy_cursor, d.maxshape.as_deref());
                 dummy_cursor += result.data_bytes.len() as u64;
                 let dense_blob = if ds_dense[i] {
                     Some(build_dense_attrs(&d.attrs, 0))
@@ -1216,6 +1224,7 @@ impl FileWriter {
                 dummy_blobs.push(DataBlob {
                     data: result.data_bytes,
                     oh_bytes: oh,
+                    precompressed: Some(pre),
                 });
             } else if is_compact[i] {
                 let dense_blob = if ds_dense[i] {
@@ -1234,6 +1243,7 @@ impl FileWriter {
                 dummy_blobs.push(DataBlob {
                     data: vec![],
                     oh_bytes: oh,
+                    precompressed: None,
                 });
             } else {
                 let dense_blob = if ds_dense[i] {
@@ -1253,6 +1263,7 @@ impl FileWriter {
                 dummy_blobs.push(DataBlob {
                     data: d.raw.clone(),
                     oh_bytes: oh,
+                    precompressed: None,
                 });
             }
         }
@@ -1355,20 +1366,17 @@ impl FileWriter {
                 ds_blobs2.push(DataBlob {
                     data: gcol_bytes.clone(),
                     oh_bytes: oh,
+                    precompressed: None,
                 });
             } else if is_chunked[i] {
-                let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
-                let elem_size = d.dt.type_size() as usize;
                 let base_address = cursor2 as u64;
-                let result = build_chunked_data_at_ext(
-                    &d.raw,
-                    &d.ds.dimensions,
-                    &chunk_dims,
-                    elem_size,
-                    &d.chunk_options,
+                // Reuse precompressed chunks from Pass 1 — avoids re-compressing
+                // the same data a second time.
+                let result = build_chunked_data_from_precompressed(
+                    dummy_blobs[i].precompressed.as_ref().expect("chunked dataset missing precompressed cache"),
                     base_address,
                     d.maxshape.as_deref(),
-                )?;
+                );
                 cursor2 += result.data_bytes.len();
                 let oh = build_chunked_dataset_oh(
                     &d.dt,
@@ -1382,6 +1390,7 @@ impl FileWriter {
                 ds_blobs2.push(DataBlob {
                     data: result.data_bytes,
                     oh_bytes: oh,
+                    precompressed: None,
                 });
             } else if is_compact[i] {
                 // Compact: data is inline in the object header, no external blob
@@ -1396,6 +1405,7 @@ impl FileWriter {
                 ds_blobs2.push(DataBlob {
                     data: vec![],
                     oh_bytes: oh,
+                    precompressed: None,
                 });
             } else {
                 // Determine alignment: per-dataset overrides global
@@ -1420,7 +1430,11 @@ impl FileWriter {
                 let mut data = vec![0u8; padding];
                 data.extend_from_slice(&d.raw);
                 cursor2 += d.raw.len();
-                ds_blobs2.push(DataBlob { data, oh_bytes: oh });
+                ds_blobs2.push(DataBlob {
+                    data,
+                    oh_bytes: oh,
+                    precompressed: None,
+                });
             }
         }
 

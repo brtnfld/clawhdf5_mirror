@@ -542,6 +542,11 @@ impl DatasetBuilder {
 
     /// Enable zstd compression at `level` (1-22). HDF5 filter ID 32015.
     /// Implies chunked storage. Requires the `zstd` cargo feature.
+    ///
+    /// **Recommended for write-heavy workloads:** Zstd level 3 encodes at
+    /// ~500+ MiB/s vs deflate's ~300 MiB/s at the same or better compression
+    /// ratio (see arXiv 2604.06221).  Use `.with_shuffle()` before this call
+    /// for floating-point data to improve the compression ratio.
     pub fn with_zstd(&mut self, level: u32) -> &mut Self {
         self.chunk_options.zstd_level = Some(level);
         self

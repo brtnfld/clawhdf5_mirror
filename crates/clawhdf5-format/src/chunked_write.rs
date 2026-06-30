@@ -545,6 +545,158 @@ pub fn build_fixed_array_at(
     combined
 }
 
+/// Compressed chunks ready to be laid out at any file address.
+///
+/// Created by [`precompress_chunks`] and consumed by
+/// [`build_chunked_data_from_precompressed`].  Caching this between the two
+/// writer passes eliminates the double-compression that the two-pass layout
+/// algorithm previously performed.
+pub struct PrecompressedChunks {
+    /// Per-chunk: (raw_size_bytes, compressed_bytes).
+    pub chunks: Vec<(u64, Vec<u8>)>,
+    pub has_filters: bool,
+    pub element_size: usize,
+    pub shape: Vec<u64>,
+    pub chunk_dims: Vec<u64>,
+    pub pipeline_message: Option<Vec<u8>>,
+}
+
+/// Compress all chunks of a dataset without laying them out at a file address.
+///
+/// Call this once per dataset in Pass 1, cache the result, then call
+/// [`build_chunked_data_from_precompressed`] in both Pass 1 (dummy address
+/// for sizing) and Pass 2 (real address) to avoid re-compressing.
+pub fn precompress_chunks(
+    raw_data: &[u8],
+    shape: &[u64],
+    chunk_dims: &[u64],
+    element_size: usize,
+    options: &ChunkOptions,
+) -> Result<PrecompressedChunks, FormatError> {
+    let pipeline = options.build_pipeline(element_size as u32);
+    let has_filters = pipeline.is_some();
+    let pipeline_message = pipeline.as_ref().map(|pl| pl.serialize());
+
+    let raw_chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
+    let compressed = compress_all_chunks(&raw_chunks, &pipeline, element_size as u32)?;
+
+    let chunks = raw_chunks
+        .into_iter()
+        .zip(compressed.into_iter())
+        .map(|((_offsets, raw_bytes), c)| (raw_bytes.len() as u64, c))
+        .collect();
+
+    Ok(PrecompressedChunks {
+        chunks,
+        has_filters,
+        element_size,
+        shape: shape.to_vec(),
+        chunk_dims: chunk_dims.to_vec(),
+        pipeline_message,
+    })
+}
+
+/// Lay out precompressed chunks at `base_address` and build index structures.
+///
+/// This is the address-dependent half of chunk writing.  Call it in Pass 1
+/// with a dummy address (to get the blob size), and again in Pass 2 with the
+/// real address — both times reusing the same [`PrecompressedChunks`] so
+/// compression happens only once.
+pub fn build_chunked_data_from_precompressed(
+    pre: &PrecompressedChunks,
+    base_address: u64,
+    maxshape: Option<&[u64]>,
+) -> ChunkedDataResult {
+    let offset_size: u8 = 8;
+    let length_size: u8 = 8;
+    let num_chunks = pre.chunks.len();
+    let element_size = pre.element_size;
+
+    let mut data_buf = Vec::new();
+    let mut written_chunks = Vec::with_capacity(num_chunks);
+
+    for (raw_size, compressed) in &pre.chunks {
+        let aligned_offset = align_to_cache_line(data_buf.len());
+        if aligned_offset > data_buf.len() {
+            data_buf.resize(aligned_offset, 0u8);
+        }
+        let address = base_address + data_buf.len() as u64;
+        let compressed_size = compressed.len() as u64;
+        data_buf.extend_from_slice(compressed);
+        written_chunks.push(WrittenChunk {
+            address,
+            compressed_size,
+            raw_size: *raw_size,
+            filter_mask: 0,
+        });
+    }
+
+    let chunk_dims_u32: Vec<u32> = pre.chunk_dims.iter().map(|&d| d as u32).collect();
+    let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
+
+    let aligned_idx = align_to_cache_line(data_buf.len());
+    if aligned_idx > data_buf.len() {
+        data_buf.resize(aligned_idx, 0u8);
+    }
+
+    let layout_message = if use_extensible {
+        let ea_address = base_address + data_buf.len() as u64;
+        let ea_bytes = ea_writer::build_extensible_array_at(
+            &written_chunks,
+            offset_size,
+            length_size,
+            pre.has_filters,
+            ea_address,
+        );
+        data_buf.extend_from_slice(&ea_bytes);
+        ea_writer::serialize_v4_extensible_array(
+            &chunk_dims_u32,
+            ea_address,
+            offset_size,
+            element_size as u32,
+        )
+    } else if num_chunks == 1 {
+        let chunk_addr = written_chunks[0].address;
+        let filtered_size = if pre.has_filters {
+            Some(written_chunks[0].compressed_size)
+        } else {
+            None
+        };
+        let filter_mask = if pre.has_filters { Some(0u32) } else { None };
+        serialize_v4_single_chunk(
+            &chunk_dims_u32,
+            chunk_addr,
+            filtered_size,
+            filter_mask,
+            offset_size,
+            element_size as u32,
+        )
+    } else {
+        let fa_address = base_address + data_buf.len() as u64;
+        let fa_bytes = build_fixed_array_at(
+            &written_chunks,
+            offset_size,
+            length_size,
+            pre.has_filters,
+            fa_address,
+        );
+        data_buf.extend_from_slice(&fa_bytes);
+        serialize_v4_fixed_array(
+            &chunk_dims_u32,
+            fa_address,
+            offset_size,
+            element_size as u32,
+            10, // max_nelmts_bits — matches h5py convention
+        )
+    };
+
+    ChunkedDataResult {
+        data_bytes: data_buf,
+        layout_message,
+        pipeline_message: pre.pipeline_message.clone(),
+    }
+}
+
 /// Build chunked data with absolute addresses.
 /// If `maxshape` has unlimited dims, uses Extensible Array index.
 pub fn build_chunked_data_at(
@@ -576,118 +728,8 @@ pub fn build_chunked_data_at_ext(
     base_address: u64,
     maxshape: Option<&[u64]>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let pipeline = options.build_pipeline(element_size as u32);
-
-    let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
-    let num_chunks = chunks.len();
-    let has_filters = pipeline.is_some();
-
-    // Compress all chunks up front (parallel under the `parallel` feature),
-    // then lay them out sequentially with cache-line padding for aligned access.
-    // Compression order matches chunk order, so the on-disk layout is identical
-    // to the previous per-chunk sequential path.
-    let compressed_chunks = compress_all_chunks(&chunks, &pipeline, element_size as u32)?;
-
-    let mut data_buf = Vec::new();
-    let mut written_chunks = Vec::with_capacity(num_chunks);
-
-    for ((_offsets, chunk_bytes), compressed) in chunks.iter().zip(compressed_chunks.iter()) {
-        // Pad current position to cache-line boundary
-        let aligned_offset = align_to_cache_line(data_buf.len());
-        if aligned_offset > data_buf.len() {
-            data_buf.resize(aligned_offset, 0u8);
-        }
-
-        let address = base_address + data_buf.len() as u64;
-        let compressed_size = compressed.len() as u64;
-        let raw_size = chunk_bytes.len() as u64;
-
-        data_buf.extend_from_slice(compressed);
-
-        written_chunks.push(WrittenChunk {
-            address,
-            compressed_size,
-            raw_size,
-            filter_mask: 0,
-        });
-    }
-
-    let chunk_dims_u32: Vec<u32> = chunk_dims.iter().map(|&d| d as u32).collect();
-    let offset_size: u8 = 8;
-    let length_size: u8 = 8;
-
-    // Determine if we should use Extensible Array (resizable datasets)
-    let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
-
-    // Pad before index structures so they are also cache-line aligned
-    let aligned_idx = align_to_cache_line(data_buf.len());
-    if aligned_idx > data_buf.len() {
-        data_buf.resize(aligned_idx, 0u8);
-    }
-
-    let layout_message = if use_extensible {
-        let ea_address = base_address + data_buf.len() as u64;
-
-        let ea_bytes = ea_writer::build_extensible_array_at(
-            &written_chunks,
-            offset_size,
-            length_size,
-            has_filters,
-            ea_address,
-        );
-        data_buf.extend_from_slice(&ea_bytes);
-
-        ea_writer::serialize_v4_extensible_array(
-            &chunk_dims_u32,
-            ea_address,
-            offset_size,
-            element_size as u32,
-        )
-    } else if num_chunks == 1 {
-        let chunk_addr = written_chunks[0].address;
-        let filtered_size = if has_filters {
-            Some(written_chunks[0].compressed_size)
-        } else {
-            None
-        };
-        let filter_mask = if has_filters { Some(0u32) } else { None };
-        serialize_v4_single_chunk(
-            &chunk_dims_u32,
-            chunk_addr,
-            filtered_size,
-            filter_mask,
-            offset_size,
-            element_size as u32,
-        )
-    } else {
-        let fa_address = base_address + data_buf.len() as u64;
-        let max_bits: u8 = 10;
-
-        let fa_bytes = build_fixed_array_at(
-            &written_chunks,
-            offset_size,
-            length_size,
-            has_filters,
-            fa_address,
-        );
-        data_buf.extend_from_slice(&fa_bytes);
-
-        serialize_v4_fixed_array(
-            &chunk_dims_u32,
-            fa_address,
-            offset_size,
-            element_size as u32,
-            max_bits,
-        )
-    };
-
-    let pipeline_message = pipeline.as_ref().map(|pl| pl.serialize());
-
-    Ok(ChunkedDataResult {
-        data_bytes: data_buf,
-        layout_message,
-        pipeline_message,
-    })
+    let pre = precompress_chunks(raw_data, shape, chunk_dims, element_size, options)?;
+    Ok(build_chunked_data_from_precompressed(&pre, base_address, maxshape))
 }
 
 /// Write selected elements into an existing in-memory dataset buffer.

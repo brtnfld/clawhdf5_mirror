@@ -16,7 +16,6 @@ use clawhdf5_format::object_header::ObjectHeader;
 use clawhdf5_format::signature::find_signature;
 use clawhdf5_format::superblock::Superblock;
 use clawhdf5_io::FileWriter as IoFileWriter;
-use clawhdf5_io::HDF5ReadWrite;
 
 /// Distance metric for the HNSW index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,7 +515,7 @@ impl HnswIndex {
     pub fn save_to_hdf5(&self, writer: &mut IoFileWriter) -> Result<(), FormatError> {
         let bytes = self.to_hdf5_bytes()?;
         writer
-            .write_all_bytes(&bytes)
+            .write_bytes_owned(bytes)
             .map_err(|e| FormatError::SerializationError(e.to_string()))?;
         Ok(())
     }

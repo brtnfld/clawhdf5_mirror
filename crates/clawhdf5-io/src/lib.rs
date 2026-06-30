@@ -231,6 +231,30 @@ impl FileWriter {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// Write `data` into this writer, taking ownership to avoid a copy.
+    ///
+    /// Prefer over [`HDF5ReadWrite::write_all_bytes`] when the caller already
+    /// owns a `Vec<u8>` (e.g., from `FileWriter::finish()`).
+    pub fn write_bytes_owned(&mut self, data: Vec<u8>) -> io::Result<()> {
+        self.data = data;
+        if let Some(ref mut interceptor) = self.interceptor {
+            let ps = self.page_size as usize;
+            if ps > 0 {
+                let mut offset: u64 = 0;
+                let mut pos = 0usize;
+                while pos + ps <= self.data.len() {
+                    interceptor.on_page_write(offset, &self.data[pos..pos + ps]);
+                    pos += ps;
+                    offset += ps as u64;
+                }
+                if pos < self.data.len() {
+                    interceptor.on_page_write(offset, &self.data[pos..]);
+                }
+            }
+        }
+        self.flush_to_disk()
+    }
 }
 
 impl HDF5Read for FileWriter {

@@ -83,7 +83,8 @@ fn bench_write_2d_chunked(c: &mut Criterion) {
                 fb.create_dataset("matrix")
                     .with_f32_data(d)
                     .with_shape(&[rows as u64, cols as u64])
-                    .with_chunks(&[cr, cc]);
+                    .with_chunks(&[cr, cc])
+                    .with_deflate(6);
                 fb.write(&path).unwrap();
             });
         });
@@ -104,6 +105,64 @@ fn bench_write_2d_chunked(c: &mut Criterion) {
                 ds.write_raw(d.as_slice()).unwrap();
             });
         });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Workload: write_2d_chunked_zstd
+// Same matrix sizes as write_2d_chunked but uses Zstd level 3.
+// Zstd level 3 typically encodes 500+ MiB/s vs deflate's ~300 MiB/s at the
+// same or better compression ratio (arXiv 2604.06221, ROOT I/O 2019).
+// ---------------------------------------------------------------------------
+
+fn bench_write_2d_chunked_zstd(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_2d_chunked_zstd");
+
+    let configs: &[(usize, usize, u64, u64)] = &[
+        (32, 32, 8, 32),
+        (128, 128, 32, 128),
+        (512, 512, 64, 512),
+    ];
+
+    for &(rows, cols, cr, cc) in configs {
+        let n = rows * cols;
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let label = format!("{rows}x{cols}");
+        group.throughput(Throughput::Bytes((n * size_of::<f32>()) as u64));
+
+        group.bench_with_input(BenchmarkId::new("clawhdf5/zstd-3", &label), &data, |b, d| {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("write_2d_chunked_zstd.h5");
+            b.iter(|| {
+                let mut fb = FileBuilder::new();
+                fb.create_dataset("matrix")
+                    .with_f32_data(d)
+                    .with_shape(&[rows as u64, cols as u64])
+                    .with_chunks(&[cr, cc])
+                    .with_zstd(3);
+                fb.write(&path).unwrap();
+            });
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("clawhdf5/deflate-6", &label),
+            &data,
+            |b, d| {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("write_2d_chunked_deflate.h5");
+                b.iter(|| {
+                    let mut fb = FileBuilder::new();
+                    fb.create_dataset("matrix")
+                        .with_f32_data(d)
+                        .with_shape(&[rows as u64, cols as u64])
+                        .with_chunks(&[cr, cc])
+                        .with_deflate(6);
+                    fb.write(&path).unwrap();
+                });
+            },
+        );
     }
 
     group.finish();
@@ -205,6 +264,7 @@ criterion_group!(
     write_benches,
     bench_write_1d_contiguous,
     bench_write_2d_chunked,
+    bench_write_2d_chunked_zstd,
     bench_write_f64_batch,
     bench_write_multi_dataset,
     bench_write_with_attrs,

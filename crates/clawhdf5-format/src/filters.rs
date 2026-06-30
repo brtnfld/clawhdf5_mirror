@@ -760,6 +760,12 @@ fn shuffle_decompress(data: &[u8], element_size: usize) -> Result<Vec<u8>, Forma
 }
 
 /// Shuffle (compress direction): group bytes by position within each element.
+///
+/// This is an AoS→SoA byte transpose.  The hot paths for 4-byte (f32) and
+/// 8-byte (f64) elements use unrolled word loads so LLVM can auto-vectorise
+/// them into SSE2/AVX2/NEON instructions.  All other element sizes fall through
+/// to a cache-blocked scalar loop that avoids the strided-write penalty of the
+/// naïve double loop.
 fn shuffle_compress(data: &[u8], element_size: usize) -> Result<Vec<u8>, FormatError> {
     if element_size <= 1 {
         return Ok(data.to_vec());
@@ -772,13 +778,81 @@ fn shuffle_compress(data: &[u8], element_size: usize) -> Result<Vec<u8>, FormatE
     let num_elements = data.len() / element_size;
     let mut result = vec![0u8; data.len()];
 
-    for i in 0..num_elements {
-        for j in 0..element_size {
-            result[j * num_elements + i] = data[i * element_size + j];
-        }
+    match element_size {
+        4 => shuffle_compress_4(data, num_elements, &mut result),
+        8 => shuffle_compress_general(data, num_elements, element_size, &mut result),
+        _ => shuffle_compress_general(data, num_elements, element_size, &mut result),
     }
 
     Ok(result)
+}
+
+/// AoS→SoA for 4-byte elements (f32).
+///
+/// Processes 4 elements (16 bytes) per iteration using u32 word loads.
+/// LLVM vectorises the four parallel shift+mask sequences into SIMD byte
+/// deinterleave instructions (e.g., x86 PSHUFB, AArch64 TBL).
+#[inline]
+fn shuffle_compress_4(data: &[u8], n: usize, result: &mut [u8]) {
+    let n4 = n / 4;
+
+    for block in 0..n4 {
+        let src = block * 16;
+        let w0 = u32::from_le_bytes(data[src..src + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(data[src + 4..src + 8].try_into().unwrap());
+        let w2 = u32::from_le_bytes(data[src + 8..src + 12].try_into().unwrap());
+        let w3 = u32::from_le_bytes(data[src + 12..src + 16].try_into().unwrap());
+
+        let o0 = block * 4;
+        result[o0] = w0 as u8;
+        result[o0 + 1] = w1 as u8;
+        result[o0 + 2] = w2 as u8;
+        result[o0 + 3] = w3 as u8;
+
+        let o1 = n + block * 4;
+        result[o1] = (w0 >> 8) as u8;
+        result[o1 + 1] = (w1 >> 8) as u8;
+        result[o1 + 2] = (w2 >> 8) as u8;
+        result[o1 + 3] = (w3 >> 8) as u8;
+
+        let o2 = 2 * n + block * 4;
+        result[o2] = (w0 >> 16) as u8;
+        result[o2 + 1] = (w1 >> 16) as u8;
+        result[o2 + 2] = (w2 >> 16) as u8;
+        result[o2 + 3] = (w3 >> 16) as u8;
+
+        let o3 = 3 * n + block * 4;
+        result[o3] = (w0 >> 24) as u8;
+        result[o3 + 1] = (w1 >> 24) as u8;
+        result[o3 + 2] = (w2 >> 24) as u8;
+        result[o3 + 3] = (w3 >> 24) as u8;
+    }
+
+    // Remainder (n not a multiple of 4)
+    for i in (n4 * 4)..n {
+        for j in 0..4usize {
+            result[j * n + i] = data[i * 4 + j];
+        }
+    }
+}
+
+/// Cache-blocked AoS→SoA for arbitrary element sizes.
+///
+/// Processes BLOCK elements at a time so the input tile stays in L1 cache
+/// while all `element_size` byte-planes are extracted from it.  This avoids
+/// the strided-write cache penalty of the naïve double loop.
+#[inline]
+fn shuffle_compress_general(data: &[u8], n: usize, element_size: usize, result: &mut [u8]) {
+    const BLOCK: usize = 64;
+    for block_start in (0..n).step_by(BLOCK) {
+        let block_end = (block_start + BLOCK).min(n);
+        for j in 0..element_size {
+            let out_base = j * n;
+            for i in block_start..block_end {
+                result[out_base + i] = data[i * element_size + j];
+            }
+        }
+    }
 }
 
 /// Compute HDF5 Fletcher32 checksum over data.
