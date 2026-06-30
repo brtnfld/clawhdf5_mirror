@@ -401,7 +401,7 @@ cargo run --release --bin ephemeral_perf
 
 Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 C library).  
 **Run:** `cargo bench -p clawhdf5-bench`  
-**Date:** 2026-06-30 · same system as above.
+**Date:** 2026-06-30 · same system as above · post write-performance improvements (chunk-cache, SIMD shuffle, Zstd codec, owned-Vec IO).
 
 ### Sequential Read Throughput
 
@@ -424,16 +424,30 @@ Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 
 
 | Workload | n=1K | n=10K | n=100K |
 |----------|------|-------|--------|
-| write_1d_contiguous (f32) | 9.99 µs / **382 MiB/s** | 26.2 µs / **1.42 GiB/s** | 203 µs / **1.83 GiB/s** |
-| write_f64_batch (f64 embeddings) | 6.68 µs (n=128) | 9.67 µs (n=512) / **404 MiB/s** | 11.1 µs (n=1K) / **704 MiB/s** |
+| write_1d_contiguous (f32) | 9.44 µs / **404 MiB/s** | 25.2 µs / **1.48 GiB/s** | 218 µs / **1.71 GiB/s** |
+| write_f64_batch (f64 embeddings) | 6.50 µs (n=128) | 8.67 µs (n=512) / **450 MiB/s** | 10.27 µs (n=1K) / **761 MiB/s** |
 
 ### Chunked Write (deflate level 6)
 
 | Matrix size | Latency | Throughput |
 |-------------|---------|-----------|
-| 32×32 f32 | 19.6 µs | 199 MiB/s |
-| 128×128 f32 | 164 µs | 381 MiB/s |
-| 512×512 f32 | 3.15 ms | 318 MiB/s |
+| 32×32 f32 | 57.7 µs | 67.8 MiB/s |
+| 128×128 f32 | 535 µs | 117 MiB/s |
+| 512×512 f32 | 3.64 ms | 275 MiB/s |
+
+### Codec Comparison: Zstd-3 vs Deflate-6
+
+Side-by-side on the same f32 matrices. Zstd level 3 encodes significantly faster
+at the same or better compression ratio (see arXiv:2604.06221, ROOT I/O arXiv:1906.04624).
+
+| Matrix size | Zstd-3 | Deflate-6 | Speedup |
+|-------------|--------|-----------|---------|
+| 32×32 f32 | 57.0 µs / 68.6 MiB/s | 54.6 µs / 71.6 MiB/s | ~1× (too small to matter) |
+| 128×128 f32 | **189 µs / 330 MiB/s** | 475 µs / 132 MiB/s | **2.51×** |
+| 512×512 f32 | **1.69 ms / 593 MiB/s** | 3.57 ms / 280 MiB/s | **2.12×** |
+
+**Recommendation:** Use `.with_zstd(3)` for chunked datasets. At matrix sizes ≥128×128 you get
+2–2.5× better write throughput with equal or better compression ratio.
 
 ### Metadata Throughput
 

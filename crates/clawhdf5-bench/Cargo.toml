@@ -59,7 +59,7 @@ tempfile = "3"
 hdf5 = { version = "0.12", optional = true, package = "hdf5-metno" }
 
 [dev-dependencies]
-clawhdf5 = { path = "../clawhdf5" }
+clawhdf5 = { path = "../clawhdf5", features = ["zstd"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]

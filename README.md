@@ -69,6 +69,17 @@ Benchmarked on Intel i7-12650H (10C/16T), 384-dim embeddings, Criterion.rs.
 | Read 1M f64 | 0.28 ms | 0.65 ms | **2.3×** |
 | Zero-copy mmap | 313 ns | N/A | — |
 
+### Chunked Write Throughput (codec comparison)
+
+Measured with Criterion on 512×512 f32 matrices (h5bench-equivalent workload):
+
+| Codec | 128×128 f32 | 512×512 f32 | vs Deflate |
+|-------|-------------|-------------|------------|
+| Zstd level 3 | **189 µs / 330 MiB/s** | **1.69 ms / 593 MiB/s** | **2.1–2.5×** |
+| Deflate level 6 | 475 µs / 132 MiB/s | 3.57 ms / 280 MiB/s | baseline |
+
+Use `.with_zstd(3)` for write-heavy workloads. Same or better compression ratio at 2× the speed.
+
 > ¹ MemX ([arxiv:2603.16171](https://arxiv.org/abs/2603.16171), March 2026): Rust + libSQL, claims <90ms at 100K records.
 
 ### LongMemEval Retrieval Recall
@@ -415,7 +426,8 @@ cargo test --workspace            # all 417+ tests
 cargo test -p clawhdf5-agent      # agent memory tests
 
 # Benchmarks
-cargo bench -p clawhdf5-agent     # full benchmark suite
+cargo bench -p clawhdf5-agent               # agent memory suite
+cargo bench -p clawhdf5-bench               # h5bench-equivalent I/O suite
 ```
 
 ---
