@@ -8,6 +8,7 @@ use alloc::{string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
+use crate::data_layout::VdsMapping;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
 use crate::link_message::{LinkMessage, LinkTarget};
@@ -790,6 +791,118 @@ fn serialize_attribute_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
     data
 }
 
+// ---- VDS helpers ----
+
+/// Serialize VDS mappings into the on-disk format stored in the global heap.
+///
+/// Layout (version 1, same-file references):
+/// ```text
+/// version(1) · nused(8, LE) · entry[nused]
+/// ```
+/// Each entry: same-file marker(0x04) · source_dataset\0 · source_sel · virtual_sel
+pub(crate) fn serialize_vds_mappings(mappings: &[VdsMapping]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(1u8); // block version 1 (same-file marker for "." source_file)
+    buf.extend_from_slice(&(mappings.len() as u64).to_le_bytes()); // nused
+    for m in mappings {
+        if m.source_file == "." {
+            buf.push(0x04); // same-file marker
+        } else {
+            buf.extend_from_slice(m.source_file.as_bytes());
+            buf.push(0); // null terminator
+        }
+        buf.extend_from_slice(m.source_dataset.as_bytes());
+        buf.push(0); // null terminator
+        buf.extend_from_slice(&m.source_selection);
+        buf.extend_from_slice(&m.virtual_selection);
+    }
+    // Checksum (4 bytes at end; parsers skip it after reaching nused entries)
+    let cksum = crate::checksum::jenkins_lookup3(&buf);
+    buf.extend_from_slice(&cksum.to_le_bytes());
+    buf
+}
+
+/// Build a minimal global heap collection containing a single object.
+///
+/// Returns the serialized collection bytes. The object index is always 1.
+///
+/// Global heap collection layout:
+/// ```text
+/// "GCOL"(4) · version(1) · reserved(3) · collection_size(8)
+/// · [index(2) · ref_count(2) · reserved(4) · object_size(8) · data · padding]
+/// · free-space-marker(2)
+/// ```
+pub(crate) fn build_global_heap_collection(object_data: &[u8]) -> Vec<u8> {
+    let ls = LENGTH_SIZE as usize;
+    let header_size = 8 + ls; // sig(4)+ver(1)+rsv(3)+coll_size(ls)
+    let obj_header_size = 8 + ls; // idx(2)+rc(2)+rsv(4)+obj_size(ls)
+    let padded_data_len = pad8(object_data.len());
+    let free_marker_size = 2;
+    let collection_size = header_size + obj_header_size + padded_data_len + free_marker_size;
+
+    let mut buf = Vec::with_capacity(collection_size);
+    buf.extend_from_slice(b"GCOL");
+    buf.push(1); // version
+    buf.extend_from_slice(&[0u8; 3]); // reserved
+    buf.extend_from_slice(&(collection_size as u64).to_le_bytes()); // collection_size
+
+    // Object 1
+    buf.extend_from_slice(&1u16.to_le_bytes()); // index
+    buf.extend_from_slice(&1u16.to_le_bytes()); // reference count
+    buf.extend_from_slice(&[0u8; 4]); // reserved
+    buf.extend_from_slice(&(object_data.len() as u64).to_le_bytes()); // object size
+    buf.extend_from_slice(object_data);
+    // Pad object data to 8-byte boundary
+    let pad = padded_data_len - object_data.len();
+    buf.extend_from_slice(&vec![0u8; pad]);
+
+    // Free space marker
+    buf.extend_from_slice(&0u16.to_le_bytes());
+
+    debug_assert_eq!(buf.len(), collection_size);
+    buf
+}
+
+/// Round up to the next multiple of 8.
+fn pad8(x: usize) -> usize {
+    (x + 7) & !7
+}
+
+/// Build a Virtual Dataset object header.
+///
+/// The layout message for a VDS dataset is:
+/// ```text
+/// version(1=4) · class(1=3) · global_heap_address(8) · global_heap_index(4)
+/// ```
+pub(crate) fn build_vds_dataset_oh(
+    dt: &Datatype,
+    ds: &Dataspace,
+    global_heap_addr: u64,
+    attrs: &[AttributeMessage],
+    dense_blob: Option<&DenseAttrBlob>,
+    fill_time: FillTime,
+) -> Vec<u8> {
+    let mut w = ObjectHeaderWriter::new();
+    w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
+    w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
+    w.add_message_with_flags(MessageType::FillValue, vec![3, fill_time.to_byte()], 0x01);
+    // VDS layout message: version=4, class=3, global_heap_address(8), global_heap_index=1(4)
+    let mut dl = Vec::new();
+    dl.push(4u8); // version
+    dl.push(3u8); // class = virtual
+    dl.extend_from_slice(&global_heap_addr.to_le_bytes());
+    dl.extend_from_slice(&1u32.to_le_bytes()); // object index 1 in the collection
+    w.add_message(MessageType::DataLayout, dl);
+    if let Some(blob) = dense_blob {
+        w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
+    } else {
+        for attr in attrs {
+            w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
+        }
+    }
+    w.serialize()
+}
+
 fn write_offset(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
     match offset_size {
         2 => buf.extend_from_slice(&(val as u16).to_le_bytes()),
@@ -879,6 +992,8 @@ impl FileWriter {
             fill_time: FillTime,
             compact: bool,
             alignment: usize,
+            /// VDS source mappings (set for Virtual datasets).
+            virtual_sources: Option<Vec<VdsMapping>>,
         }
         struct GrpFlat {
             name: String,
@@ -886,14 +1001,18 @@ impl FileWriter {
             ds_indices: Vec<usize>,
         }
 
-        let mut all_ds: Vec<DsFlat> = Vec::new();
-        let mut groups: Vec<GrpFlat> = Vec::new();
-        let mut root_ds_indices: Vec<usize> = Vec::new();
-
-        for db in self.root_datasets {
+        // Helper: convert a DatasetBuilder into DsFlat, handling VDS (which
+        // does not require a `data` field).
+        let flatten_ds = |db: DatasetBuilder| -> Result<DsFlat, FormatError> {
             let dt = db.datatype.ok_or(FormatError::DatasetMissingData)?;
             let shape = db.shape.ok_or(FormatError::DatasetMissingShape)?;
-            let raw = db.data.ok_or(FormatError::DatasetMissingData)?;
+            let is_vds = db.virtual_sources.is_some();
+            let raw = if is_vds {
+                // VDS datasets have no raw data stored in this file.
+                db.data.unwrap_or_default()
+            } else {
+                db.data.ok_or(FormatError::DatasetMissingData)?
+            };
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {
@@ -918,8 +1037,7 @@ impl FileWriter {
                 };
                 attrs.extend(p.build_attrs(&raw));
             }
-            root_ds_indices.push(all_ds.len());
-            all_ds.push(DsFlat {
+            Ok(DsFlat {
                 name: db.name,
                 dt,
                 ds: dspace,
@@ -930,7 +1048,17 @@ impl FileWriter {
                 fill_time: db.fill_time,
                 compact: db.compact,
                 alignment: db.alignment,
-            });
+                virtual_sources: db.virtual_sources,
+            })
+        };
+
+        let mut all_ds: Vec<DsFlat> = Vec::new();
+        let mut groups: Vec<GrpFlat> = Vec::new();
+        let mut root_ds_indices: Vec<usize> = Vec::new();
+
+        for db in self.root_datasets {
+            root_ds_indices.push(all_ds.len());
+            all_ds.push(flatten_ds(db)?);
         }
 
         for g in self.groups.into_iter() {
@@ -940,46 +1068,8 @@ impl FileWriter {
             }
             let mut ds_idx = Vec::new();
             for db in g.datasets {
-                let dt = db.datatype.ok_or(FormatError::DatasetMissingData)?;
-                let shape = db.shape.ok_or(FormatError::DatasetMissingShape)?;
-                let raw = db.data.ok_or(FormatError::DatasetMissingData)?;
-                let max_dimensions = db.maxshape.clone();
-                let dspace = Dataspace {
-                    space_type: if shape.is_empty() {
-                        DataspaceType::Scalar
-                    } else {
-                        DataspaceType::Simple
-                    },
-                    rank: shape.len() as u8,
-                    dimensions: shape,
-                    max_dimensions,
-                };
-                let mut attrs = Vec::new();
-                for (n, v) in &db.attrs {
-                    attrs.push(build_attr_message(n, v));
-                }
-                #[cfg(feature = "provenance")]
-                if let Some(ref prov) = db.provenance {
-                    let p = crate::provenance::Provenance {
-                        creator: prov.creator.clone(),
-                        timestamp: prov.timestamp.clone(),
-                        source: prov.source.clone(),
-                    };
-                    attrs.extend(p.build_attrs(&raw));
-                }
                 ds_idx.push(all_ds.len());
-                all_ds.push(DsFlat {
-                    name: db.name,
-                    dt,
-                    ds: dspace,
-                    raw,
-                    attrs,
-                    chunk_options: db.chunk_options,
-                    maxshape: db.maxshape,
-                    fill_time: db.fill_time,
-                    compact: db.compact,
-                    alignment: db.alignment,
-                });
+                all_ds.push(flatten_ds(db)?);
             }
             groups.push(GrpFlat {
                 name: g.name,
@@ -993,15 +1083,20 @@ impl FileWriter {
             root_attrs.push(build_attr_message(n, v));
         }
 
+        let is_vds: Vec<bool> = all_ds
+            .iter()
+            .map(|d| d.virtual_sources.is_some())
+            .collect();
         let is_chunked: Vec<bool> = all_ds
             .iter()
-            .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some())
+            .enumerate()
+            .map(|(i, d)| !is_vds[i] && (d.chunk_options.is_chunked() || d.maxshape.is_some()))
             .collect();
         // Determine which datasets use compact storage
         let is_compact: Vec<bool> = all_ds
             .iter()
             .enumerate()
-            .map(|(i, d)| !is_chunked[i] && d.compact && d.raw.len() <= 65535)
+            .map(|(i, d)| !is_vds[i] && !is_chunked[i] && d.compact && d.raw.len() <= 65535)
             .collect();
         let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
         let group_dense: Vec<bool> = groups
@@ -1065,7 +1160,31 @@ impl FileWriter {
         let mut dummy_blobs: Vec<DataBlob> = Vec::new();
         let mut dummy_cursor = 0u64;
         for (i, d) in all_ds.iter().enumerate() {
-            if is_chunked[i] {
+            if is_vds[i] {
+                // VDS: dummy OH with address 0 to get the OH size. The global
+                // heap blob will be placed after the OHs in pass 2.
+                let dense_blob = if ds_dense[i] {
+                    Some(build_dense_attrs(&d.attrs, 0))
+                } else {
+                    None
+                };
+                let oh = build_vds_dataset_oh(
+                    &d.dt,
+                    &d.ds,
+                    0, // dummy address
+                    &d.attrs,
+                    dense_blob.as_ref(),
+                    d.fill_time,
+                );
+                // Global heap blob size is address-independent; compute it now
+                // so pass 2 can place it correctly.
+                let vds_mappings = d.virtual_sources.as_deref().unwrap_or(&[]);
+                let gcol_bytes = build_global_heap_collection(&serialize_vds_mappings(vds_mappings));
+                dummy_blobs.push(DataBlob {
+                    data: gcol_bytes, // store heap blob here temporarily
+                    oh_bytes: oh,
+                });
+            } else if is_chunked[i] {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let elem_size = d.dt.type_size() as usize;
                 let result = build_chunked_data_at_ext(
@@ -1214,7 +1333,25 @@ impl FileWriter {
         let global_align_threshold = self.alignment_threshold;
         let global_align_bytes = self.alignment_bytes;
         for (i, d) in all_ds.iter().enumerate() {
-            if is_chunked[i] {
+            if is_vds[i] {
+                // VDS: place the global heap collection right after the OHs,
+                // then rebuild the OH with the real heap address.
+                let gcol_bytes = &dummy_blobs[i].data; // pre-computed in pass 1
+                let heap_addr = cursor2 as u64;
+                cursor2 += gcol_bytes.len();
+                let oh = build_vds_dataset_oh(
+                    &d.dt,
+                    &d.ds,
+                    heap_addr,
+                    &d.attrs,
+                    ds_dense_blobs[i].as_ref(),
+                    d.fill_time,
+                );
+                ds_blobs2.push(DataBlob {
+                    data: gcol_bytes.clone(),
+                    oh_bytes: oh,
+                });
+            } else if is_chunked[i] {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let elem_size = d.dt.type_size() as usize;
                 let base_address = cursor2 as u64;
@@ -1706,5 +1843,201 @@ mod tests {
         ));
         let err = finalize_parallel(vec![b0, b1]).unwrap_err();
         assert!(matches!(err, FormatError::DuplicateDatasetName(_)));
+    }
+
+    // ---- Virtual Dataset (VDS) round-trip tests ----
+
+    /// Serialize an H5S ALL selection (type=3, version=1, 16 bytes).
+    fn sel_all() -> Vec<u8> {
+        vec![
+            3, 0, 0, 0, // type = ALL
+            1, 0, 0, 0, // version
+            0, 0, 0, 0, // reserved
+            0, 0, 0, 0, // length (unused for ALL)
+        ]
+    }
+
+    /// Serialize an H5S HYPER selection (version 3, rank 1, enc_size 2).
+    /// Encodes start=`start`, stride=1, count=1, block=`block`.
+    fn sel_hyper_1d(start: u16, block: u16) -> Vec<u8> {
+        let mut v = vec![
+            2, 0, 0, 0, // type = HYPER
+            3, 0, 0, 0, // version 3
+            0x01,       // flags = regular
+            0x02,       // enc_size = 2 (u16 per coordinate)
+            1, 0, 0, 0, // rank = 1
+        ];
+        v.extend_from_slice(&start.to_le_bytes()); // start
+        v.extend_from_slice(&1u16.to_le_bytes());  // stride
+        v.extend_from_slice(&1u16.to_le_bytes());  // count
+        v.extend_from_slice(&block.to_le_bytes()); // block
+        v
+    }
+
+    #[test]
+    fn vds_write_read_virtual_layout() {
+        use crate::data_layout::DataLayout;
+
+        // A virtual dataset /vds of shape [8] backed by two same-file sources:
+        // /src_a maps to virtual[0:4] and /src_b maps to virtual[4:8].
+        let mapping_a = VdsMapping {
+            source_file: ".".into(),
+            source_dataset: "src_a".into(),
+            source_selection: sel_all(),
+            virtual_selection: sel_hyper_1d(0, 4),
+        };
+        let mapping_b = VdsMapping {
+            source_file: ".".into(),
+            source_dataset: "src_b".into(),
+            source_selection: sel_all(),
+            virtual_selection: sel_hyper_1d(4, 4),
+        };
+
+        let mut fw = FileWriter::new();
+        // Source datasets (real data in this file)
+        fw.create_dataset("src_a").with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
+        fw.create_dataset("src_b").with_f64_data(&[5.0, 6.0, 7.0, 8.0]);
+        // Virtual dataset
+        fw.create_dataset("vds")
+            .with_shape(&[8])
+            .with_f64_data(&[]) // shape hint; raw data is ignored for VDS
+            .with_virtual_sources(vec![mapping_a, mapping_b]);
+
+        let bytes = fw.finish().unwrap();
+
+        // Verify the virtual dataset resolves to DataLayout::Virtual
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let vds_addr = resolve_path_any(&bytes, &sb, "vds").unwrap();
+        let hdr = ObjectHeader::parse(
+            &bytes,
+            vds_addr as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+
+        let dl_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data;
+
+        let mut layout =
+            DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
+
+        // Before resolution, mappings field is empty.
+        assert!(
+            matches!(layout, DataLayout::Virtual { .. }),
+            "expected Virtual layout, got {layout:?}"
+        );
+
+        // Resolve VDS mappings from the global heap.
+        layout.resolve_vds_mappings(&bytes, sb.length_size).unwrap();
+
+        match &layout {
+            DataLayout::Virtual { mappings, .. } => {
+                assert_eq!(mappings.len(), 2, "expected 2 VDS mappings");
+                assert_eq!(mappings[0].source_file, ".");
+                assert_eq!(mappings[0].source_dataset, "src_a");
+                assert_eq!(mappings[1].source_file, ".");
+                assert_eq!(mappings[1].source_dataset, "src_b");
+
+                // Verify the virtual selections cover [0:4] and [4:8].
+                use crate::selection::Selection;
+                let (vsel_a, _) =
+                    Selection::decode_serialized(&mappings[0].virtual_selection).unwrap();
+                let (vsel_b, _) =
+                    Selection::decode_serialized(&mappings[1].virtual_selection).unwrap();
+                assert_eq!(vsel_a.iter_linear_1d(8).unwrap(), vec![0, 1, 2, 3]);
+                assert_eq!(vsel_b.iter_linear_1d(8).unwrap(), vec![4, 5, 6, 7]);
+            }
+            other => panic!("expected Virtual layout after resolution, got {other:?}"),
+        }
+
+        // Source datasets still readable normally.
+        assert_eq!(read_dataset_f64(&bytes, "src_a"), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read_dataset_f64(&bytes, "src_b"), vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn vds_external_source_file() {
+        use crate::data_layout::DataLayout;
+
+        // A VDS mapping referencing an external file ("other.h5").
+        let mapping_ext = VdsMapping {
+            source_file: "other.h5".into(),
+            source_dataset: "data".into(),
+            source_selection: sel_all(),
+            virtual_selection: sel_all(),
+        };
+
+        let mut fw = FileWriter::new();
+        fw.create_dataset("ext_vds")
+            .with_shape(&[10])
+            .with_f64_data(&[]) // shape hint only
+            .with_virtual_sources(vec![mapping_ext]);
+
+        let bytes = fw.finish().unwrap();
+
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let addr = resolve_path_any(&bytes, &sb, "ext_vds").unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let dl_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data;
+        let mut layout =
+            DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
+        layout.resolve_vds_mappings(&bytes, sb.length_size).unwrap();
+
+        match &layout {
+            DataLayout::Virtual { mappings, .. } => {
+                assert_eq!(mappings.len(), 1);
+                assert_eq!(mappings[0].source_file, "other.h5");
+                assert_eq!(mappings[0].source_dataset, "data");
+            }
+            other => panic!("expected Virtual, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vds_empty_mapping_list() {
+        use crate::data_layout::DataLayout;
+
+        let mut fw = FileWriter::new();
+        fw.create_dataset("empty_vds")
+            .with_shape(&[0])
+            .with_f64_data(&[])
+            .with_virtual_sources(vec![]);
+
+        let bytes = fw.finish().unwrap();
+
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let addr = resolve_path_any(&bytes, &sb, "empty_vds").unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let dl_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data;
+        let mut layout =
+            DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
+        layout.resolve_vds_mappings(&bytes, sb.length_size).unwrap();
+
+        match &layout {
+            DataLayout::Virtual { mappings, .. } => {
+                assert_eq!(mappings.len(), 0, "expected empty mappings for zero-mapping VDS");
+            }
+            other => panic!("expected Virtual, got {other:?}"),
+        }
     }
 }

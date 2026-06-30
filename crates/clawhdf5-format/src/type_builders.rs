@@ -7,6 +7,7 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::ChunkOptions;
+use crate::data_layout::VdsMapping;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
@@ -362,6 +363,12 @@ pub struct DatasetBuilder {
     pub(crate) compact: bool,
     /// Per-dataset alignment in bytes (0 = no special alignment).
     pub(crate) alignment: usize,
+    /// Virtual Dataset (VDS) source mappings.
+    ///
+    /// When set, this dataset uses Virtual Dataset layout (v4 class 3). The
+    /// `data` field is ignored; instead the global heap blob is built from
+    /// these mappings and a VDS layout message is emitted.
+    pub(crate) virtual_sources: Option<Vec<VdsMapping>>,
     #[cfg(feature = "provenance")]
     pub(crate) provenance: Option<ProvenanceConfig>,
 }
@@ -379,6 +386,7 @@ impl DatasetBuilder {
             fill_time: FillTime::default(),
             compact: false,
             alignment: 0,
+            virtual_sources: None,
             #[cfg(feature = "provenance")]
             provenance: None,
         }
@@ -583,6 +591,20 @@ impl DatasetBuilder {
     /// is a multiple of `bytes`. Useful for page-aligned I/O (e.g., 4096).
     pub fn align(&mut self, bytes: usize) -> &mut Self {
         self.alignment = bytes;
+        self
+    }
+
+    /// Configure this dataset as a Virtual Dataset (VDS).
+    ///
+    /// The supplied `mappings` list describes each source → virtual region
+    /// correspondence. The dataset will use HDF5 layout class 3 (Virtual).
+    /// Any previously set `data` is ignored when virtual sources are present.
+    ///
+    /// `datatype` and `shape` must still be set via `with_*_data()` or
+    /// `with_shape()` / `with_f64_data()` etc.; the actual raw bytes are
+    /// not written for VDS datasets.
+    pub fn with_virtual_sources(&mut self, mappings: Vec<VdsMapping>) -> &mut Self {
+        self.virtual_sources = Some(mappings);
         self
     }
 
