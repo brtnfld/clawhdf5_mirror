@@ -48,9 +48,14 @@ fn szip_decode_impl(data: &[u8], cd: &[u32], chunk_size: usize) -> Result<Vec<u8
             "szip: unknown output size".into(),
         ));
     }
+    if data.is_empty() {
+        return Err(FormatError::ChunkedReadError(
+            "szip: empty input".into(),
+        ));
+    }
+
     // Map HDF5 options mask to libaec flags.
     // bit 2 (0x04): NN (nearest-neighbor) preprocessing
-    // bit 5 (0x20): EC (entropy coding) — handled internally by libaec
     // bit 6 (0x40): LSB order; absence means MSB
     // bit 8 (0x100): allow k=13
     let mut flags: u32 = 0;
@@ -64,25 +69,25 @@ fn szip_decode_impl(data: &[u8], cd: &[u32], chunk_size: usize) -> Result<Vec<u8
         flags |= libaec_sys::AEC_ALLOW_K13;
     }
 
-    let mut out_len: usize = chunk_size;
     let mut out = vec![0u8; chunk_size];
-    let result = unsafe {
-        libaec_sys::aec_buffer_decode(
-            data.as_ptr(),
-            data.len(),
-            out.as_mut_ptr(),
-            &mut out_len,
-            bits_per_sample,
-            pixels_per_block,
-            flags,
-        )
-    };
+    let mut strm = libaec_sys::AecStream::zeroed();
+    strm.next_in = data.as_ptr();
+    strm.avail_in = data.len();
+    strm.next_out = out.as_mut_ptr();
+    strm.avail_out = chunk_size;
+    strm.bits_per_sample = bits_per_sample;
+    strm.block_size = pixels_per_block;
+    strm.rsi = 128; // HDF5 default: 128 blocks per reference sample interval
+    strm.flags = flags;
+
+    let result = unsafe { libaec_sys::aec_buffer_decode(&mut strm) };
     if result != 0 {
         return Err(FormatError::DecompressionError(format!(
             "szip: libaec error {result}"
         )));
     }
-    out.truncate(out_len);
+    let decoded_len = chunk_size - strm.avail_out;
+    out.truncate(decoded_len);
     Ok(out)
 }
 
