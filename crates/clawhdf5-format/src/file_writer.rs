@@ -805,30 +805,14 @@ fn serialize_attribute_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
 
 // ---- VDS helpers ----
 
-/// Serialize VDS mappings into the on-disk format stored in the global heap.
+/// Serialize VDS mappings for storage in a global heap object.
 ///
-/// Layout (version 1, same-file references):
-/// ```text
-/// version(1) · nused(8, LE) · entry[nused]
-/// ```
-/// Each entry: same-file marker(0x04) · source_dataset\0 · source_sel · virtual_sel
+/// Delegates to `data_layout_write::serialize_vds_mappings` (the canonical
+/// implementation with full version/external-file handling), then appends a
+/// trailing 4-byte Jenkins lookup3 checksum that parsers skip after consuming
+/// all `nused` entries.
 pub(crate) fn serialize_vds_mappings(mappings: &[VdsMapping]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.push(1u8); // block version 1 (same-file marker for "." source_file)
-    buf.extend_from_slice(&(mappings.len() as u64).to_le_bytes()); // nused
-    for m in mappings {
-        if m.source_file == "." {
-            buf.push(0x04); // same-file marker
-        } else {
-            buf.extend_from_slice(m.source_file.as_bytes());
-            buf.push(0); // null terminator
-        }
-        buf.extend_from_slice(m.source_dataset.as_bytes());
-        buf.push(0); // null terminator
-        buf.extend_from_slice(&m.source_selection);
-        buf.extend_from_slice(&m.virtual_selection);
-    }
-    // Checksum (4 bytes at end; parsers skip it after reaching nused entries)
+    let mut buf = crate::data_layout_write::serialize_vds_mappings(mappings, 8);
     let cksum = crate::checksum::jenkins_lookup3(&buf);
     buf.extend_from_slice(&cksum.to_le_bytes());
     buf

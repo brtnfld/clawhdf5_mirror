@@ -1,15 +1,16 @@
 //! Raw FFI bindings to libaec (Adaptive Entropy Coding library).
 //!
-//! Exposes the `aec_buffer_decode` one-shot convenience function via
-//! the `AecStream` control structure, matching the libaec C API.
+//! Exposes `aec_buffer_encode` and `aec_buffer_decode` via the `AecStream`
+//! control structure, matching the libaec C API defined in `<libaec.h>`.
 
 use std::os::raw::c_void;
 
-// AEC flag constants matching aec.h
-pub const AEC_DATA_PREPROCESS: u32 = 1; // NN preprocessing
-pub const AEC_DATA_MSB: u32 = 2; // big-endian sample order
-pub const AEC_RESTRICTED: u32 = 4; // restricted coding set
-pub const AEC_ALLOW_K13: u32 = 8; // allow k=13 option
+// AEC flag constants — values match <libaec.h> exactly.
+pub const AEC_DATA_SIGNED: u32 = 1;
+pub const AEC_DATA_3BYTE: u32 = 2;
+pub const AEC_DATA_MSB: u32 = 4;
+pub const AEC_DATA_PREPROCESS: u32 = 8;
+pub const AEC_RESTRICTED: u32 = 16;
 
 /// Mirror of `struct aec_stream` from `<libaec.h>`.
 ///
@@ -50,6 +51,13 @@ impl AecStream {
 }
 
 unsafe extern "C" {
+    /// One-shot compression.  Returns `AEC_OK` (0) on success.
+    ///
+    /// # Safety
+    /// `strm.next_in` must be valid for `strm.avail_in` bytes;
+    /// `strm.next_out` must be valid for `strm.avail_out` bytes.
+    pub fn aec_buffer_encode(strm: *mut AecStream) -> i32;
+
     /// One-shot decompression.  Returns `AEC_OK` (0) on success.
     ///
     /// # Safety
@@ -63,9 +71,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constants_are_correct() {
-        assert_eq!(AEC_DATA_PREPROCESS, 1);
-        assert_eq!(AEC_DATA_MSB, 2);
+    fn constants_match_libaec_header() {
+        assert_eq!(AEC_DATA_SIGNED, 1);
+        assert_eq!(AEC_DATA_3BYTE, 2);
+        assert_eq!(AEC_DATA_MSB, 4);
+        assert_eq!(AEC_DATA_PREPROCESS, 8);
+        assert_eq!(AEC_RESTRICTED, 16);
     }
 
     #[test]
