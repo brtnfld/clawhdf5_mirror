@@ -281,6 +281,8 @@ pub mod mmap;
 #[cfg(feature = "mmap")]
 pub use mmap::{MmapReadWrite, MmapReader};
 
+pub mod mpi_vol;
+pub use mpi_vol::MpiVol;
 pub mod prefetch;
 pub mod subfiling;
 pub mod sweep;

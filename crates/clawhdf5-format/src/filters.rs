@@ -9,7 +9,7 @@ use alloc::{vec, vec::Vec};
 use crate::error::FormatError;
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
-    FILTER_ZSTD, FilterPipeline,
+    FILTER_SZIP, FILTER_ZSTD, FilterPipeline,
 };
 
 /// Apply a filter pipeline to decompress a chunk.
@@ -33,6 +33,7 @@ pub fn decompress_chunk(
             // decoders can reject an element count that would over-allocate.
             FILTER_SCALEOFFSET => scaleoffset_decompress(&data, &filter.client_data, chunk_size)?,
             FILTER_NBIT => nbit_decompress(&data, &filter.client_data, chunk_size)?,
+            FILTER_SZIP => crate::filters_szip::szip_decompress(&data, &filter.client_data, chunk_size)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -71,29 +72,28 @@ pub fn compress_chunk(
 
 /// Decode the HDF5 scale-offset filter (id 6).
 ///
-/// Supports the integer variant (`H5Z_SO_INT`) and the floating-point
-/// **D-scale** variant (`H5Z_SO_FLOAT_DSCALE`); the float E-scale variant is
-/// reported as unsupported.
+/// Supports all three scale-offset variants:
+/// - `H5Z_SO_FLOAT_DSCALE` (0): `value = minval + code / 10^D`
+/// - `H5Z_SO_FLOAT_ESCALE` (1): `value = minval + code * 2^E`
+/// - `H5Z_SO_INT` (2): `value = minval + code`
 ///
-/// Compressed buffer layout (reverse-engineered against HDF5 2.0 and verified
-/// across signed/unsigned int sizes, f32/f64, negatives, fill values and chunk
-/// sizes): `minbits` (u32 LE) · `minval_width` (1 byte) · `minval`
-/// (`minval_width` bytes — a little-endian integer for the int variant, or the
-/// minimum float for D-scale) · 8 reserved bytes · MSB-first packed codes
-/// (`nelmts * minbits` bits). The all-ones code is reserved for the (defined)
-/// fill value. Integer reconstruction is `value = minval + code`; D-scale float
-/// is `value = minval + code / 10^scale_factor`.
+/// Compressed buffer layout: `minbits` (u32 LE) · `minval_width` (1 byte)
+/// · `minval` (`minval_width` bytes) · 8 reserved bytes · MSB-first packed
+/// codes (`nelmts * minbits` bits). The all-ones code is reserved for the
+/// defined fill value.
 ///
-/// `cd` is the `H5Zscaleoffset.c` parameter block: `[0]`=scale type
-/// (0 = float D-scale, 2 = integer), `[1]`=scale factor (decimal digits for
-/// D-scale), `[2]`=element count, `[4]`=element size, `[5]`=signed flag,
-/// `[6]`=byte order (1 = big-endian), `[7]`=fill defined, `[8..]`=fill value.
+/// `cd` is the `H5Zscaleoffset.c` parameter block: `[0]`=scale type,
+/// `[1]`=scale factor (decimal digits D for D-scale, binary exponent E for
+/// E-scale, interpreted as i32 for negative exponents), `[2]`=element count,
+/// `[4]`=element size, `[5]`=signed flag, `[6]`=byte order (1 = big-endian),
+/// `[7]`=fill defined, `[8..]`=fill value bits.
 fn scaleoffset_decompress(
     data: &[u8],
     cd: &[u32],
     expected_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
     const H5Z_SO_FLOAT_DSCALE: u32 = 0;
+    const H5Z_SO_FLOAT_ESCALE: u32 = 1;
     const H5Z_SO_INT: u32 = 2;
     if cd.len() < 8 {
         return Err(FormatError::ChunkedReadError(
@@ -101,9 +101,8 @@ fn scaleoffset_decompress(
         ));
     }
     let scale_type = cd[0];
-    let is_float = scale_type == H5Z_SO_FLOAT_DSCALE;
+    let is_float = scale_type == H5Z_SO_FLOAT_DSCALE || scale_type == H5Z_SO_FLOAT_ESCALE;
     if scale_type != H5Z_SO_INT && !is_float {
-        // Float E-scale (scale type 1) uses a different algorithm.
         return Err(FormatError::UnsupportedFilter(FILTER_SCALEOFFSET));
     }
     let nelmts = cd[2] as usize;
@@ -190,7 +189,8 @@ fn scaleoffset_decompress(
     };
 
     if is_float {
-        let scale = 10f64.powi(cd[1] as i32);
+        let is_escale = scale_type == H5Z_SO_FLOAT_ESCALE;
+        let scale_factor = cd[1] as i32;
         let minval = read_le_float(minval_bytes, elem_size);
         let fill_value = if fill_defined {
             let lo = *cd.get(8).unwrap_or(&0) as u64;
@@ -204,8 +204,10 @@ fn scaleoffset_decompress(
             .map(|&code| {
                 if has_fill_code && code == fill_code {
                     fill_value
+                } else if is_escale {
+                    minval + code as f64 * 2f64.powi(scale_factor)
                 } else {
-                    minval + code as f64 / scale
+                    minval + code as f64 / 10f64.powi(scale_factor)
                 }
             })
             .collect();
@@ -1289,15 +1291,46 @@ mod tests {
         }
     }
 
+    fn as_f64(bytes: &[u8]) -> Vec<f64> {
+        bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
     #[test]
-    fn scaleoffset_float_escale_unsupported() {
-        // scale_type 1 = float E-scale — a different algorithm, must be rejected.
-        let cd = [1u32, 3, 50, 1, 4, 0, 0, 1, 0];
-        let raw = [0u8; 24];
-        assert!(matches!(
-            scaleoffset_decompress(&raw, &cd, 0),
-            Err(FormatError::UnsupportedFilter(FILTER_SCALEOFFSET))
-        ));
+    fn scaleoffset_float_escale_e1() {
+        // f64 [0.0, 2.0, 4.0, 6.0], E=1 (×2^1=2), fill_defined=0.
+        // cd: scale_type=1, E=1, nelmts=4, elem_size=8.
+        let cd = [1u32, 1, 4, 0, 8, 0, 0, 0];
+        let raw: &[u8] = &[
+            2, 0, 0, 0, // minbits=2
+            8,          // minval_width=8
+            0, 0, 0, 0, 0, 0, 0, 0, // minval=0.0f64
+            0, 0, 0, 0, 0, 0, 0, 0, // 8 reserved bytes
+            0x1B, // packed codes: 00 01 10 11 MSB-first
+        ];
+        let got = as_f64(&scaleoffset_decompress(raw, &cd, 0).unwrap());
+        assert_eq!(got, vec![0.0, 2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn scaleoffset_float_escale_neg_exp() {
+        // f64 [0.0, 0.5, 1.0, 1.5], E=-1 (×2^-1=0.5), fill_defined=0.
+        // cd[1] = 0xFFFF_FFFF which casts to i32 = -1.
+        let cd = [1u32, 0xFFFF_FFFF, 4, 0, 8, 0, 0, 0];
+        let raw: &[u8] = &[
+            2, 0, 0, 0, // minbits=2
+            8,          // minval_width=8
+            0, 0, 0, 0, 0, 0, 0, 0, // minval=0.0f64
+            0, 0, 0, 0, 0, 0, 0, 0, // 8 reserved bytes
+            0x1B, // packed codes: 00 01 10 11 MSB-first
+        ];
+        let got = as_f64(&scaleoffset_decompress(raw, &cd, 0).unwrap());
+        let exp = [0.0f64, 0.5, 1.0, 1.5];
+        for (g, e) in got.iter().zip(exp.iter()) {
+            assert!((g - e).abs() < 1e-9, "got {g} expected {e}");
+        }
     }
 
     // --- N-Bit (filter id 5) --------------------------------------------------

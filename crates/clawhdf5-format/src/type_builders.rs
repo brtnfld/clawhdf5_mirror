@@ -602,9 +602,12 @@ impl DatasetBuilder {
     ///
     /// `datatype` and `shape` must still be set via `with_*_data()` or
     /// `with_shape()` / `with_f64_data()` etc.; the actual raw bytes are
-    /// not written for VDS datasets.
+    /// not written for VDS datasets. A non-empty `mappings` list is required;
+    /// an empty list is silently ignored (no VDS layout is written).
     pub fn with_virtual_sources(&mut self, mappings: Vec<VdsMapping>) -> &mut Self {
-        self.virtual_sources = Some(mappings);
+        if !mappings.is_empty() {
+            self.virtual_sources = Some(mappings);
+        }
         self
     }
 
@@ -635,6 +638,8 @@ pub struct GroupBuilder {
     pub(crate) name: String,
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) attrs: Vec<(String, AttrValue)>,
+    /// (link_name, target_file, target_path)
+    pub(crate) external_links: Vec<(String, String, String)>,
 }
 
 impl GroupBuilder {
@@ -643,6 +648,7 @@ impl GroupBuilder {
             name: name.to_string(),
             datasets: Vec::new(),
             attrs: Vec::new(),
+            external_links: Vec::new(),
         }
     }
 
@@ -655,12 +661,28 @@ impl GroupBuilder {
         self.attrs.push((name.to_string(), value));
     }
 
+    /// Add an external link: a named pointer to an object in another HDF5 file.
+    pub fn add_external_link(
+        &mut self,
+        name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> &mut Self {
+        self.external_links.push((
+            name.to_string(),
+            target_file.to_string(),
+            target_path.to_string(),
+        ));
+        self
+    }
+
     /// Consume the builder, returning a FinishedGroup to add to FileWriter.
     pub fn finish(self) -> FinishedGroup {
         FinishedGroup {
             name: self.name,
             datasets: self.datasets,
             attrs: self.attrs,
+            external_links: self.external_links,
         }
     }
 }
@@ -670,4 +692,6 @@ pub struct FinishedGroup {
     pub(crate) name: String,
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) attrs: Vec<(String, AttrValue)>,
+    /// (link_name, target_file, target_path)
+    pub(crate) external_links: Vec<(String, String, String)>,
 }

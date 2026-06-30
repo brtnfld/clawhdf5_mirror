@@ -170,6 +170,18 @@ pub(crate) fn make_link(name: &str, addr: u64) -> LinkMessage {
     }
 }
 
+pub(crate) fn make_external_link(name: &str, filename: &str, object_path: &str) -> LinkMessage {
+    LinkMessage {
+        name: name.to_string(),
+        link_target: LinkTarget::External {
+            filename: filename.to_string(),
+            object_path: object_path.to_string(),
+        },
+        creation_order: None,
+        charset: CharacterSet::Ascii,
+    }
+}
+
 // ---- Dense attribute blob ----
 
 /// Pre-built dense attribute storage (fractal heap + B-tree v2 + attribute info message).
@@ -999,6 +1011,8 @@ impl FileWriter {
             name: String,
             attrs: Vec<AttributeMessage>,
             ds_indices: Vec<usize>,
+            /// (link_name, target_file, target_path)
+            external_links: Vec<(String, String, String)>,
         }
 
         // Helper: convert a DatasetBuilder into DsFlat, handling VDS (which
@@ -1075,6 +1089,7 @@ impl FileWriter {
                 name: g.name,
                 attrs: gattrs,
                 ds_indices: ds_idx,
+                external_links: g.external_links,
             });
         }
 
@@ -1114,7 +1129,7 @@ impl FileWriter {
         let root_links_dense = root_link_count > DENSE_LINK_THRESHOLD;
         let group_links_dense: Vec<bool> = groups
             .iter()
-            .map(|g| g.ds_indices.len() > DENSE_LINK_THRESHOLD)
+            .map(|g| g.ds_indices.len() + g.external_links.len() > DENSE_LINK_THRESHOLD)
             .collect();
         // The dense LinkInfo message is a fixed size regardless of address, so a
         // dummy is sufficient for OH size computation.
@@ -1125,11 +1140,14 @@ impl FileWriter {
             .iter()
             .enumerate()
             .map(|(gi, g)| {
-                let dummy_links: Vec<LinkMessage> = g
+                let mut dummy_links: Vec<LinkMessage> = g
                     .ds_indices
                     .iter()
                     .map(|&i| make_link(&all_ds[i].name, 0))
                     .collect();
+                for (lname, fname, opath) in &g.external_links {
+                    dummy_links.push(make_external_link(lname, fname, opath));
+                }
                 let attr_blob = group_dense[gi].then(|| build_dense_attrs(&g.attrs, 0));
                 let dl = group_links_dense[gi].then_some(dummy_link_info.as_slice());
                 build_group_oh(&dummy_links, dl, &g.attrs, attr_blob.as_ref()).len()
@@ -1289,11 +1307,14 @@ impl FileWriter {
                 let addr = cursor2 as u64;
                 cursor2 += sz;
                 if group_links_dense[gi] {
-                    let dummy_links: Vec<LinkMessage> = groups[gi]
+                    let mut dummy_links: Vec<LinkMessage> = groups[gi]
                         .ds_indices
                         .iter()
                         .map(|&i| make_link(&all_ds[i].name, 0))
                         .collect();
+                    for (lname, fname, opath) in &groups[gi].external_links {
+                        dummy_links.push(make_external_link(lname, fname, opath));
+                    }
                     let blob_addr = cursor2 as u64;
                     cursor2 += build_dense_links(&dummy_links, blob_addr).blob.len();
                     group_link_blob_addrs.push(Some(blob_addr));
@@ -1470,11 +1491,14 @@ impl FileWriter {
 
         // Group OHs + dense blobs (link blob, then attr blob, matching pass 2)
         for (gi, g) in groups.iter().enumerate() {
-            let links: Vec<LinkMessage> = g
+            let mut links: Vec<LinkMessage> = g
                 .ds_indices
                 .iter()
                 .map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i]))
                 .collect();
+            for (lname, fname, opath) in &g.external_links {
+                links.push(make_external_link(lname, fname, opath));
+            }
             let link_blob = group_link_blob_addrs[gi].map(|addr| build_dense_links(&links, addr));
             let dl = link_blob.as_ref().map(|b| b.link_info_message.as_slice());
             buf.extend_from_slice(&build_group_oh(
@@ -2008,6 +2032,8 @@ mod tests {
 
     #[test]
     fn vds_empty_mapping_list() {
+        // Calling with_virtual_sources([]) is silently ignored — the dataset
+        // falls back to a normal contiguous layout rather than writing an empty VDS.
         use crate::data_layout::DataLayout;
 
         let mut fw = FileWriter::new();
@@ -2029,15 +2055,51 @@ mod tests {
             .find(|m| m.msg_type == MessageType::DataLayout)
             .unwrap()
             .data;
-        let mut layout =
-            DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
-        layout.resolve_vds_mappings(&bytes, sb.length_size).unwrap();
+        let layout = DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
 
-        match &layout {
-            DataLayout::Virtual { mappings, .. } => {
-                assert_eq!(mappings.len(), 0, "expected empty mappings for zero-mapping VDS");
+        // Empty mapping list → no VDS layout; should be Contiguous or Compact.
+        assert!(
+            !matches!(layout, DataLayout::Virtual { .. }),
+            "empty with_virtual_sources should NOT produce a VDS layout, got {layout:?}"
+        );
+    }
+
+    #[test]
+    fn external_link_write_roundtrip() {
+        let mut fw = FileWriter::new();
+        let mut grp = fw.create_group("sensors");
+        grp.create_dataset("local_ds").with_f64_data(&[1.0, 2.0]);
+        grp.add_external_link("remote_temp", "other_file.h5", "/temperature");
+        fw.add_group(grp.finish());
+
+        let bytes = fw.finish().unwrap();
+
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let sensors_addr = resolve_path_any(&bytes, &sb, "sensors").unwrap();
+        let hdr = ObjectHeader::parse(
+            &bytes,
+            sensors_addr as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+
+        // Find the external LinkMessage directly in the object header.
+        let ext_link = hdr
+            .messages
+            .iter()
+            .filter(|m| m.msg_type == MessageType::Link)
+            .filter_map(|m| crate::link_message::LinkMessage::parse(&m.data, sb.offset_size).ok())
+            .find(|l| l.name == "remote_temp")
+            .expect("external link 'remote_temp' not found in group OH");
+
+        match &ext_link.link_target {
+            crate::link_message::LinkTarget::External { filename, object_path } => {
+                assert_eq!(filename, "other_file.h5");
+                assert_eq!(object_path, "/temperature");
             }
-            other => panic!("expected Virtual, got {other:?}"),
+            other => panic!("expected External link, got {other:?}"),
         }
     }
 }
