@@ -55,7 +55,8 @@ serde_json = "1"
 tempfile = "3"
 # Optional: libhdf5 C wrapper for side-by-side comparison (requires system libhdf5).
 # Enable with: cargo bench -p clawhdf5-bench --features libhdf5-compare
-hdf5 = { version = "0.8", optional = true }
+# Uses hdf5-metno (fork of hdf5 crate) which supports HDF5 1.14.x.
+hdf5 = { version = "0.12", optional = true, package = "hdf5-metno" }
 
 [dev-dependencies]
 clawhdf5 = { path = "../clawhdf5" }

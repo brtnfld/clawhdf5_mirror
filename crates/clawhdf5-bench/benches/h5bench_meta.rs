@@ -49,7 +49,7 @@ fn bench_metadata_attrs_write(c: &mut Criterion) {
                 ds.write(&[1.0f64, 2.0, 3.0]).unwrap();
                 for i in 0..k {
                     ds.new_attr::<i64>()
-                        .create(&format!("attr_{i:04}"))
+                        .create(format!("attr_{i:04}").as_str())
                         .unwrap()
                         .write_scalar(&(i as i64))
                         .unwrap();
@@ -137,7 +137,7 @@ fn bench_metadata_groups_create(c: &mut Criterion) {
                         .shape([1])
                         .create("x")
                         .unwrap()
-                        .write_scalar(&0.0f64)
+                        .write(&[0.0f64])
                         .unwrap();
                 }
             });

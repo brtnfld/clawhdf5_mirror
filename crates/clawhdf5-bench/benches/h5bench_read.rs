@@ -68,10 +68,19 @@ fn bench_read_sequential(c: &mut Criterion) {
         });
 
         #[cfg(feature = "libhdf5-compare")]
-        group.bench_with_input(BenchmarkId::new("libhdf5", n), &bytes, |b, raw| {
+        group.bench_with_input(BenchmarkId::new("libhdf5", n), &n, |b, &nn| {
             let tmp = TempDir::new().unwrap();
             let path = tmp.path().join("seq_libhdf5.h5");
-            std::fs::write(&path, raw).unwrap();
+            let data: Vec<f32> = (0..nn).map(|i| i as f32 * 0.001).collect();
+            {
+                let lf = hdf5::File::create(&path).unwrap();
+                let lds = lf
+                    .new_dataset::<f32>()
+                    .shape([nn])
+                    .create("data")
+                    .unwrap();
+                lds.write(data.as_slice()).unwrap();
+            }
             b.iter(|| {
                 let file = hdf5::File::open(&path).unwrap();
                 let ds = file.dataset("data").unwrap();

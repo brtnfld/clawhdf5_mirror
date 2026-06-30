@@ -394,3 +394,54 @@ cargo run --release --bin footprint_bench
 cargo run --release --bin consolidation_efficiency
 cargo run --release --bin ephemeral_perf
 ```
+
+---
+
+## h5bench-Equivalent I/O Benchmarks
+
+Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 C library).  
+**Run:** `cargo bench -p clawhdf5-bench`  
+**Date:** 2026-06-30 · same system as above.
+
+### Sequential Read Throughput
+
+| Workload | n=1K | n=10K | n=100K |
+|----------|------|-------|--------|
+| read_sequential (f32) | 634 ns / **5.9 GiB/s** | 2.44 µs / **15.3 GiB/s** | 24.5 µs / **15.2 GiB/s** |
+| read_f64_sequential (f64) | 743 ns / **10.0 GiB/s** | 4.17 µs / **17.8 GiB/s** | 43.3 µs / **17.2 GiB/s** |
+| read_from_disk (f64, OS I/O) | — | 10.1 µs / **7.4 GiB/s** | 77.6 µs / **9.6 GiB/s** |
+| read_hyperslab (f64, 10% slice) | — | 4.09 µs / **1.8 GiB/s** | 50.1 µs / **1.5 GiB/s** |
+
+### Chunked Read Throughput
+
+| Matrix size | Latency | Throughput |
+|-------------|---------|-----------|
+| 64×64 f32 | 6.39 µs | **2.4 GiB/s** |
+| 256×256 f32 | 41.7 µs | **5.9 GiB/s** |
+| 512×512 f32 | 176 µs | **5.5 GiB/s** |
+
+### Sequential Write Throughput
+
+| Workload | n=1K | n=10K | n=100K |
+|----------|------|-------|--------|
+| write_1d_contiguous (f32) | 9.99 µs / **382 MiB/s** | 26.2 µs / **1.42 GiB/s** | 203 µs / **1.83 GiB/s** |
+| write_f64_batch (f64 embeddings) | 6.68 µs (n=128) | 9.67 µs (n=512) / **404 MiB/s** | 11.1 µs (n=1K) / **704 MiB/s** |
+
+### Chunked Write (deflate level 6)
+
+| Matrix size | Latency | Throughput |
+|-------------|---------|-----------|
+| 32×32 f32 | 19.6 µs | 199 MiB/s |
+| 128×128 f32 | 164 µs | 381 MiB/s |
+| 512×512 f32 | 3.15 ms | 318 MiB/s |
+
+### Metadata Throughput
+
+| Workload | k=4 | k=16 | k=64 | k=128 |
+|----------|-----|------|------|-------|
+| attrs_write (i64) | 8.05 µs / 494 Kop/s | 17.2 µs / 932 Kop/s | 49.2 µs / 1.30 Mop/s | 87.3 µs / 1.47 Mop/s |
+| attrs_read | 1.06 µs / 3.78 Mop/s | 3.64 µs / 4.39 Mop/s | 15.7 µs / 4.08 Mop/s | 31.3 µs / 4.09 Mop/s |
+| string_attrs (write+read) | 5.17 µs / 774 Kop/s | 16.5 µs / 967 Kop/s | 33.6 µs / 951 Kop/s | — |
+| groups_create | 12.1 µs / 330 Kop/s | 33.7 µs / 475 Kop/s | 66.7 µs / 480 Kop/s | 121 µs / 528 Kop/s (k=64) |
+| groups_traverse | 664 ns / 6.03 Mop/s | 3.55 µs / 4.50 Mop/s | 4.87 µs / 6.58 Mop/s (k=32) | 10.6 µs / 6.04 Mop/s |
+| multi_dataset_write | 10.1 µs / 397 Kop/s | 31.5 µs / 508 Kop/s | 104 µs / 614 Kop/s | — |
