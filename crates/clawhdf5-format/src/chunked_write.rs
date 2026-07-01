@@ -34,7 +34,11 @@ pub struct ChunkOptions {
     /// Deflate compression level (0-9), None = no deflate.
     pub deflate_level: Option<u32>,
     /// Whether to apply shuffle filter before compression.
+    /// If `false` AND compression is enabled AND `no_shuffle` is `false`,
+    /// shuffle is auto-applied (matches h5py default behavior).
     pub shuffle: bool,
+    /// Disable the automatic shuffle pre-filter. Set via `without_shuffle()`.
+    pub no_shuffle: bool,
     /// Whether to apply fletcher32 checksum.
     pub fletcher32: bool,
     /// Whether to use LZ4 compression (filter ID 32004).
@@ -61,7 +65,15 @@ impl ChunkOptions {
     pub fn build_pipeline(&self, element_size: u32) -> Option<FilterPipeline> {
         let mut filters = Vec::new();
 
-        if self.shuffle {
+        let has_compression = self.deflate_level.is_some()
+            || self.zstd_level.is_some()
+            || self.lz4
+            || self.pcodec;
+
+        // Shuffle before compression. Applied if explicitly requested OR if compression
+        // is active and the caller hasn't disabled it — matches h5py default behavior
+        // and implements TDT byte-grouping (arXiv:2506.18062) for free.
+        if self.shuffle || (has_compression && !self.no_shuffle) {
             filters.push(FilterDescription {
                 filter_id: FILTER_SHUFFLE,
                 name: None,
@@ -1127,8 +1139,23 @@ mod tests {
 
     #[test]
     fn chunk_options_pipeline_deflate() {
+        // Auto-shuffle is applied before compression by default (matches h5py).
         let options = ChunkOptions {
             deflate_level: Some(6),
+            ..Default::default()
+        };
+        let pl = options.build_pipeline(8).unwrap();
+        assert_eq!(pl.filters.len(), 2);
+        assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
+        assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);
+    }
+
+    #[test]
+    fn chunk_options_pipeline_deflate_no_shuffle() {
+        // Users can opt out of auto-shuffle with no_shuffle = true.
+        let options = ChunkOptions {
+            deflate_level: Some(6),
+            no_shuffle: true,
             ..Default::default()
         };
         let pl = options.build_pipeline(8).unwrap();
@@ -1138,25 +1165,29 @@ mod tests {
 
     #[test]
     fn chunk_options_pipeline_lz4() {
+        // Auto-shuffle before LZ4.
         let options = ChunkOptions {
             lz4: true,
             ..Default::default()
         };
         let pl = options.build_pipeline(8).unwrap();
-        assert_eq!(pl.filters.len(), 1);
-        assert_eq!(pl.filters[0].filter_id, FILTER_LZ4);
+        assert_eq!(pl.filters.len(), 2);
+        assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
+        assert_eq!(pl.filters[1].filter_id, FILTER_LZ4);
     }
 
     #[test]
     fn chunk_options_pipeline_zstd() {
+        // Auto-shuffle before Zstd.
         let options = ChunkOptions {
             zstd_level: Some(3),
             ..Default::default()
         };
         let pl = options.build_pipeline(8).unwrap();
-        assert_eq!(pl.filters.len(), 1);
-        assert_eq!(pl.filters[0].filter_id, FILTER_ZSTD);
-        assert_eq!(pl.filters[0].client_data, vec![3]);
+        assert_eq!(pl.filters.len(), 2);
+        assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
+        assert_eq!(pl.filters[1].filter_id, FILTER_ZSTD);
+        assert_eq!(pl.filters[1].client_data, vec![3]);
     }
 
     #[test]
@@ -1167,8 +1198,10 @@ mod tests {
             ..Default::default()
         };
         let pl = options.build_pipeline(8).unwrap();
-        assert_eq!(pl.filters.len(), 1);
-        assert_eq!(pl.filters[0].filter_id, FILTER_ZSTD);
+        // shuffle + zstd (deflate is ignored when zstd wins priority)
+        assert_eq!(pl.filters.len(), 2);
+        assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
+        assert_eq!(pl.filters[1].filter_id, FILTER_ZSTD);
     }
 
     #[test]

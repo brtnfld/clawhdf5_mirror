@@ -401,7 +401,7 @@ cargo run --release --bin ephemeral_perf
 
 Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 C library).  
 **Run:** `cargo bench -p clawhdf5-bench`  
-**Date:** 2026-06-30 · same system as above · post write-performance improvements (chunk-cache, SIMD shuffle, Zstd codec, owned-Vec IO).
+**Date:** 2026-07-01 · same system as above · post write-performance improvements (chunk-cache, SIMD shuffle, Zstd codec, owned-Vec IO, auto-shuffle pre-filter, Pcodec codec).
 
 ### Sequential Read Throughput
 
@@ -427,27 +427,33 @@ Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 
 | write_1d_contiguous (f32) | 9.44 µs / **404 MiB/s** | 25.2 µs / **1.48 GiB/s** | 218 µs / **1.71 GiB/s** |
 | write_f64_batch (f64 embeddings) | 6.50 µs (n=128) | 8.67 µs (n=512) / **450 MiB/s** | 10.27 µs (n=1K) / **761 MiB/s** |
 
-### Chunked Write (deflate level 6)
+### Chunked Write: Codec Comparison (Zstd-3 vs Deflate-6, with auto-shuffle)
 
-| Matrix size | Latency | Throughput |
-|-------------|---------|-----------|
-| 32×32 f32 | 57.7 µs | 67.8 MiB/s |
-| 128×128 f32 | 535 µs | 117 MiB/s |
-| 512×512 f32 | 3.64 ms | 275 MiB/s |
+Auto-shuffle is applied before all compression codecs by default (matches h5py behavior,
+implements byte-grouping pre-filter per arXiv:2506.18062). Shuffle dramatically improves
+both throughput and compression ratio for float/int data.
 
-### Codec Comparison: Zstd-3 vs Deflate-6
+| Matrix size | Zstd-3 + shuffle | Deflate-6 + shuffle | Speedup |
+|-------------|-----------------|---------------------|---------|
+| 32×32 f32 | 48 µs / **81 MiB/s** | 41 µs / **94 MiB/s** | Deflate 1.16× faster (small chunk) |
+| 128×128 f32 | **150 µs / 417 MiB/s** | 156 µs / **401 MiB/s** | Parity |
+| 512×512 f32 | **1.31 ms / 764 MiB/s** | 1.34 ms / **745 MiB/s** | Parity |
 
-Side-by-side on the same f32 matrices. Zstd level 3 encodes significantly faster
-at the same or better compression ratio (see arXiv:2604.06221, ROOT I/O arXiv:1906.04624).
+**Impact of auto-shuffle** (vs previous baseline without shuffle):
 
-| Matrix size | Zstd-3 | Deflate-6 | Speedup |
-|-------------|--------|-----------|---------|
-| 32×32 f32 | 57.0 µs / 68.6 MiB/s | 54.6 µs / 71.6 MiB/s | ~1× (too small to matter) |
-| 128×128 f32 | **189 µs / 330 MiB/s** | 475 µs / 132 MiB/s | **2.51×** |
-| 512×512 f32 | **1.69 ms / 593 MiB/s** | 3.57 ms / 280 MiB/s | **2.12×** |
+| Matrix size | Zstd-3 speedup | Deflate-6 speedup |
+|-------------|----------------|-------------------|
+| 32×32 | +19% | +31% |
+| 128×128 | +25% | **+204%** |
+| 512×512 | +25% | **+166%** |
 
-**Recommendation:** Use `.with_zstd(3)` for chunked datasets. At matrix sizes ≥128×128 you get
-2–2.5× better write throughput with equal or better compression ratio.
+Both codecs now perform at parity at large sizes (~750 MiB/s). The shuffle filter
+reorganizes bytes across all elements (AoS→SoA), creating long runs of similar bytes
+that both Zstd and deflate compress in fewer cycles.
+
+**Recommendation:** `.with_zstd(3)` or `.with_deflate(6)` — both are now competitive.
+Use `.without_shuffle()` only for byte arrays or data that does not benefit from AoS→SoA
+transposition.
 
 ### Codec Comparison: Pcodec vs Zstd-3
 

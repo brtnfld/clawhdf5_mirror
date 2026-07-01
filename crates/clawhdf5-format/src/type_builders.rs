@@ -545,8 +545,8 @@ impl DatasetBuilder {
     ///
     /// **Recommended for write-heavy workloads:** Zstd level 3 encodes at
     /// ~500+ MiB/s vs deflate's ~300 MiB/s at the same or better compression
-    /// ratio (see arXiv 2604.06221).  Use `.with_shuffle()` before this call
-    /// for floating-point data to improve the compression ratio.
+    /// ratio (see arXiv 2604.06221). Shuffle is applied automatically before
+    /// compression; call `.without_shuffle()` to disable it.
     pub fn with_zstd(&mut self, level: u32) -> &mut Self {
         self.chunk_options.zstd_level = Some(level);
         self
@@ -570,8 +570,21 @@ impl DatasetBuilder {
     }
 
     /// Enable shuffle filter (usually combined with deflate or zstd).
+    /// Note: shuffle is auto-applied before any compression codec by default.
     pub fn with_shuffle(&mut self) -> &mut Self {
         self.chunk_options.shuffle = true;
+        self
+    }
+
+    /// Disable the automatic shuffle pre-filter.
+    ///
+    /// By default, the shuffle filter is applied before any compression codec
+    /// (deflate, Zstd, LZ4, Pcodec) to improve compression ratios on float/int
+    /// arrays. Call this to disable it, e.g. for already-shuffled data or when
+    /// storing byte arrays where shuffle hurts compression.
+    pub fn without_shuffle(&mut self) -> &mut Self {
+        self.chunk_options.no_shuffle = true;
+        self.chunk_options.shuffle = false;
         self
     }
 
