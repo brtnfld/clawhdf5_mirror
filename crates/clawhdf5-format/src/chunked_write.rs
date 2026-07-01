@@ -260,8 +260,12 @@ pub fn split_into_chunks(
 }
 
 /// Parallel compression threshold: use rayon when chunk count exceeds this.
+///
+/// Lowered to 2 to enable parallel compression for typical 4-chunk workloads
+/// (e.g., 128×128 matrix with 32-row chunks = 4 chunks). Rayon's overhead is
+/// ~2 µs, worthwhile at ≥2 chunks with any real compression (arXiv:2206.14761).
 #[cfg(feature = "parallel")]
-const PARALLEL_COMPRESS_THRESHOLD: usize = 4;
+const PARALLEL_COMPRESS_THRESHOLD: usize = 2;
 
 /// Compress all chunks, using parallel compression when beneficial.
 ///
