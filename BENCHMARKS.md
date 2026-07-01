@@ -4,7 +4,7 @@
 
 **System:** Intel i7-12650H (10C/16T, 4.7 GHz boost) · 32 GB DDR5 · Linux 6.8.0  
 **Rust:** 1.96.0-nightly (2026-03-14) · `--release` profile  
-**Date:** 2026-03-20
+**Date:** 2026-07-01
 
 ---
 
@@ -114,8 +114,8 @@ HDF5 persistence with optional Write-Ahead Log.
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
-| Single save (no WAL) | 91 µs | Direct HDF5 write |
-| Single save (with WAL) | 134 µs | +47% for crash safety |
+| Single save (no WAL) | 61 µs | Direct HDF5 write (owned-Vec IO path) |
+| Single save (with WAL) | 18 µs | WAL group-commit append; HDF5 write batched at flush |
 | Batch 100 | 723 µs | 7.2 µs per record |
 | Batch 1,000 | 6.17 ms | 6.2 µs per record |
 | WAL save (1K existing) | 539 µs | Incremental append |
@@ -160,7 +160,7 @@ End-to-end strategy evaluation including embedding operations.
 | **Hybrid vector+keyword** | <200 µs | 1K records |
 | **Knowledge graph query** | <25 µs | 1K entities |
 | **Temporal range query** | <1 µs | 10K timestamps |
-| **Memory write** | <135 µs | Per record |
+| **Memory write** | <20 µs | Per record (WAL group-commit append) |
 | **Consolidation cycle** | <165 µs | 1K records |
 | **Importance gate** | <1 µs | Per record |
 
