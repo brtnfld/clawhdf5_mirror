@@ -424,7 +424,7 @@ Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 
 
 | Workload | n=1K | n=10K | n=100K |
 |----------|------|-------|--------|
-| write_1d_contiguous (f32) | 9.44 µs / **404 MiB/s** | 25.2 µs / **1.48 GiB/s** | 218 µs / **1.71 GiB/s** |
+| write_1d_contiguous (f32) | 9.44 µs / **404 MiB/s** | 25 µs / **1.49 GiB/s** | 228 µs / **1.63 GiB/s** |
 | write_f64_batch (f64 embeddings) | 6.50 µs (n=128) | 8.67 µs (n=512) / **450 MiB/s** | 10.27 µs (n=1K) / **761 MiB/s** |
 
 ### Chunked Write: Codec Comparison (Zstd-3 vs Deflate-6, with auto-shuffle)
@@ -435,19 +435,19 @@ both throughput and compression ratio for float/int data.
 
 | Matrix size | Zstd-3 + shuffle | Deflate-6 + shuffle | Speedup |
 |-------------|-----------------|---------------------|---------|
-| 32×32 f32 | 48 µs / **81 MiB/s** | 41 µs / **94 MiB/s** | Deflate 1.16× faster (small chunk) |
-| 128×128 f32 | **150 µs / 417 MiB/s** | 156 µs / **401 MiB/s** | Parity |
-| 512×512 f32 | **1.31 ms / 764 MiB/s** | 1.34 ms / **745 MiB/s** | Parity |
+| 32×32 f32 | 48 µs / **81 MiB/s** | 39 µs / **100 MiB/s** | Deflate 1.23× faster (small chunk) |
+| 128×128 f32 | **148 µs / 422 MiB/s** | 153 µs / **407 MiB/s** | Parity |
+| 512×512 f32 | **1.34 ms / 748 MiB/s** | 1.39 ms / **719 MiB/s** | Zstd 1.04× faster |
 
-**Impact of auto-shuffle** (vs previous baseline without shuffle):
+**Impact of auto-shuffle** (vs baseline without shuffle):
 
 | Matrix size | Zstd-3 speedup | Deflate-6 speedup |
 |-------------|----------------|-------------------|
-| 32×32 | +19% | +31% |
+| 32×32 | +19% | +38% |
 | 128×128 | +25% | **+204%** |
-| 512×512 | +25% | **+166%** |
+| 512×512 | +25% | **+157%** |
 
-Both codecs now perform at parity at large sizes (~750 MiB/s). The shuffle filter
+Both codecs now perform at parity at large sizes (~720–750 MiB/s). The shuffle filter
 reorganizes bytes across all elements (AoS→SoA), creating long runs of similar bytes
 that both Zstd and deflate compress in fewer cycles.
 
