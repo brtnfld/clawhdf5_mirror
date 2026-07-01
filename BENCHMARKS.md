@@ -399,18 +399,30 @@ cargo run --release --bin ephemeral_perf
 
 ## h5bench-Equivalent I/O Benchmarks
 
-Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 C library).  
-**Run:** `cargo bench -p clawhdf5-bench`  
-**Date:** 2026-07-01 · same system as above · post write-performance improvements (chunk-cache, SIMD shuffle, Zstd codec, owned-Vec IO, auto-shuffle pre-filter, Pcodec codec).
+Criterion harness mirroring h5bench serial workloads. clawhdf5 benchmarks dated 2026-07-01;
+libhdf5 1.14.6 head-to-head comparison dated 2026-06-30 (same hardware, same Criterion harness).
+
+```bash
+cargo bench -p clawhdf5-bench                         # clawhdf5-only
+cargo bench -p clawhdf5-bench --features libhdf5-compare  # head-to-head
+```
 
 ### Sequential Read Throughput
 
+Both read a 1-D contiguous f32 dataset. clawhdf5 parses from `Vec<u8>` (zero-copy);
+libhdf5 reads from a temp file including `open` + `read` + `close` overhead.
+
 | Workload | n=1K | n=10K | n=100K |
 |----------|------|-------|--------|
-| read_sequential (f32) | 634 ns / **5.9 GiB/s** | 2.44 µs / **15.3 GiB/s** | 24.5 µs / **15.2 GiB/s** |
-| read_f64_sequential (f64) | 743 ns / **10.0 GiB/s** | 4.17 µs / **17.8 GiB/s** | 43.3 µs / **17.2 GiB/s** |
-| read_from_disk (f64, OS I/O) | — | 10.1 µs / **7.4 GiB/s** | 77.6 µs / **9.6 GiB/s** |
-| read_hyperslab (f64, 10% slice) | — | 4.09 µs / **1.8 GiB/s** | 50.1 µs / **1.5 GiB/s** |
+| **clawhdf5** f32 | 634 ns / **5.9 GiB/s** | 2.44 µs / **15.3 GiB/s** | 24.5 µs / **15.2 GiB/s** |
+| libhdf5 f32 | 45.2 µs / 85 MiB/s | 47.8 µs / 799 MiB/s | 73.9 µs / 5.0 GiB/s |
+| **Speedup** | **71×** | **20×** | **3.0×** |
+| clawhdf5 f64 | 743 ns / **10.0 GiB/s** | 4.17 µs / **17.8 GiB/s** | 43.3 µs / **17.2 GiB/s** |
+| clawhdf5 from_disk (f64, OS I/O) | — | 10.1 µs / **7.4 GiB/s** | 77.6 µs / **9.6 GiB/s** |
+| clawhdf5 hyperslab (f64, 10% slice) | — | 4.09 µs / **1.8 GiB/s** | 50.1 µs / **1.5 GiB/s** |
+
+libhdf5 f64 comparison excluded — clawhdf5's datatype encoding differs from libhdf5's (known
+gap), making cross-format reads unreliable for comparison.
 
 ### Chunked Read Throughput
 
@@ -422,16 +434,20 @@ Criterion harness mirroring h5bench serial workloads. Clawhdf5-only (no libhdf5 
 
 ### Sequential Write Throughput
 
+Both write to disk. At 100K elements both converge on the OS `write()` syscall ceiling.
+
 | Workload | n=1K | n=10K | n=100K |
 |----------|------|-------|--------|
-| write_1d_contiguous (f32) | 9.44 µs / **404 MiB/s** | 25 µs / **1.49 GiB/s** | 228 µs / **1.63 GiB/s** |
-| write_f64_batch (f64 embeddings) | 6.50 µs (n=128) | 8.67 µs (n=512) / **450 MiB/s** | 10.27 µs (n=1K) / **761 MiB/s** |
+| **clawhdf5** f32 | 9.44 µs / **404 MiB/s** | 25 µs / **1.49 GiB/s** | 228 µs / **1.63 GiB/s** |
+| libhdf5 f32 | 77.9 µs / 49 MiB/s | 87.8 µs / 435 MiB/s | 214 µs / 1.74 GiB/s |
+| **Speedup** | **8.2×** | **3.5×** | **≈ tie** |
+| clawhdf5 f64 embeddings | 6.50 µs (n=128) | 8.67 µs (n=512) / **450 MiB/s** | 10.27 µs (n=1K) / **761 MiB/s** |
 
-### Chunked Write: Codec Comparison (Zstd-3 vs Deflate-6, with auto-shuffle)
+### Chunked Write: Codec Comparison (with auto-shuffle)
 
-Auto-shuffle is applied before all compression codecs by default (matches h5py behavior,
-implements byte-grouping pre-filter per arXiv:2506.18062). Shuffle dramatically improves
-both throughput and compression ratio for float/int data.
+Auto-shuffle is applied before all compression codecs by default — AoS→SoA byte transpose,
+implements byte-grouping pre-filter per arXiv:2506.18062. Shuffle dramatically improves
+throughput for float/int data by creating long runs of similar bytes.
 
 | Matrix size | Zstd-3 + shuffle | Deflate-6 + shuffle | Speedup |
 |-------------|-----------------|---------------------|---------|
@@ -439,7 +455,7 @@ both throughput and compression ratio for float/int data.
 | 128×128 f32 | **148 µs / 422 MiB/s** | 153 µs / **407 MiB/s** | Parity |
 | 512×512 f32 | **1.34 ms / 748 MiB/s** | 1.39 ms / **719 MiB/s** | Zstd 1.04× faster |
 
-**Impact of auto-shuffle** (vs baseline without shuffle):
+Impact of auto-shuffle vs no-shuffle baseline:
 
 | Matrix size | Zstd-3 speedup | Deflate-6 speedup |
 |-------------|----------------|-------------------|
@@ -447,39 +463,104 @@ both throughput and compression ratio for float/int data.
 | 128×128 | +25% | **+204%** |
 | 512×512 | +25% | **+157%** |
 
-Both codecs now perform at parity at large sizes (~720–750 MiB/s). The shuffle filter
-reorganizes bytes across all elements (AoS→SoA), creating long runs of similar bytes
-that both Zstd and deflate compress in fewer cycles.
+Both codecs perform at parity at large sizes (~720–750 MiB/s). Use `.with_zstd(3)` or
+`.with_deflate(6)` for write-heavy workloads. Use `.without_shuffle()` only for byte arrays
+or data that doesn't benefit from AoS→SoA transposition.
 
-**Recommendation:** `.with_zstd(3)` or `.with_deflate(6)` — both are now competitive.
-Use `.without_shuffle()` only for byte arrays or data that does not benefit from AoS→SoA
-transposition.
+### Chunked Write vs libhdf5 (deflate-6)
+
+clawhdf5 compresses all chunks in memory and issues a single `write()`. libhdf5 flushes each
+chunk individually via its Virtual File Layer (one `pwrite()` per chunk).
+
+| Matrix | clawhdf5 deflate-6 + shuffle | libhdf5 deflate-6 | Speedup |
+|--------|------------------------------|-------------------|---------|
+| 32×32 f32 | 39 µs / 100 MiB/s | 172 µs / 23 MiB/s | **4.4×** |
+| 128×128 f32 | 153 µs / 407 MiB/s | 3,150 µs / 20 MiB/s | **20.6×** |
+| 512×512 f32 | 1,390 µs / 719 MiB/s | 53,300 µs / 19 MiB/s | **38.4×** |
+
+The 32×32 speedup (4.4×) is lower than the 512×512 speedup (38.4×) because shuffle adds
+overhead that dominates at 4 KB chunks. libhdf5 was benchmarked without shuffle. The speedup
+compounds with matrix size because libhdf5's per-chunk VFL overhead is proportional to chunk
+count while clawhdf5's single-pass cost is constant.
 
 ### Codec Comparison: Pcodec vs Zstd-3
 
-Pcodec (arXiv:2502.06112) is a pure-Rust lossless numerical codec that achieves 30–94% better
-compression ratio than Zstd for f32/f64 columns at 1–5 GiB/s decompression. Write throughput
-comparison (same f32 matrices as above):
+Pcodec (arXiv:2502.06112) is a pure-Rust lossless numerical codec with 30–94% better compression
+ratio than Zstd for f32/f64 columns. Both sides benchmarked **without** auto-shuffle here (shuffle
+degrades Pcodec which handles byte organization internally; Zstd-3 without shuffle numbers shown
+for an apples-to-apples comparison).
 
-| Matrix size | Pcodec | Zstd-3 | Winner |
-|-------------|--------|--------|--------|
+| Matrix size | Pcodec | Zstd-3 (no shuffle) | Winner |
+|-------------|--------|---------------------|--------|
 | 32×32 f32 | 95 µs / **41 MiB/s** | 57 µs / **68 MiB/s** | Zstd-3 (1.66×) |
 | 128×128 f32 | 528 µs / **118 MiB/s** | 179 µs / **349 MiB/s** | Zstd-3 (2.95×) |
 | 512×512 f32 | 1.69 ms / **591 MiB/s** | 1.64 ms / **610 MiB/s** | Parity (3% diff) |
 
-**Interpretation:** Pcodec's distributional analysis adds fixed per-chunk overhead (~400 µs).
-For small chunks (32×32 = 4 KB), this overhead dominates and Zstd-3 wins by 2–3×. At large
-chunks (512×512 = 1 MB), they converge. **Pcodec's advantage is compression ratio, not
-encode speed** — it stores less data on disk, improving read throughput and storage
-efficiency. Enable with `.with_pcodec()` for write-once / read-many embedding archives.
+Pcodec's fixed per-chunk distributional analysis overhead (~400 µs) dominates at 32×32 (4 KB).
+At 512×512 (1 MB) the speeds converge. **Pcodec's advantage is compression ratio, not encode
+speed** — less data on disk means faster reads and lower storage cost. Enable with
+`.with_pcodec()` for write-once/read-many workloads (embedding archives, scientific datasets).
 
 ### Metadata Throughput
 
+clawhdf5 accumulates all metadata in memory and serializes in one pass. libhdf5 acquires a
+global file mutex and flushes to disk on every attribute write or group creation.
+
+**Attributes and datasets** (k = attribute or dataset count):
+
 | Workload | k=4 | k=16 | k=64 | k=128 |
 |----------|-----|------|------|-------|
-| attrs_write (i64) | 8.05 µs / 494 Kop/s | 17.2 µs / 932 Kop/s | 49.2 µs / 1.30 Mop/s | 87.3 µs / 1.47 Mop/s |
-| attrs_read | 1.06 µs / 3.78 Mop/s | 3.64 µs / 4.39 Mop/s | 15.7 µs / 4.08 Mop/s | 31.3 µs / 4.09 Mop/s |
-| string_attrs (write+read) | 5.17 µs / 774 Kop/s | 16.5 µs / 967 Kop/s | 33.6 µs / 951 Kop/s | — |
-| groups_create | 12.1 µs / 330 Kop/s | 33.7 µs / 475 Kop/s | 66.7 µs / 480 Kop/s | 121 µs / 528 Kop/s (k=64) |
-| groups_traverse | 664 ns / 6.03 Mop/s | 3.55 µs / 4.50 Mop/s | 4.87 µs / 6.58 Mop/s (k=32) | 10.6 µs / 6.04 Mop/s |
-| multi_dataset_write | 10.1 µs / 397 Kop/s | 31.5 µs / 508 Kop/s | 104 µs / 614 Kop/s | — |
+| **clawhdf5** attrs_write (i64) | 8.05 µs / 494 Kop/s | 17.2 µs / 932 Kop/s | 49.2 µs / 1.30 Mop/s | 87.3 µs / 1.47 Mop/s |
+| libhdf5 attrs_write | 100 µs / 40 Kop/s | 170 µs / 94 Kop/s | 472 µs / 136 Kop/s | 929 µs / 138 Kop/s |
+| **Speedup** | **12.4×** | **9.9×** | **9.6×** | **10.6×** |
+| clawhdf5 attrs_read | 1.06 µs / 3.78 Mop/s | 3.64 µs / 4.39 Mop/s | 15.7 µs / 4.08 Mop/s | 31.3 µs / 4.09 Mop/s |
+| clawhdf5 string_attrs (write+read) | 5.17 µs / 774 Kop/s | 16.5 µs / 967 Kop/s | 33.6 µs / 951 Kop/s | — |
+| clawhdf5 multi_dataset_write | 10.1 µs / 397 Kop/s | 31.5 µs / 508 Kop/s | 104 µs / 614 Kop/s | — |
+
+**Groups** (k = group count):
+
+| Workload | k=4 | k=16 | k=32 | k=64 |
+|----------|-----|------|------|------|
+| **clawhdf5** groups_create | 12.1 µs / 330 Kop/s | 33.7 µs / 475 Kop/s | 66.7 µs / 480 Kop/s | 121 µs / 529 Kop/s |
+| libhdf5 groups_create | 140 µs / 28 Kop/s | 433 µs / 37 Kop/s | 690 µs / 46 Kop/s | 1,340 µs / 48 Kop/s |
+| **Speedup** | **11.6×** | **12.8×** | **9.5×** | **11.1×** |
+| clawhdf5 groups_traverse | 664 ns / 6.0 Mop/s | 3.55 µs / 4.5 Mop/s | 4.87 µs / 6.6 Mop/s | 10.6 µs / 6.0 Mop/s |
+
+---
+
+## vs libhdf5 Summary
+
+| Workload | clawhdf5 | libhdf5 | Speedup |
+|----------|----------|---------|---------|
+| Sequential read, 1K f32 | 634 ns | 45.2 µs | **71×** |
+| Sequential read, 100K f32 | 24.5 µs · 15.2 GiB/s | 73.9 µs · 5.0 GiB/s | **3.0×** |
+| Sequential write, 100K f32 | 228 µs · 1.63 GiB/s | 214 µs · 1.74 GiB/s | **≈ tie** |
+| Chunked write deflate-6, 512×512 | 1,390 µs · 719 MiB/s | 53,300 µs · 19 MiB/s | **38.4×** |
+| Attribute write, 128 attrs | 87.3 µs · 1.47 Mop/s | 929 µs · 138 Kop/s | **10.6×** |
+| Group create, 64 groups | 121 µs · 529 Kop/s | 1,340 µs · 48 Kop/s | **11.1×** |
+
+### Why the Gaps
+
+**Metadata (10–13×):** libhdf5 was designed for MPI parallel filesystems where every metadata
+write must be immediately visible to other processes. It acquires a global file mutex and
+flushes to disk per operation. clawhdf5 builds the entire file in memory and writes it in one
+shot — no locking, no flushing, no C heap allocation per message.
+
+**Chunked compressed write (4–38×):** libhdf5 writes each chunk individually through its VFL
+(Virtual File Layer), one `pwrite()` per chunk. clawhdf5 compresses all chunks in memory (Rayon
+parallel when > 2 chunks), lays them out contiguously, and issues a single `write()`. The
+speedup compounds with matrix size: libhdf5's per-chunk overhead is proportional to chunk count
+while clawhdf5's architectural cost is constant.
+
+**Small reads (20–71×):** libhdf5's per-open overhead (chunk cache init, SWMR lock, metadata
+read) dominates at sub-millisecond payloads. clawhdf5 has no global state — `File::from_bytes()`
+starts parsing immediately.
+
+**Large contiguous writes (≈ tie at 100K):** Both are bottlenecked by the OS `write()` syscall
+to the page cache. There is no algorithmic headroom above ~1.7 GiB/s on this hardware.
+
+### Caveats
+
+- libhdf5 f64 read comparison excluded — clawhdf5's f32 datatype encoding differs from libhdf5's (known compatibility gap). f64 results are clawhdf5-only.
+- Serial benchmarks. clawhdf5 uses Rayon for chunk compression when > 2 chunks; that parallelism is already reflected in the chunked write numbers.
+- clawhdf5 reads from `Vec<u8>` (zero-copy from mmap in production); libhdf5 reads from a temp file. This gives clawhdf5 a structural read advantage that reflects realistic API usage.
