@@ -11,8 +11,8 @@ use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
 use crate::ea_writer;
 use crate::error::FormatError;
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_SHUFFLE, FILTER_ZSTD, FilterDescription,
-    FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_PCODEC, FILTER_SHUFFLE, FILTER_ZSTD,
+    FilterDescription, FilterPipeline,
 };
 use crate::filters::compress_chunk;
 
@@ -41,6 +41,8 @@ pub struct ChunkOptions {
     pub lz4: bool,
     /// Zstandard compression level (1-22), None = no zstd. Filter ID 32015.
     pub zstd_level: Option<u32>,
+    /// Pcodec lossless numerical compression. Filter ID 32023.
+    pub pcodec: bool,
 }
 
 impl ChunkOptions {
@@ -52,6 +54,7 @@ impl ChunkOptions {
             || self.fletcher32
             || self.lz4
             || self.zstd_level.is_some()
+            || self.pcodec
     }
 
     /// Build a FilterPipeline from the options.
@@ -67,8 +70,15 @@ impl ChunkOptions {
             });
         }
 
-        // Compression filters (mutually exclusive, priority: zstd > lz4 > deflate)
-        if let Some(level) = self.zstd_level {
+        // Compression filters (mutually exclusive, priority: pcodec > zstd > lz4 > deflate)
+        if self.pcodec {
+            filters.push(FilterDescription {
+                filter_id: FILTER_PCODEC,
+                name: Some("pcodec".into()),
+                flags: 0,
+                client_data: vec![element_size],
+            });
+        } else if let Some(level) = self.zstd_level {
             filters.push(FilterDescription {
                 filter_id: FILTER_ZSTD,
                 name: Some("zstd".into()),

@@ -8,8 +8,8 @@ use alloc::{vec, vec::Vec};
 
 use crate::error::FormatError;
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
-    FILTER_SZIP, FILTER_ZSTD, FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_PCODEC,
+    FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP, FILTER_ZSTD, FilterPipeline,
 };
 
 /// Apply a filter pipeline to decompress a chunk.
@@ -29,6 +29,7 @@ pub fn decompress_chunk(
             FILTER_LZ4 => lz4_decompress(&data)?,
             FILTER_ZSTD => zstd_decompress(&data)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
+            FILTER_PCODEC => pcodec_decompress(&data, element_size as usize)?,
             // `chunk_size` is the expected decompressed size; pass it so these
             // decoders can reject an element count that would over-allocate.
             FILTER_SCALEOFFSET => scaleoffset_decompress(&data, &filter.client_data, chunk_size)?,
@@ -63,6 +64,7 @@ pub fn compress_chunk(
                 zstd_compress(&result, level)?
             }
             FILTER_FLETCHER32 => fletcher32_append(&result)?,
+            FILTER_PCODEC => pcodec_compress(&result, element_size as usize)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -936,6 +938,75 @@ fn fletcher32_append(data: &[u8]) -> Result<Vec<u8>, FormatError> {
     let mut result = data.to_vec();
     result.extend_from_slice(&checksum.to_le_bytes());
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Pcodec — lossless numerical compression (arXiv:2502.06112)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pcodec")]
+fn pcodec_compress(data: &[u8], element_size: usize) -> Result<Vec<u8>, FormatError> {
+    use pco::ChunkConfig;
+    use pco::standalone::simple_compress;
+    let config = ChunkConfig::default();
+    match element_size {
+        4 => {
+            let nums: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            simple_compress(&nums, &config)
+                .map_err(|e| FormatError::CompressionError(format!("pco: {e}")))
+        }
+        8 => {
+            let nums: Vec<f64> = data
+                .chunks_exact(8)
+                .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            simple_compress(&nums, &config)
+                .map_err(|e| FormatError::CompressionError(format!("pco: {e}")))
+        }
+        _ => {
+            let nums: Vec<u32> = data
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            simple_compress(&nums, &config)
+                .map_err(|e| FormatError::CompressionError(format!("pco: {e}")))
+        }
+    }
+}
+
+#[cfg(not(feature = "pcodec"))]
+fn pcodec_compress(_data: &[u8], _element_size: usize) -> Result<Vec<u8>, FormatError> {
+    Err(FormatError::UnsupportedFilter(FILTER_PCODEC))
+}
+
+#[cfg(feature = "pcodec")]
+fn pcodec_decompress(data: &[u8], element_size: usize) -> Result<Vec<u8>, FormatError> {
+    use pco::standalone::simple_decompress;
+    match element_size {
+        4 => {
+            let nums = simple_decompress::<f32>(data)
+                .map_err(|e| FormatError::DecompressionError(format!("pco: {e}")))?;
+            Ok(nums.iter().flat_map(|x| x.to_le_bytes()).collect())
+        }
+        8 => {
+            let nums = simple_decompress::<f64>(data)
+                .map_err(|e| FormatError::DecompressionError(format!("pco: {e}")))?;
+            Ok(nums.iter().flat_map(|x| x.to_le_bytes()).collect())
+        }
+        _ => {
+            let nums = simple_decompress::<u32>(data)
+                .map_err(|e| FormatError::DecompressionError(format!("pco: {e}")))?;
+            Ok(nums.iter().flat_map(|x| x.to_le_bytes()).collect())
+        }
+    }
+}
+
+#[cfg(not(feature = "pcodec"))]
+fn pcodec_decompress(_data: &[u8], _element_size: usize) -> Result<Vec<u8>, FormatError> {
+    Err(FormatError::UnsupportedFilter(FILTER_PCODEC))
 }
 
 #[cfg(test)]

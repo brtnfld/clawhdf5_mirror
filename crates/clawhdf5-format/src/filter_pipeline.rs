@@ -19,6 +19,8 @@ pub const FILTER_SCALEOFFSET: u16 = 6;
 pub const FILTER_LZ4: u16 = 32004;
 /// Zstandard compression.
 pub const FILTER_ZSTD: u16 = 32015;
+/// Pcodec lossless numerical codec (clawhdf5 internal; not yet HDF5-registered).
+pub const FILTER_PCODEC: u16 = 32023;
 
 /// Description of a single filter in a pipeline.
 #[derive(Debug, Clone, PartialEq)]

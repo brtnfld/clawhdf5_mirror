@@ -449,6 +449,24 @@ at the same or better compression ratio (see arXiv:2604.06221, ROOT I/O arXiv:19
 **Recommendation:** Use `.with_zstd(3)` for chunked datasets. At matrix sizes ≥128×128 you get
 2–2.5× better write throughput with equal or better compression ratio.
 
+### Codec Comparison: Pcodec vs Zstd-3
+
+Pcodec (arXiv:2502.06112) is a pure-Rust lossless numerical codec that achieves 30–94% better
+compression ratio than Zstd for f32/f64 columns at 1–5 GiB/s decompression. Write throughput
+comparison (same f32 matrices as above):
+
+| Matrix size | Pcodec | Zstd-3 | Winner |
+|-------------|--------|--------|--------|
+| 32×32 f32 | 95 µs / **41 MiB/s** | 57 µs / **68 MiB/s** | Zstd-3 (1.66×) |
+| 128×128 f32 | 528 µs / **118 MiB/s** | 179 µs / **349 MiB/s** | Zstd-3 (2.95×) |
+| 512×512 f32 | 1.69 ms / **591 MiB/s** | 1.64 ms / **610 MiB/s** | Parity (3% diff) |
+
+**Interpretation:** Pcodec's distributional analysis adds fixed per-chunk overhead (~400 µs).
+For small chunks (32×32 = 4 KB), this overhead dominates and Zstd-3 wins by 2–3×. At large
+chunks (512×512 = 1 MB), they converge. **Pcodec's advantage is compression ratio, not
+encode speed** — it stores less data on disk, improving read throughput and storage
+efficiency. Enable with `.with_pcodec()` for write-once / read-many embedding archives.
+
 ### Metadata Throughput
 
 | Workload | k=4 | k=16 | k=64 | k=128 |

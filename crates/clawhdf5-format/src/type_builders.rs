@@ -559,6 +559,16 @@ impl DatasetBuilder {
         self
     }
 
+    /// Enable Pcodec lossless numerical compression (clawhdf5 filter ID 32023).
+    ///
+    /// Pcodec achieves 30–94% better compression ratio than Zstd for f32/f64
+    /// columns at 1–5 GiB/s decompression speed (arXiv:2502.06112). Requires
+    /// the `pcodec` cargo feature.
+    pub fn with_pcodec(&mut self) -> &mut Self {
+        self.chunk_options.pcodec = true;
+        self
+    }
+
     /// Enable shuffle filter (usually combined with deflate or zstd).
     pub fn with_shuffle(&mut self) -> &mut Self {
         self.chunk_options.shuffle = true;
