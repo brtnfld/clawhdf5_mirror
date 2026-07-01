@@ -83,14 +83,15 @@ fn build_memory_group(
             let rows_per_chunk = (target_chunk_bytes / (d * 4)).max(1).min(n);
             ds.with_chunks(&[rows_per_chunk, d]);
 
-            // Compression: shuffle + deflate for embeddings when enabled
+            // Compression: Zstd for embeddings — faster than deflate at same ratio.
+            // Shuffle is applied automatically (auto-shuffle pre-filter).
             if config.compression {
                 let level = if config.compression_level > 0 {
-                    config.compression_level
+                    config.compression_level.min(22)
                 } else {
-                    1 // fast default for embeddings
+                    3 // Zstd level 3: fast + good ratio for f32 embeddings
                 };
-                ds.with_shuffle().with_deflate(level);
+                ds.with_zstd(level);
             }
         }
 
