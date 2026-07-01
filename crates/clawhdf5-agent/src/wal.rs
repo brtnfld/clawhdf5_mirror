@@ -44,11 +44,20 @@ pub struct WalEntry {
     pub tombstone_index: Option<usize>,
 }
 
+/// How many entries to accumulate before updating the header entry_count.
+///
+/// The header count is only needed for replay; `read_entries` already handles
+/// stale counts by reading until EOF.  Updating every N entries rather than
+/// every entry eliminates 3 lseek() + 1 write() per entry — see arXiv:2507.13062.
+const GROUP_COMMIT_SIZE: u32 = 8;
+
 #[derive(Debug)]
 pub struct WalFile {
     path: PathBuf,
     file: Option<File>,
     entry_count: u32,
+    /// Entries written since the last header count update.
+    pending_header_sync: u32,
 }
 
 impl WalFile {
@@ -83,6 +92,7 @@ impl WalFile {
                 path: path.to_path_buf(),
                 file: Some(f),
                 entry_count,
+                pending_header_sync: 0,
             })
         } else {
             // Create new WAL
@@ -95,62 +105,82 @@ impl WalFile {
                 path: path.to_path_buf(),
                 file: Some(f),
                 entry_count: 0,
+                pending_header_sync: 0,
             })
         }
     }
 
     /// Append a save entry to the WAL.
+    ///
+    /// Serializes the entry into a single buffer before writing to minimize
+    /// syscall count (1 write() vs ~8 previously). The header entry_count is
+    /// updated every GROUP_COMMIT_SIZE entries rather than on every write,
+    /// eliminating 3 lseek() + 1 write() per entry (arXiv:2507.13062).
+    ///
+    /// Crash safety: `read_entries` reads until EOF and handles stale header
+    /// counts, so deferred header updates do not compromise recovery.
     pub fn append_save(&mut self, entry: &WalEntry) -> Result<(), MemoryError> {
+        let emb_len = entry.embedding.len();
+        let mut buf = Vec::with_capacity(
+            1 + 8 + // type + timestamp
+            4 + entry.chunk.len() +
+            4 + emb_len * 4 +
+            4 + entry.source_channel.len() +
+            4 + entry.session_id.len() +
+            4 + entry.tags.len(),
+        );
+        buf.push(WalEntryType::Save as u8);
+        buf.extend_from_slice(&entry.timestamp.to_le_bytes());
+        serialize_str(&mut buf, &entry.chunk);
+        buf.extend_from_slice(&(emb_len as u32).to_le_bytes());
+        for &val in &entry.embedding {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        serialize_str(&mut buf, &entry.source_channel);
+        serialize_str(&mut buf, &entry.session_id);
+        serialize_str(&mut buf, &entry.tags);
+
         let f = self
             .file
             .as_mut()
             .ok_or_else(|| MemoryError::Io(std::io::Error::other("WAL file not open")))?;
-        // entry_type
-        f.write_all(&[WalEntryType::Save as u8])?;
-        // timestamp
-        f.write_all(&entry.timestamp.to_le_bytes())?;
-        // chunk
-        write_len_prefixed_str(f, &entry.chunk)?;
-        // embedding
-        let emb_len = entry.embedding.len() as u32;
-        f.write_all(&emb_len.to_le_bytes())?;
-        for &val in &entry.embedding {
-            f.write_all(&val.to_le_bytes())?;
-        }
-        // source_channel
-        write_len_prefixed_str(f, &entry.source_channel)?;
-        // session_id
-        write_len_prefixed_str(f, &entry.session_id)?;
-        // tags
-        write_len_prefixed_str(f, &entry.tags)?;
-        f.flush()?;
+        f.write_all(&buf)?;
 
         self.entry_count += 1;
-        self.write_entry_count()?;
+        self.pending_header_sync += 1;
+        if self.pending_header_sync >= GROUP_COMMIT_SIZE {
+            self.write_entry_count()?;
+        }
         Ok(())
     }
 
     /// Append a tombstone entry (deletion).
     pub fn append_tombstone(&mut self, index: usize, timestamp: f64) -> Result<(), MemoryError> {
+        let mut buf = [0u8; 1 + 8 + 4]; // type + timestamp + index
+        buf[0] = WalEntryType::Tombstone as u8;
+        buf[1..9].copy_from_slice(&timestamp.to_le_bytes());
+        buf[9..13].copy_from_slice(&(index as u32).to_le_bytes());
+
         let f = self
             .file
             .as_mut()
             .ok_or_else(|| MemoryError::Io(std::io::Error::other("WAL file not open")))?;
-        f.write_all(&[WalEntryType::Tombstone as u8])?;
-        f.write_all(&timestamp.to_le_bytes())?;
-        f.write_all(&(index as u32).to_le_bytes())?;
-        f.flush()?;
+        f.write_all(&buf)?;
 
         self.entry_count += 1;
-        self.write_entry_count()?;
+        self.pending_header_sync += 1;
+        if self.pending_header_sync >= GROUP_COMMIT_SIZE {
+            self.write_entry_count()?;
+        }
         Ok(())
     }
 
     /// Read all entries from the WAL (for replay on open).
     ///
-    /// Tolerates truncated WAL files: if the file is shorter than the header's
-    /// `entry_count` claims, the successfully-read entries are returned without
-    /// error. This handles crash-during-truncate and header-only WAL scenarios.
+    /// Reads until EOF — the header `entry_count` is used only for pre-allocation
+    /// (and may be stale if written with deferred group-commit updates). This
+    /// tolerates both truncated files (crash mid-write) and stale header counts
+    /// (crash before the next group-commit header sync).
     pub fn read_entries(path: &Path) -> Result<Vec<WalEntry>, MemoryError> {
         if !path.exists() {
             return Ok(Vec::new());
@@ -168,11 +198,12 @@ impl WalFile {
                 header[4]
             )));
         }
-        let entry_count = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
-        let mut entries = Vec::with_capacity(entry_count as usize);
+        // entry_count is a pre-allocation hint only — we read until EOF.
+        let entry_count_hint = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
+        let mut entries = Vec::with_capacity(entry_count_hint as usize);
 
-        for _ in 0..entry_count {
-            // Read entry type — EOF here means truncated WAL, not an error
+        loop {
+            // Read entry type — EOF here is normal end-of-log, not an error
             let mut type_buf = [0u8; 1];
             if f.read_exact(&mut type_buf).is_err() {
                 break;
@@ -252,6 +283,7 @@ impl WalFile {
         f.flush()?;
         self.file = Some(f);
         self.entry_count = 0;
+        self.pending_header_sync = 0;
         Ok(())
     }
 
@@ -274,8 +306,8 @@ impl WalFile {
         let pos = f.stream_position()?;
         f.seek(SeekFrom::Start(5))?;
         f.write_all(&self.entry_count.to_le_bytes())?;
-        f.flush()?;
         f.seek(SeekFrom::Start(pos))?;
+        self.pending_header_sync = 0;
         Ok(())
     }
 }
@@ -306,11 +338,11 @@ pub fn replay_into_cache(entries: &[WalEntry], cache: &mut crate::cache::MemoryC
 
 // --- Binary helpers ---
 
-fn write_len_prefixed_str(f: &mut File, s: &str) -> Result<(), MemoryError> {
+/// Serialize a length-prefixed string into an in-memory buffer (zero syscalls).
+fn serialize_str(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
-    f.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    f.write_all(bytes)?;
-    Ok(())
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 fn read_len_prefixed_str(f: &mut File) -> Result<String, MemoryError> {
