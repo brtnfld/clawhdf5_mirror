@@ -1,0 +1,30 @@
+[package]
+name = "clawhdf5-sign"
+version = "2.1.0"
+edition = "2024"
+description = "Cryptographic signing and verification for HDF5 files"
+license = "MIT"
+repository = "https://github.com/redclawsystems/clawhdf5"
+readme = "README.md"
+keywords = ["hdf5", "signing", "cryptography", "merkle"]
+categories = ["cryptography", "science"]
+
+[dependencies]
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["merkle"] }
+ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+ml-dsa = { version = "0.1", optional = true }
+pqcrypto-mldsa = { version = "0.1", optional = true }
+pqcrypto-traits = { version = "0.3", optional = true }
+rand = { version = "0.8", optional = true }
+thiserror = { version = "2", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = ["std", "ed25519"]
+std = ["thiserror"]
+ed25519 = ["ed25519-dalek", "rand"]
+mldsa = ["ml-dsa", "rand"]
+pq-mldsa = ["pqcrypto-mldsa", "pqcrypto-traits"]

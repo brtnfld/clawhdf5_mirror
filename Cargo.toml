@@ -17,6 +17,7 @@ members = [
     "crates/clawhdf5-cli",
     "crates/clawhdf5-napi",
     "crates/clawhdf5-bench",
+    "crates/clawhdf5-sign",
 ]
 resolver = "2"
 
