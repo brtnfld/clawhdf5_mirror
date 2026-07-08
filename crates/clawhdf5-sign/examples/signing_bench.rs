@@ -14,8 +14,13 @@
 //!     CLAWHDF5_BENCH_PLATFORM=x86_noavx \
 //!     cargo run --example signing_bench --release --features "ed25519,mldsa"
 //!
-//! On real ARM hardware, no override is needed — `detect_platform` reports
-//! "arm" automatically.
+//! On real ARM hardware, no platform override is needed — `detect_platform`
+//! reports "arm" automatically. On ephemeral CI runners, set
+//! CLAWHDF5_BENCH_HOSTNAME to a stable name so results don't fragment across
+//! a new throwaway-hostname CSV on every run:
+//!
+//!   CLAWHDF5_BENCH_HOSTNAME=github-actions-arm64 \
+//!     cargo run --example signing_bench --release --features "ed25519,mldsa"
 //!
 //! Output: benches/results/signing-$(hostname).csv (merged by platform column;
 //! re-running for one platform label refreshes only that label's rows).
@@ -34,6 +39,12 @@ const N_DATASETS: &[usize] = &[10_000, 100_000, 1_000_000, 10_000_000];
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn hostname() -> String {
+    // Hosted CI runners get a random ephemeral hostname per run, which would
+    // otherwise fragment one platform's results across many throwaway
+    // filenames — allow pinning a stable name (e.g. "github-actions-arm64").
+    if let Ok(h) = std::env::var("CLAWHDF5_BENCH_HOSTNAME") {
+        return h;
+    }
     std::process::Command::new("hostname")
         .output()
         .ok()
@@ -57,15 +68,23 @@ fn cpu_model() -> String {
     }
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/cpuinfo")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("model name"))
-                    .and_then(|l| l.split(':').nth(1))
-                    .map(|v| v.trim().to_string())
-            })
-            .unwrap_or_default()
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let field = |key: &str| -> Option<String> {
+            cpuinfo
+                .lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        // x86 /proc/cpuinfo has "model name"; some ARM boards report "Model".
+        field("model name").or_else(|| field("Model")).unwrap_or_else(|| {
+            // Cloud ARM64 (e.g. GitHub-hosted aarch64 runners, Neoverse cores)
+            // typically lacks a friendly name field — fall back to raw codes.
+            let implementer = field("CPU implementer").unwrap_or_else(|| "?".to_string());
+            let part = field("CPU part").unwrap_or_else(|| "?".to_string());
+            format!("aarch64 implementer={implementer} part={part}")
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
