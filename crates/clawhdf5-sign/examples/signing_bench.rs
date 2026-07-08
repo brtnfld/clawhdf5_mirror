@@ -6,10 +6,22 @@
 //! Usage:
 //!   cargo run --example signing_bench --release --features "ed25519,mldsa"
 //!
-//! Output: benches/results/signing-$(hostname).csv
+//! To collect the "x86_noavx" row on a machine whose CPU supports AVX-512
+//! (runtime `is_x86_feature_detected!` would otherwise mislabel the run),
+//! disable AVX-512 codegen and force the platform label explicitly:
+//!
+//!   RUSTFLAGS="-C target-feature=-avx512f,-avx512bw,-avx512cd,-avx512dq,-avx512vl" \
+//!     CLAWHDF5_BENCH_PLATFORM=x86_noavx \
+//!     cargo run --example signing_bench --release --features "ed25519,mldsa"
+//!
+//! On real ARM hardware, no override is needed — `detect_platform` reports
+//! "arm" automatically.
+//!
+//! Output: benches/results/signing-$(hostname).csv (merged by platform column;
+//! re-running for one platform label refreshes only that label's rows).
 
 use clawhdf5_sign::{HashAlg, canonical_payload, sign_root, verify_sig};
-use clawhdf5_sign::{HybridSignature, SigningKey, mldsa::MlDsaSigningKey};
+use clawhdf5_sign::{SigningKey, mldsa::MlDsaSigningKey};
 use std::io::Write as IoWrite;
 use std::time::Instant;
 
@@ -62,6 +74,11 @@ fn cpu_model() -> String {
 }
 
 fn detect_platform() -> String {
+    // Runtime CPUID detection can't tell "compiled without AVX-512" apart
+    // from "CPU lacks AVX-512" — allow an explicit override for the former.
+    if let Ok(p) = std::env::var("CLAWHDF5_BENCH_PLATFORM") {
+        return p;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         // Check for AVX-512 support
@@ -131,6 +148,42 @@ fn write_row(w: &mut impl IoWrite, r: &BenchmarkRow) -> std::io::Result<()> {
         r.header_overhead_bytes,
         r.trial
     )
+}
+
+/// Merge this run's rows into `csv_path`, replacing any existing rows for
+/// `platform` (the run being (re-)collected) while preserving rows for every
+/// other platform already recorded in the file.
+///
+/// Returns the total number of data rows in the merged file.
+fn merge_csv(
+    csv_path: &std::path::Path,
+    host: &str,
+    platform: &str,
+    new_rows: &[BenchmarkRow],
+) -> std::io::Result<usize> {
+    let mut kept_lines: Vec<String> = Vec::new();
+    if csv_path.exists() {
+        let existing = std::fs::read_to_string(csv_path)?;
+        for line in existing.lines() {
+            if line.starts_with('#') || line.starts_with("scheme,") {
+                continue; // comment/header regenerated below
+            }
+            let row_platform = line.split(',').nth(1).unwrap_or("");
+            if row_platform != platform {
+                kept_lines.push(line.to_string());
+            }
+        }
+    }
+
+    let mut f = std::fs::File::create(csv_path)?;
+    write_header(&mut f, host)?;
+    for line in &kept_lines {
+        writeln!(f, "{line}")?;
+    }
+    for r in new_rows {
+        write_row(&mut f, r)?;
+    }
+    Ok(kept_lines.len() + new_rows.len())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,14 +322,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&out_dir)?;
 
     let csv_path = out_dir.join(format!("signing-{host}.csv"));
-    println!("\nWriting {}", csv_path.display());
+    println!("\nMerging {} platform={platform} row(s) into {}", rows.len(), csv_path.display());
 
-    let mut f = std::fs::File::create(&csv_path)?;
-    write_header(&mut f, &host)?;
-    for r in &rows {
-        write_row(&mut f, r)?;
-    }
+    let total = merge_csv(&csv_path, &host, &platform, &rows)?;
 
-    println!("Done — {} rows written.", rows.len());
+    println!("Done — {} new rows, {total} total rows in file.", rows.len());
     Ok(())
 }

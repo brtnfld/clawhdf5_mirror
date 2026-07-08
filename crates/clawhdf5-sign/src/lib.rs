@@ -60,6 +60,9 @@ pub enum SignError {
 
     /// Internal signing error (e.g., cryptographic library failure).
     SigningFailed,
+
+    /// The `merkle_sig` attribute is absent from the dataset.
+    AttributeMissing,
 }
 
 impl core::fmt::Display for SignError {
@@ -69,6 +72,7 @@ impl core::fmt::Display for SignError {
             SignError::InvalidKey(msg) => write!(f, "invalid key format: {msg}"),
             SignError::InvalidRoot => write!(f, "missing or invalid Merkle root"),
             SignError::SigningFailed => write!(f, "signing operation failed"),
+            SignError::AttributeMissing => write!(f, "merkle_sig attribute absent from dataset"),
         }
     }
 }
@@ -422,6 +426,63 @@ pub fn verify_sig(
 
     // Both signatures are valid
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HDF5 Attribute Storage (P2.1 step 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Name of the HDF5 attribute storing the hybrid signature.
+///
+/// Mirrors the `merkle_root` attribute in `clawhdf5_format::merkle`, which is
+/// likewise named without its spec-document leading underscore.
+pub const SIG_ATTR_NAME: &str = "merkle_sig";
+
+/// Write a [`HybridSignature`] to a dataset as the `merkle_sig` attribute.
+///
+/// Serializes the signature with [`HybridSignature::to_bytes`] (1-byte
+/// version tag + concatenated Ed25519 and ML-DSA-65 signatures) and attaches
+/// it as an opaque byte-array attribute on the dataset builder.
+///
+/// # Example
+///
+/// ```ignore
+/// use clawhdf5_sign::{canonical_payload, sign_root, write_sig_attr, HashAlg};
+/// use clawhdf5_format::file_writer::FileWriter;
+///
+/// let payload = canonical_payload(&root, &companion_hash, 1, timestamp, HashAlg::Blake3);
+/// let sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
+///
+/// let mut fw = FileWriter::new();
+/// let ds = fw.create_dataset("data");
+/// ds.with_u8_data(&data);
+/// write_sig_attr(ds, &sig);
+/// ```
+#[cfg(feature = "std")]
+pub fn write_sig_attr(
+    dataset: &mut clawhdf5_format::type_builders::DatasetBuilder,
+    sig: &HybridSignature,
+) {
+    dataset.set_attr(
+        SIG_ATTR_NAME,
+        clawhdf5_format::type_builders::AttrValue::Bytes(sig.to_bytes().to_vec()),
+    );
+}
+
+/// Read a [`HybridSignature`] back from a dataset's parsed attributes.
+///
+/// # Errors
+///
+/// Returns `SignError::AttributeMissing` if no `merkle_sig` attribute is
+/// present, or `SignError::InvalidSignature` if the attribute is present but
+/// malformed (wrong length or unrecognized version tag).
+#[cfg(feature = "std")]
+pub fn read_sig_attr(
+    attrs: &[clawhdf5_format::attribute::AttributeMessage],
+) -> Result<HybridSignature, SignError> {
+    let attr = clawhdf5_format::attribute::find_attribute(attrs, SIG_ATTR_NAME)
+        .ok_or(SignError::AttributeMissing)?;
+    HybridSignature::from_bytes(&attr.raw_data)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1506,6 +1567,87 @@ mod tests {
         assert!(matches!(
             verify_sig(&payload, &hybrid_sig, &ed_pub, &ml_pub),
             Err(SignError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn write_and_read_sig_attr_roundtrip() {
+        use crate::mldsa::MlDsaSigningKey;
+        use clawhdf5_format::attribute::extract_attributes;
+        use clawhdf5_format::file_writer::FileWriter;
+        use clawhdf5_format::group_v2::resolve_path_any;
+        use clawhdf5_format::object_header::ObjectHeader;
+        use clawhdf5_format::signature::find_signature;
+        use clawhdf5_format::superblock::Superblock;
+
+        let ed_key = SigningKey::generate();
+        let ml_key = MlDsaSigningKey::generate();
+
+        let root = [0x11; 32];
+        let companion_hash = [0x22; 32];
+        let payload = canonical_payload(&root, &companion_hash, 1, 1_700_000_000, HashAlg::Blake3);
+        let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
+
+        // Write a file with the signature attached to a dataset.
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
+        write_sig_attr(ds, &hybrid_sig);
+        let file_bytes = fw.finish().expect("file should build");
+
+        // Reopen the file from scratch and read the attribute back.
+        let sig_offset = find_signature(&file_bytes).expect("signature not found");
+        let sb = Superblock::parse(&file_bytes, sig_offset).expect("superblock parse failed");
+        let data_addr = resolve_path_any(&file_bytes, &sb, "data").expect("dataset not found");
+        let data_hdr = ObjectHeader::parse(
+            &file_bytes,
+            data_addr as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .expect("dataset header parse failed");
+        let attrs = extract_attributes(&data_hdr, sb.length_size).expect("extract attrs failed");
+
+        let recovered = read_sig_attr(&attrs).expect("merkle_sig attribute not found");
+        assert_eq!(recovered, hybrid_sig);
+
+        // The recovered signature must still verify against the original payload.
+        let ed_pub = ed_key.verifying_key();
+        let ml_pub = ml_key.verifying_key();
+        assert!(verify_sig(&payload, &recovered, &ed_pub, &ml_pub).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn read_sig_attr_missing_returns_attribute_missing() {
+        use clawhdf5_format::attribute::extract_attributes;
+        use clawhdf5_format::file_writer::FileWriter;
+        use clawhdf5_format::group_v2::resolve_path_any;
+        use clawhdf5_format::object_header::ObjectHeader;
+        use clawhdf5_format::signature::find_signature;
+        use clawhdf5_format::superblock::Superblock;
+
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_u8_data(&[1, 2, 3]);
+        let file_bytes = fw.finish().expect("file should build");
+
+        let sig_offset = find_signature(&file_bytes).expect("signature not found");
+        let sb = Superblock::parse(&file_bytes, sig_offset).expect("superblock parse failed");
+        let data_addr = resolve_path_any(&file_bytes, &sb, "data").expect("dataset not found");
+        let data_hdr = ObjectHeader::parse(
+            &file_bytes,
+            data_addr as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .expect("dataset header parse failed");
+        let attrs = extract_attributes(&data_hdr, sb.length_size).expect("extract attrs failed");
+
+        assert!(matches!(
+            read_sig_attr(&attrs),
+            Err(SignError::AttributeMissing)
         ));
     }
 }
