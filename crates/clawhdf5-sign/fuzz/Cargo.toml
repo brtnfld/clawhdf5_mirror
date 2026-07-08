@@ -1,0 +1,23 @@
+[package]
+name = "clawhdf5-sign-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.clawhdf5-sign]
+path = ".."
+features = ["ed25519", "mldsa"]
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_hybrid_signature"
+path = "fuzz_targets/fuzz_hybrid_signature.rs"
+doc = false
