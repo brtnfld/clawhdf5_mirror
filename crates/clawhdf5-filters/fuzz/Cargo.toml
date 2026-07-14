@@ -1,0 +1,28 @@
+[package]
+name = "clawhdf5-filters-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.clawhdf5-filters]
+path = ".."
+features = ["std", "chacha20"]
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_version_store"
+path = "fuzz_targets/fuzz_version_store.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wal_record"
+path = "fuzz_targets/fuzz_wal_record.rs"
+doc = false
