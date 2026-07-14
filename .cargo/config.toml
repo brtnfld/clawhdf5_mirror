@@ -1,0 +1,12 @@
+# Cargo configuration for clawhdf5
+#
+# This file contains environment variables for testing the prototype
+# encryption implementation (P2.2).
+
+[env]
+# Mock Data Encryption Key (DEK) for prototype testing.
+# This is a 32-byte (256-bit) key encoded as 64 hex characters.
+#
+# SECURITY WARNING: This is for PROTOTYPE TESTING ONLY.
+# Production key management (HKDF, KEK wrapping) is deferred to Phase 3.
+CLAW_DUMMY_DEK = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

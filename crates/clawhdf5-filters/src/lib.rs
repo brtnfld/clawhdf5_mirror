@@ -11,6 +11,35 @@
 
 pub mod fast_deflate;
 
+#[cfg(feature = "std")]
+pub mod mock_keystore;
+#[cfg(feature = "std")]
+pub use mock_keystore::{DEK_SIZE, Dek, KeyStoreError, MockKeyStore, mock_dek, try_mock_dek};
+
+#[cfg(feature = "chacha20")]
+pub mod chacha20_filter;
+#[cfg(feature = "chacha20")]
+pub use chacha20_filter::{
+    ChaCha20Error, ChaCha20Nonce, EncryptedChunkResult, EncryptedChunkWriter, EncryptedWriteError,
+    KEY_SIZE, NONCE_SIZE, TAG_SIZE, decrypt, decrypt_chunk, derive_nonce, encrypt, encrypt_chunk,
+};
+
+#[cfg(feature = "chacha20")]
+pub mod version_wal;
+#[cfg(feature = "chacha20")]
+pub use version_wal::{
+    VersionCounterStore, VersionWal, WAL_HEADER_SIZE, WAL_MAGIC, WAL_RECORD_SIZE, WAL_VERSION,
+    WalError, WalRecord, WalRecordStatus,
+};
+
+#[cfg(feature = "chacha20")]
+pub mod filter_pipeline;
+#[cfg(feature = "chacha20")]
+pub use filter_pipeline::{
+    FilterPipeline, FilterPipelineConfig, FilterPipelineError, FilteredChunk, HASH_SIZE, Hash,
+    compute_leaf_hash, compute_leaf_hash_plaintext, shuffle, unshuffle,
+};
+
 /// Decompress zlib-compressed data.
 ///
 /// Uses the fastest available backend. When `max_output_size` > 0,
