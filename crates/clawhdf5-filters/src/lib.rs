@@ -21,7 +21,8 @@ pub mod chacha20_filter;
 #[cfg(feature = "chacha20")]
 pub use chacha20_filter::{
     ChaCha20Error, ChaCha20Nonce, EncryptedChunkResult, EncryptedChunkWriter, EncryptedWriteError,
-    KEY_SIZE, NONCE_SIZE, TAG_SIZE, decrypt, decrypt_chunk, derive_nonce, encrypt, encrypt_chunk,
+    KEY_SIZE, NONCE_SIZE, TAG_SIZE, decrypt, decrypt_chunk, derive_nonce, derive_subkeys, encrypt,
+    encrypt_chunk,
 };
 
 #[cfg(feature = "chacha20")]

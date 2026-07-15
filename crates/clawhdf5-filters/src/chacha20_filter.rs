@@ -21,6 +21,22 @@
 //! This guarantees a unique nonce per (key, chunk, version) triple, preventing
 //! keystream reuse even when chunks are updated in place.
 //!
+//! # Key Separation
+//!
+//! [`encrypt_chunk`]/[`decrypt_chunk`] (the combined API used by
+//! [`EncryptedChunkWriter`] and the filter pipeline) never key the AEAD
+//! cipher and the nonce KDF from the same raw DEK bytes. [`derive_subkeys`]
+//! splits the DEK into an encryption subkey and a nonce-KDF subkey via
+//! domain-separated BLAKE3 derivation before either is used, so a raw DEK is
+//! never handed to two different cryptographic primitives. This closes a
+//! key-separation gap flagged during the P2.3 security review (see
+//! `docs/security-review-notes.md` in the S2-D2-Yr2 spec repo, Remark A.5 of
+//! the security appendix). The low-level [`derive_nonce`]/[`encrypt`]/
+//! [`decrypt`] primitives are unchanged and still accept a raw key directly;
+//! callers building on those primitives directly (rather than through
+//! `encrypt_chunk`/`decrypt_chunk`) are responsible for their own key
+//! separation.
+//!
 //! # Spec Reference
 //!
 //! S2-D2-Yr2 P2.2 step 2: "Add a `chacha20_filter` module to `clawhdf5-filters`
@@ -230,10 +246,38 @@ pub fn decrypt(
     }
 }
 
+/// Derive independent encryption and nonce-KDF subkeys from a single DEK.
+///
+/// Returns `(dek_enc, dek_kdf)`. Using domain-separated BLAKE3 derivation
+/// (distinct from the nonce derivation context in [`derive_nonce`]) means the
+/// raw DEK bytes are never used directly as either key: [`encrypt_chunk`] and
+/// [`decrypt_chunk`] key the AEAD cipher from `dek_enc` and the nonce KDF from
+/// `dek_kdf`. Both subkeys are cheap to recompute on demand, so this adds no
+/// storage cost beyond the wrapped DEK already persisted by the key store.
+#[must_use]
+pub fn derive_subkeys(dek: &Dek) -> (Dek, Dek) {
+    (
+        derive_subkey(dek, "clawhdf5 dek subkey v1 enc"),
+        derive_subkey(dek, "clawhdf5 dek subkey v1 nonce-kdf"),
+    )
+}
+
+fn derive_subkey(dek: &Dek, context: &str) -> Dek {
+    let mut hasher = blake3::Hasher::new_derive_key(context);
+    hasher.update(dek);
+    let hash = hasher.finalize();
+    let mut out = [0u8; KEY_SIZE];
+    out.copy_from_slice(hash.as_bytes());
+    out
+}
+
 /// Encrypt a chunk with automatic nonce derivation.
 ///
 /// This is the primary API for chunk encryption in the HDF5 filter pipeline.
-/// It automatically derives a unique nonce from the chunk index and version counter.
+/// It automatically derives a unique nonce from the chunk index and version
+/// counter, and internally splits `dek` into independent encryption/nonce-KDF
+/// subkeys via [`derive_subkeys`] so the raw DEK never keys two different
+/// cryptographic primitives.
 ///
 /// # Arguments
 ///
@@ -251,13 +295,15 @@ pub fn encrypt_chunk(
     version: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ChaCha20Error> {
-    let nonce = derive_nonce(dek, chunk_idx, version);
-    encrypt(dek, &nonce, plaintext, &[])
+    let (dek_enc, dek_kdf) = derive_subkeys(dek);
+    let nonce = derive_nonce(&dek_kdf, chunk_idx, version);
+    encrypt(&dek_enc, &nonce, plaintext, &[])
 }
 
 /// Decrypt a chunk with automatic nonce derivation.
 ///
 /// This is the primary API for chunk decryption in the HDF5 filter pipeline.
+/// See [`encrypt_chunk`] for the key-separation details.
 ///
 /// # Arguments
 ///
@@ -275,8 +321,9 @@ pub fn decrypt_chunk(
     version: u64,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, ChaCha20Error> {
-    let nonce = derive_nonce(dek, chunk_idx, version);
-    decrypt(dek, &nonce, ciphertext, &[])
+    let (dek_enc, dek_kdf) = derive_subkeys(dek);
+    let nonce = derive_nonce(&dek_kdf, chunk_idx, version);
+    decrypt(&dek_enc, &nonce, ciphertext, &[])
 }
 
 // ---- EncryptedChunkWriter: High-level API integrating WAL + version counters ----
@@ -618,6 +665,37 @@ mod tests {
         let nonce1 = derive_nonce(&dek, 0, 0);
         let nonce2 = derive_nonce(&dek, 0, 1);
         assert_ne!(nonce1, nonce2);
+    }
+
+    #[test]
+    fn derive_subkeys_are_independent_of_each_other_and_the_dek() {
+        let dek = test_dek();
+        let (dek_enc, dek_kdf) = derive_subkeys(&dek);
+
+        assert_ne!(dek_enc, dek, "encryption subkey must not equal the raw DEK");
+        assert_ne!(dek_kdf, dek, "KDF subkey must not equal the raw DEK");
+        assert_ne!(
+            dek_enc, dek_kdf,
+            "encryption and nonce-KDF subkeys must differ from each other"
+        );
+    }
+
+    #[test]
+    fn derive_subkeys_deterministic() {
+        let dek = test_dek();
+        assert_eq!(derive_subkeys(&dek), derive_subkeys(&dek));
+    }
+
+    #[test]
+    fn derive_subkeys_differ_across_deks() {
+        let dek1 = test_dek();
+        let mut dek2 = test_dek();
+        dek2[0] ^= 0xFF;
+
+        let (enc1, kdf1) = derive_subkeys(&dek1);
+        let (enc2, kdf2) = derive_subkeys(&dek2);
+        assert_ne!(enc1, enc2);
+        assert_ne!(kdf1, kdf2);
     }
 
     #[test]
