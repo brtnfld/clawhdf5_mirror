@@ -1553,9 +1553,21 @@ impl<'a> From<&'a MerkleAttr> for MerkleAttrRef<'static> {
 /// Write the merkle_root attribute to a dataset.
 ///
 /// Packs the root hash (32 bytes), algorithm identifier (1 byte),
-/// integrity hash (32 bytes), and companion hash (32 bytes) into a
-/// fixed-width 129-byte binary blob and writes it as the HDF5 attribute
-/// `merkle_root`.
+/// integrity hash (32 bytes), companion hash (32 bytes), and grid hash
+/// (32 bytes) into a fixed-width 129-byte binary blob and writes it as the
+/// HDF5 attribute `merkle_root`.
+///
+/// If `dataset` already has both a shape (set by any `with_*_data`/
+/// `with_shape` call) and chunk dimensions (set by `with_chunks`), the
+/// grid hash is derived from them via
+/// [`subset_proof::compute_grid_hash`](crate::subset_proof::compute_grid_hash)
+/// and bound into the attribute, closing the gap where a dataset's
+/// declared shape/chunk grid could be tampered with undetected (see
+/// [`subset_proof::verify_subset`](crate::subset_proof::verify_subset)'s
+/// `trusted_grid_hash` parameter, which authenticates against exactly this
+/// field). If either is unset (e.g. an unchunked/contiguous dataset with
+/// no `with_chunks` call), the grid hash is left at the all-zero "not
+/// bound" sentinel, matching prior behavior.
 ///
 /// # Arguments
 ///
@@ -1579,13 +1591,20 @@ impl<'a> From<&'a MerkleAttr> for MerkleAttrRef<'static> {
 /// let mut fw = FileWriter::new();
 /// let ds = fw.create_dataset("data");
 /// ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
-/// write_merkle_attr(ds, &tree)?;
+/// ds.with_chunks(&[3]);
+/// write_merkle_attr(ds, &tree)?; // grid hash bound from shape=[6], chunk_dims=[3]
 /// ```
 pub fn write_merkle_attr(
     dataset: &mut crate::type_builders::DatasetBuilder,
     tree: &MerkleTree,
 ) -> Result<(), MerkleError> {
-    let attr = MerkleAttr::from_tree(tree);
+    let grid_hash = match (&dataset.shape, &dataset.chunk_options.chunk_dims) {
+        (Some(dims), Some(chunk_dims)) => {
+            crate::subset_proof::compute_grid_hash(dims, chunk_dims, tree.algorithm())
+        }
+        _ => [0u8; HASH_SIZE],
+    };
+    let attr = MerkleAttr::from_tree_with_companion_and_grid(tree, [0u8; HASH_SIZE], grid_hash);
     let packed = attr.pack();
     dataset.set_attr(
         MERKLE_ATTR_NAME,
@@ -3068,6 +3087,81 @@ mod tests {
 
         // The attribute should be readable (basic check)
         // Full parsing would require reading the attribute back
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_attr_binds_grid_hash_when_shape_and_chunks_set() {
+        use crate::file_writer::FileWriter;
+        use crate::subset_proof::compute_grid_hash;
+        use crate::type_builders::AttrValue;
+
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_u8_data(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        ds.with_chunks(&[4]);
+
+        write_merkle_attr(ds, &tree).expect("write_merkle_attr should succeed");
+
+        let (_, packed_value) = ds
+            .attrs
+            .iter()
+            .find(|(name, _)| name == MERKLE_ATTR_NAME)
+            .expect("merkle_root attribute should be set");
+        let AttrValue::Bytes(packed) = packed_value else {
+            panic!("expected Bytes attribute value");
+        };
+        let attr = MerkleAttr::unpack(packed).expect("attribute should unpack");
+
+        let expected_grid_hash = compute_grid_hash(&[8], &[4], HashAlg::Blake3);
+        assert_ne!(
+            expected_grid_hash,
+            [0u8; HASH_SIZE],
+            "sanity: real grid hash should not itself be the all-zero sentinel"
+        );
+        assert_eq!(
+            attr.grid_hash, expected_grid_hash,
+            "write_merkle_attr should derive grid_hash from the dataset's own \
+             shape/chunk_dims once both are set"
+        );
+        assert!(attr.has_grid_hash());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_attr_leaves_grid_hash_unbound_without_chunks() {
+        // Mirrors test_write_merkle_attr's setup (no `.with_chunks()` call) to
+        // confirm the fallback path leaves grid_hash at the "not bound"
+        // sentinel rather than erroring or guessing.
+        use crate::file_writer::FileWriter;
+        use crate::type_builders::AttrValue;
+
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_u8_data(&[1, 2, 3, 4]);
+
+        write_merkle_attr(ds, &tree).expect("write_merkle_attr should succeed");
+
+        let (_, packed_value) = ds
+            .attrs
+            .iter()
+            .find(|(name, _)| name == MERKLE_ATTR_NAME)
+            .expect("merkle_root attribute should be set");
+        let AttrValue::Bytes(packed) = packed_value else {
+            panic!("expected Bytes attribute value");
+        };
+        let attr = MerkleAttr::unpack(packed).expect("attribute should unpack");
+
+        assert!(!attr.has_grid_hash());
+        assert_eq!(attr.grid_hash, [0u8; HASH_SIZE]);
     }
 
     #[test]
