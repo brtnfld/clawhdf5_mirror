@@ -99,6 +99,16 @@ fuzz_target!(|data: &[u8]| {
         grid_params: grid.clone(),
         coverage_cert: c.hash(),
     };
+    // Fuzz both a "trusted" grid hash that matches `grid` and an arbitrary
+    // adversarial one, since verify_subset must never panic either way. Read
+    // this before `c.rest()` below drains the cursor.
+    let use_real_grid_hash = c.byte() % 2 == 0;
+    let fuzzed_grid_hash = c.hash();
+    let trusted_grid_hash = if use_real_grid_hash {
+        grid.grid_hash
+    } else {
+        fuzzed_grid_hash
+    };
     let chunk_data = c.rest();
     let chunks: Vec<ChunkData<'_>> = chunk_indices
         .iter()
@@ -118,6 +128,7 @@ fuzz_target!(|data: &[u8]| {
         &chunks,
         &adversarial_proof,
         &grid,
+        &trusted_grid_hash,
         &sel,
         order,
     );
@@ -139,6 +150,7 @@ fuzz_target!(|data: &[u8]| {
             &delivered,
             &proof,
             &grid,
+            &grid.grid_hash,
             &sel,
             order,
         );

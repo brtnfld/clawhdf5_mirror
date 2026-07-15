@@ -68,7 +68,7 @@ impl ChunkGridParams {
     }
 }
 
-fn compute_grid_hash(dims: &[u64], chunk_shape: &[u64], alg: HashAlg) -> [u8; HASH_SIZE] {
+pub(crate) fn compute_grid_hash(dims: &[u64], chunk_shape: &[u64], alg: HashAlg) -> [u8; HASH_SIZE] {
     let mut buf = Vec::with_capacity((dims.len() + chunk_shape.len()) * 8);
     for &d in dims {
         buf.extend_from_slice(&d.to_le_bytes());
@@ -452,13 +452,29 @@ fn checked_padded_leaf_count(grid: &ChunkGridParams) -> Result<usize, MerkleErro
 /// dataset rooted at `root`, covering exactly the region the verifier
 /// requested (`expected_grid`, `sel`, `order`).
 ///
-/// `expected_grid`/`sel`/`order` must come from the verifier's own trusted
-/// knowledge of the dataset and request — never from `proof` itself, or a
-/// prover holding the real tree could satisfy every other check here while
-/// substituting a proof for a different region than was requested.
-/// `proof.grid_params` is treated as untrusted and is not used to derive the
-/// expected chunk set; it only feeds the (redundant, defense-in-depth)
-/// coverage-certificate check below.
+/// # Trust model
+///
+/// `expected_grid.dims`/`expected_grid.chunk_shape` do **not** need to come
+/// from the verifier's own out-of-band trusted knowledge — they can come
+/// from anywhere convenient (e.g. a live read of the HDF5 object header),
+/// because this function authenticates them itself: it recomputes
+/// `H(dims || chunk_shape)` (the same way
+/// [`ChunkGridParams::new`]/`compute_grid_hash` does) and rejects with
+/// [`MerkleError::GridHashMismatch`] unless it matches `trusted_grid_hash`.
+/// `trusted_grid_hash` must be the cryptographically-anchored 32-byte hash
+/// obtained from an already-verified `MerkleAttr::grid_hash()` or
+/// `MerkleAttrRef::grid_hash()` — i.e. bound into the file's signed Merkle
+/// attribute. This is what closes the gap where a dataset's declared
+/// shape/chunk grid could be tampered with while chunk data and version
+/// counters remain untouched: the caller only needs to trust one small
+/// hash, not `expected_grid`'s contents.
+///
+/// `sel`/`order` still must come from the verifier's own trusted knowledge
+/// of the request — never from `proof` itself, or a prover holding the real
+/// tree could satisfy every other check here while substituting a proof for
+/// a different region than was requested. `proof.grid_params` is treated as
+/// untrusted and is not used to derive the expected chunk set; it only
+/// feeds the (redundant, defense-in-depth) coverage-certificate check below.
 ///
 /// `chunks` must be in the same order as `proof.chunk_indices`, with
 /// `chunks[i].index == proof.chunk_indices[i]` — this is what lets the
@@ -468,6 +484,10 @@ fn checked_padded_leaf_count(grid: &ChunkGridParams) -> Result<usize, MerkleErro
 ///
 /// # Errors
 ///
+/// - [`MerkleError::GridHashMismatch`] if `expected_grid`'s `dims`/
+///   `chunk_shape` do not hash to `trusted_grid_hash` — `expected_grid`
+///   itself has been tampered with (the T1/T3 grid-tampering gap this
+///   parameter closes).
 /// - [`MerkleError::CompanionTampered`] if `chunks` doesn't match
 ///   `proof.chunk_indices` (wrong length, wrong index, or reordered) —
 ///   this is the "chunk silently omitted/substituted" detection path. The
@@ -486,9 +506,24 @@ pub fn verify_subset(
     chunks: &[ChunkData<'_>],
     proof: &SubsetProof,
     expected_grid: &ChunkGridParams,
+    trusted_grid_hash: &[u8; HASH_SIZE],
     sel: &Selection,
     order: LeafOrder,
 ) -> Result<bool, MerkleError> {
+    // Authenticate expected_grid's dims/chunk_shape against the caller's
+    // cryptographically-anchored grid hash *before* trusting anything else
+    // about expected_grid. Recomputing from expected_grid's own dims/
+    // chunk_shape (rather than trusting its `grid_hash` field, which is a
+    // plain pub field an attacker could set to match tampered dims/
+    // chunk_shape) is what prevents a coherent-looking but wrong
+    // `expected_grid` from slipping through when its contents were sourced
+    // from an unauthenticated location (e.g. a live object-header read).
+    let recomputed_grid_hash =
+        compute_grid_hash(&expected_grid.dims, &expected_grid.chunk_shape, alg);
+    if !constant_time_eq(&recomputed_grid_hash, trusted_grid_hash) {
+        return Err(MerkleError::GridHashMismatch);
+    }
+
     // `proof` is untrusted wire data: chunk_indices/leaf_hashes are walked
     // in lockstep below by index, so their lengths (and the caller-supplied
     // `chunks`) must all agree before any indexing happens.
@@ -716,6 +751,7 @@ mod tests {
             &delivered,
             &proof,
             &grid,
+            &grid.grid_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -750,6 +786,7 @@ mod tests {
             &chunk_data,
             &proof,
             &grid,
+            &grid.grid_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -781,6 +818,7 @@ mod tests {
             &delivered,
             &proof,
             &grid,
+            &grid.grid_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -825,6 +863,7 @@ mod tests {
             &delivered,
             &proof,
             &grid,
+            &grid.grid_hash,
             &sel,
             LeafOrder::Morton,
         )
@@ -876,6 +915,7 @@ mod tests {
             &delivered,
             &proof,
             &grid,
+            &grid.grid_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -900,9 +940,16 @@ mod tests {
 
         // `expected_grid` (the verifier's own trusted grid, not the proof's)
         // is now what's structurally validated, so the malformed input must
-        // be injected there.
+        // be injected there. Its stale `.grid_hash` field (still the
+        // original, pre-mutation hash) is irrelevant here — verify_subset
+        // never reads `expected_grid.grid_hash`, it recomputes from
+        // `dims`/`chunk_shape`. Pass a `trusted_grid_hash` that matches the
+        // mutated grid so the (pre-existing) structural check below is what
+        // gets exercised, not the new grid-hash-authentication check.
         let mut bad_grid = grid.clone();
         bad_grid.chunk_shape.push(1); // now mismatched vs dims.len()
+        let bad_trusted_hash =
+            compute_grid_hash(&bad_grid.dims, &bad_grid.chunk_shape, HashAlg::Blake3);
 
         let err = verify_subset(
             tree.root(),
@@ -910,6 +957,7 @@ mod tests {
             &delivered,
             &proof,
             &bad_grid,
+            &bad_trusted_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -934,6 +982,8 @@ mod tests {
 
         let mut bad_grid = grid.clone();
         bad_grid.chunk_shape[0] = 0; // would divide-by-zero in div_ceil
+        let bad_trusted_hash =
+            compute_grid_hash(&bad_grid.dims, &bad_grid.chunk_shape, HashAlg::Blake3);
 
         let err = verify_subset(
             tree.root(),
@@ -941,6 +991,7 @@ mod tests {
             &delivered,
             &proof,
             &bad_grid,
+            &bad_trusted_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -973,6 +1024,7 @@ mod tests {
             &delivered,
             &proof,
             &bad_grid,
+            &bad_grid.grid_hash,
             &bad_sel,
             LeafOrder::RowMajor,
         )
@@ -1005,6 +1057,7 @@ mod tests {
             &delivered,
             &proof,
             &bad_grid,
+            &bad_grid.grid_hash,
             &sel,
             LeafOrder::RowMajor,
         )
@@ -1049,10 +1102,64 @@ mod tests {
             &delivered,
             &proof,
             &grid,
+            &grid.grid_hash,
             &requested_sel,
             LeafOrder::RowMajor,
         )
         .unwrap_err();
         assert!(matches!(err, MerkleError::SelectionMismatch));
+    }
+
+    #[test]
+    fn test_verify_subset_rejects_tampered_grid_params_via_grid_hash_mismatch() {
+        // The actual attack this closes: a dataset's declared chunk-grid
+        // parameters (dims/chunk_shape) get tampered with while chunk data
+        // and version counters remain untouched. Since `ChunkGridParams`'s
+        // fields are all `pub`, an attacker can hand `verify_subset` a
+        // forged `expected_grid` whose `grid_hash` field is *internally*
+        // self-consistent with its own (forged) dims/chunk_shape — so a
+        // check that only looked at `expected_grid.grid_hash` in isolation
+        // would find nothing wrong. The fix is that `verify_subset` doesn't
+        // trust `expected_grid.grid_hash` at all: it recomputes the hash
+        // from `expected_grid.dims`/`chunk_shape` and compares it against
+        // `trusted_grid_hash`, which the caller must obtain from an
+        // independently-anchored, already-verified source (e.g.
+        // `MerkleAttr::grid_hash()`/`MerkleAttrRef::grid_hash()`).
+        let (tree, grid, chunks) = make_tree_and_grid(8);
+        let sel = Selection::slice(&[2..5]);
+        let proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor).unwrap();
+
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| ChunkData {
+                index: idx,
+                data: &chunks[idx],
+            })
+            .collect();
+
+        // Forged grid: different dims/chunk_shape than the real dataset (8
+        // chunks of shape [1]), but its own `grid_hash` field is coherently
+        // recomputed for the forged values (i.e. it would pass a naive "is
+        // grid_params self-consistent" check).
+        let forged_grid = ChunkGridParams::new(vec![999], vec![1], HashAlg::Blake3);
+        assert_ne!(forged_grid.grid_hash, grid.grid_hash);
+
+        // The verifier's trusted hash reflects the REAL dataset grid,
+        // obtained independently (e.g. from an already-verified MerkleAttr).
+        let trusted_grid_hash = grid.grid_hash;
+
+        let err = verify_subset(
+            tree.root(),
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &forged_grid,
+            &trusted_grid_hash,
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MerkleError::GridHashMismatch));
     }
 }

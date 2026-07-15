@@ -92,12 +92,18 @@ pub enum MerkleError {
     /// and chunk grid (see `subset_proof::verify_subset`). This means the
     /// prover delivered a proof for a different region than was requested.
     SelectionMismatch,
+    /// A dataset's declared chunk-grid parameters (`dims`/`chunk_shape`) do
+    /// not match the authenticated `grid_hash` bound into the signed
+    /// `MerkleAttr`/`MerkleAttrRef`. This closes the T1/T3 gap where an
+    /// attacker tampers with the declared shape/chunk grid while leaving
+    /// chunk data and version counters untouched.
+    GridHashMismatch,
 }
 
 /// Reasons why a merkle attribute is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidAttrReason {
-    /// Attribute size is not 97 bytes.
+    /// Attribute size is not 129 bytes.
     WrongSize,
     /// Unknown algorithm identifier.
     UnknownAlgorithm,
@@ -112,6 +118,23 @@ pub enum CompanionVerifyResult {
     Valid,
     /// No companion data present (hash is all zeros).
     NoCompanion,
+    /// Verification failed: hash mismatch (possible tampering).
+    HashMismatch,
+}
+
+/// Result of chunk-grid parameter verification.
+///
+/// Mirrors [`CompanionVerifyResult`]: the `grid_hash` field binds a
+/// dataset's `dims`/`chunk_shape` into the signed `MerkleAttr`, closing the
+/// gap where those parameters could be tampered with while chunk data and
+/// version counters remain untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridVerifyResult {
+    /// Verification passed: grid hash matches the provided `dims`/`chunk_shape`.
+    Valid,
+    /// No grid hash present (hash is all zeros) — not bound, defense-in-depth
+    /// checks elsewhere (e.g. `subset_proof::verify_subset`) still apply.
+    NoGrid,
     /// Verification failed: hash mismatch (possible tampering).
     HashMismatch,
 }
@@ -147,7 +170,7 @@ impl core::fmt::Display for MerkleError {
             MerkleError::InvalidAttribute { reason } => {
                 let msg = match reason {
                     InvalidAttrReason::WrongSize => {
-                        "attribute size is not valid (expected 97 bytes for v0)"
+                        "attribute size is not valid (expected 129 bytes for v0)"
                     }
                     InvalidAttrReason::UnknownAlgorithm => "unknown algorithm identifier",
                     InvalidAttrReason::IntegrityMismatch => "integrity hash mismatch",
@@ -158,6 +181,12 @@ impl core::fmt::Display for MerkleError {
                 write!(
                     f,
                     "subset proof's chunk set does not match the requested selection"
+                )
+            }
+            MerkleError::GridHashMismatch => {
+                write!(
+                    f,
+                    "chunk-grid parameters do not match the authenticated grid hash"
                 )
             }
         }
@@ -218,6 +247,7 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::NoncePending => VerifyResponse::Halt,
         MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
         MerkleError::SelectionMismatch => VerifyResponse::Halt,
+        MerkleError::GridHashMismatch => VerifyResponse::Halt,
     }
 }
 
@@ -913,18 +943,26 @@ const INTEGRITY_PREFIX: u8 = 0x03;
 
 // ---- Attribute format versioning ----
 //
-// Version 0 (implicit): 97 bytes, current format
+// Version 0 (implicit): 129 bytes, current format
 // Future versions may add a version byte prefix
 
-/// Attribute format version 0 (current, 97 bytes with companion hash).
+/// Attribute format version 0 (current, 129 bytes with companion and grid hash).
 pub const MERKLE_ATTR_VERSION_0: u8 = 0;
 
-// ---- 97-byte attribute layout offsets ----
+// ---- 129-byte attribute layout offsets ----
 //
-// ┌─────────────────────────────────┬───────┬─────────────────────────────────┬─────────────────────────────────┐
-// │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │   Companion Hash (32B)          │
-// └─────────────────────────────────┴───────┴─────────────────────────────────┴─────────────────────────────────┘
-// 0                                32      33                                65                                97
+// ┌─────────────────────────────────┬───────┬─────────────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+// │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │   Companion Hash (32B)          │      Grid Hash (32B)            │
+// └─────────────────────────────────┴───────┴─────────────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+// 0                                32      33                                65                                97                               129
+//
+// The Grid Hash field binds a dataset's chunk-grid parameters (`dims`,
+// `chunk_shape`) into this attribute (see `subset_proof::ChunkGridParams`
+// and `subset_proof::compute_grid_hash`). Like Companion Hash, it is an
+// independent field alongside the `integrity` sub-hash — NOT folded into
+// `compute_integrity` — protected instead by whatever eventually signs the
+// whole packed attribute blob (P2.1's hybrid signature). An all-zero value
+// is the sentinel for "no grid hash bound" (see `has_grid_hash`).
 //
 /// Offset of root hash in packed attribute.
 const ATTR_ROOT_OFFSET: usize = 0;
@@ -952,8 +990,19 @@ const ATTR_COMPANION_SIZE: usize = HASH_SIZE;
 /// End offset of companion hash (exclusive).
 const ATTR_COMPANION_END: usize = ATTR_COMPANION_OFFSET + ATTR_COMPANION_SIZE; // 97
 
-/// Size of the packed merkle_root attribute (root + alg_id + integrity + companion_hash).
-pub const MERKLE_ATTR_SIZE: usize = ATTR_COMPANION_END; // 97 bytes
+/// Offset of grid hash in packed attribute.
+///
+/// Binds a dataset's chunk-grid parameters (`dims`, `chunk_shape`) into the
+/// attribute (see `subset_proof::ChunkGridParams`/`compute_grid_hash`). An
+/// all-zero value means "no grid hash bound" (see `MerkleAttr::has_grid_hash`).
+const ATTR_GRID_OFFSET: usize = ATTR_COMPANION_END; // 97
+/// Size of grid hash field.
+const ATTR_GRID_SIZE: usize = HASH_SIZE;
+/// End offset of grid hash (exclusive).
+const ATTR_GRID_END: usize = ATTR_GRID_OFFSET + ATTR_GRID_SIZE; // 129
+
+/// Size of the packed merkle_root attribute (root + alg_id + integrity + companion_hash + grid_hash).
+pub const MERKLE_ATTR_SIZE: usize = ATTR_GRID_END; // 129 bytes
 
 /// Name of the HDF5 attribute storing merkle root information.
 pub const MERKLE_ATTR_NAME: &str = "merkle_root";
@@ -987,11 +1036,12 @@ impl HashAlg {
 
 /// Packed merkle root attribute data.
 ///
-/// Layout (97 bytes total):
+/// Layout (129 bytes total):
 /// - Bytes 0-31: Root hash (32 bytes)
 /// - Byte 32: Algorithm identifier (1 byte)
 /// - Bytes 33-64: Integrity hash (32 bytes) - binds root and algorithm
 /// - Bytes 65-96: Companion hash (32 bytes) - SHA-256 of nodes data
+/// - Bytes 97-128: Grid hash (32 bytes) - binds dataset `dims`/`chunk_shape`
 ///
 /// The integrity hash is `H(0x03 || root || alg_id)` and prevents
 /// an attacker from modifying the algorithm ID without detection.
@@ -999,6 +1049,13 @@ impl HashAlg {
 /// The companion hash is SHA-256 of the full nodes array (either inline
 /// in `merkle_nodes` attribute or in `/merkle/{name}` companion dataset).
 /// This allows quick tamper detection before walking the tree.
+///
+/// The grid hash is `H(dims || chunk_shape)` (see
+/// `subset_proof::compute_grid_hash`), matching the hash bound into
+/// `subset_proof::ChunkGridParams`. Like the companion hash, it is *not*
+/// folded into `integrity` — it is an independent field, protected (once
+/// signed) by whatever eventually signs the whole packed attribute blob.
+/// An all-zero value means "no grid hash bound" (see [`Self::has_grid_hash`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerkleAttr {
     /// The Merkle tree root hash.
@@ -1010,13 +1067,16 @@ pub struct MerkleAttr {
     /// SHA-256 hash of the companion/inline nodes data.
     /// All zeros if no companion data (root-only attribute).
     pub companion_hash: [u8; HASH_SIZE],
+    /// `H(dims || chunk_shape)`, binding the dataset's chunk-grid parameters.
+    /// All zeros if no grid hash is bound.
+    pub grid_hash: [u8; HASH_SIZE],
 }
 
 impl MerkleAttr {
-    /// Create a new merkle attribute from a tree without companion data.
+    /// Create a new merkle attribute from a tree without companion or grid data.
     ///
     /// Computes the integrity hash as `H(0x03 || root || alg_id)`.
-    /// Sets companion_hash to all zeros.
+    /// Sets companion_hash and grid_hash to all zeros.
     #[must_use]
     pub fn from_tree(tree: &MerkleTree) -> Self {
         Self::from_tree_with_companion(tree, [0u8; HASH_SIZE])
@@ -1026,8 +1086,24 @@ impl MerkleAttr {
     ///
     /// The companion_hash should be SHA-256 of the nodes data (either inline
     /// in `merkle_nodes` attribute or in `/merkle/{name}` companion dataset).
+    /// Sets grid_hash to all zeros (no grid hash bound).
     #[must_use]
     pub fn from_tree_with_companion(tree: &MerkleTree, companion_hash: [u8; HASH_SIZE]) -> Self {
+        Self::from_tree_with_companion_and_grid(tree, companion_hash, [0u8; HASH_SIZE])
+    }
+
+    /// Create a new merkle attribute from a tree with companion data hash and
+    /// grid hash.
+    ///
+    /// `grid_hash` should be `H(dims || chunk_shape)` as computed by
+    /// `subset_proof::compute_grid_hash`/`subset_proof::ChunkGridParams::new`,
+    /// binding the dataset's chunk-grid parameters into the signed attribute.
+    #[must_use]
+    pub fn from_tree_with_companion_and_grid(
+        tree: &MerkleTree,
+        companion_hash: [u8; HASH_SIZE],
+        grid_hash: [u8; HASH_SIZE],
+    ) -> Self {
         let root = *tree.root();
         let algorithm = tree.algorithm();
         let integrity = Self::compute_integrity(&root, algorithm);
@@ -1037,6 +1113,7 @@ impl MerkleAttr {
             algorithm,
             integrity,
             companion_hash,
+            grid_hash,
         }
     }
 
@@ -1052,9 +1129,9 @@ impl MerkleAttr {
         alg.hash_raw(&data)
     }
 
-    /// Pack the attribute into a 97-byte binary blob.
+    /// Pack the attribute into a 129-byte binary blob.
     ///
-    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32]`
+    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32][grid_hash:32]`
     #[must_use]
     pub fn pack(&self) -> [u8; MERKLE_ATTR_SIZE] {
         let mut buf = [0u8; MERKLE_ATTR_SIZE];
@@ -1062,17 +1139,18 @@ impl MerkleAttr {
         buf[ATTR_ALG_OFFSET] = self.algorithm.to_id();
         buf[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END].copy_from_slice(&self.integrity);
         buf[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END].copy_from_slice(&self.companion_hash);
+        buf[ATTR_GRID_OFFSET..ATTR_GRID_END].copy_from_slice(&self.grid_hash);
         buf
     }
 
-    /// Unpack from a 97-byte binary blob.
+    /// Unpack from a 129-byte binary blob.
     ///
-    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32]`
+    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32][grid_hash:32]`
     ///
     /// # Errors
     ///
     /// Returns `Err` if:
-    /// - The data is not 97 bytes (`WrongSize`)
+    /// - The data is not 129 bytes (`WrongSize`)
     /// - The algorithm ID is unknown (`UnknownAlgorithm`)
     /// - The integrity hash does not match (`IntegrityMismatch`)
     pub fn unpack(data: &[u8]) -> Result<Self, MerkleError> {
@@ -1096,6 +1174,9 @@ impl MerkleAttr {
         let mut companion_hash = [0u8; ATTR_COMPANION_SIZE];
         companion_hash.copy_from_slice(&data[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END]);
 
+        let mut grid_hash = [0u8; ATTR_GRID_SIZE];
+        grid_hash.copy_from_slice(&data[ATTR_GRID_OFFSET..ATTR_GRID_END]);
+
         // Verify integrity hash
         let expected_integrity = Self::compute_integrity(&root, algorithm);
         if !constant_time_eq(&integrity, &expected_integrity) {
@@ -1109,6 +1190,7 @@ impl MerkleAttr {
             algorithm,
             integrity,
             companion_hash,
+            grid_hash,
         })
     }
 
@@ -1148,6 +1230,44 @@ impl MerkleAttr {
         self.companion_hash != [0u8; HASH_SIZE]
     }
 
+    /// Verify the chunk-grid parameters against the stored grid hash.
+    ///
+    /// Computes `H(dims || chunk_shape)` the same way
+    /// `subset_proof::compute_grid_hash` does and compares it with the
+    /// stored `grid_hash`, using this attribute's own hash algorithm.
+    ///
+    /// # Returns
+    ///
+    /// - `Valid`: Grid hash matches the provided `dims`/`chunk_shape`
+    /// - `NoGrid`: No grid hash present (hash is all zeros)
+    /// - `HashMismatch`: Verification failed (possible tampering)
+    #[must_use]
+    pub fn verify_grid(&self, dims: &[u64], chunk_shape: &[u64]) -> GridVerifyResult {
+        // All zeros means no grid hash bound
+        if self.grid_hash == [0u8; HASH_SIZE] {
+            return GridVerifyResult::NoGrid;
+        }
+        let computed = crate::subset_proof::compute_grid_hash(dims, chunk_shape, self.algorithm);
+        if constant_time_eq(&computed, &self.grid_hash) {
+            GridVerifyResult::Valid
+        } else {
+            GridVerifyResult::HashMismatch
+        }
+    }
+
+    /// Check if this attribute has a grid hash bound.
+    #[must_use]
+    pub fn has_grid_hash(&self) -> bool {
+        self.grid_hash != [0u8; HASH_SIZE]
+    }
+
+    /// Get the grid hash.
+    #[inline]
+    #[must_use]
+    pub fn grid_hash(&self) -> &[u8; HASH_SIZE] {
+        &self.grid_hash
+    }
+
     /// Get the format version of this attribute.
     #[must_use]
     pub const fn version(&self) -> u8 {
@@ -1164,7 +1284,7 @@ impl MerkleAttr {
 /// # Format Versioning
 ///
 /// The format version is determined implicitly by the data size:
-/// - 97 bytes: Version 0 (current format)
+/// - 129 bytes: Version 0 (current format)
 ///
 /// Future versions may add an explicit version byte prefix.
 ///
@@ -1195,7 +1315,7 @@ impl<'a> MerkleAttrRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the data size is not 97 bytes.
+    /// Returns `Err` if the data size is not 129 bytes.
     pub fn from_slice(data: &'a [u8]) -> Result<Self, MerkleError> {
         Self::validate_size(data.len())?;
         Ok(Self {
@@ -1207,7 +1327,7 @@ impl<'a> MerkleAttrRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the data size is not 97 bytes.
+    /// Returns `Err` if the data size is not 129 bytes.
     pub fn from_vec(data: Vec<u8>) -> Result<MerkleAttrRef<'static>, MerkleError> {
         Self::validate_size(data.len())?;
         Ok(MerkleAttrRef {
@@ -1296,6 +1416,23 @@ impl<'a> MerkleAttrRef<'a> {
         self.companion_hash().iter().any(|&b| b != 0)
     }
 
+    /// Get the grid hash (zero-copy slice).
+    ///
+    /// `H(dims || chunk_shape)`, binding the dataset's chunk-grid parameters.
+    /// All zeros if no grid hash is bound.
+    #[must_use]
+    pub fn grid_hash(&self) -> &[u8] {
+        &self.data[ATTR_GRID_OFFSET..ATTR_GRID_END]
+    }
+
+    /// Check if this attribute has a grid hash bound.
+    ///
+    /// Returns `false` when the grid hash is all zeros.
+    #[must_use]
+    pub fn has_grid_hash(&self) -> bool {
+        self.grid_hash().iter().any(|&b| b != 0)
+    }
+
     /// Verify the integrity hash without fully unpacking.
     ///
     /// This validates that the root and algorithm haven't been tampered with.
@@ -1342,6 +1479,43 @@ impl<'a> MerkleAttrRef<'a> {
         }
     }
 
+    /// Verify the chunk-grid parameters against the stored grid hash.
+    ///
+    /// Computes `H(dims || chunk_shape)` the same way
+    /// `subset_proof::compute_grid_hash` does and compares it with the
+    /// stored `grid_hash`, using this attribute's own hash algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the algorithm ID is unknown (`UnknownAlgorithm`).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Valid)`: Grid hash matches the provided `dims`/`chunk_shape`
+    /// - `Ok(NoGrid)`: No grid hash present (hash is all zeros)
+    /// - `Ok(HashMismatch)`: Verification failed (possible tampering)
+    pub fn verify_grid(
+        &self,
+        dims: &[u64],
+        chunk_shape: &[u64],
+    ) -> Result<GridVerifyResult, MerkleError> {
+        if !self.has_grid_hash() {
+            return Ok(GridVerifyResult::NoGrid);
+        }
+        let algorithm = self.algorithm()?;
+        let computed = crate::subset_proof::compute_grid_hash(dims, chunk_shape, algorithm);
+        // Safe: grid_hash() always returns exactly HASH_SIZE bytes for v0
+        let grid_arr: &[u8; HASH_SIZE] = match self.grid_hash().try_into() {
+            Ok(arr) => arr,
+            Err(_) => return Ok(GridVerifyResult::NoGrid),
+        };
+        Ok(if constant_time_eq(&computed, grid_arr) {
+            GridVerifyResult::Valid
+        } else {
+            GridVerifyResult::HashMismatch
+        })
+    }
+
     /// Convert to an owned `MerkleAttr`, verifying integrity.
     ///
     /// # Errors
@@ -1380,7 +1554,7 @@ impl<'a> From<&'a MerkleAttr> for MerkleAttrRef<'static> {
 ///
 /// Packs the root hash (32 bytes), algorithm identifier (1 byte),
 /// integrity hash (32 bytes), and companion hash (32 bytes) into a
-/// fixed-width 97-byte binary blob and writes it as the HDF5 attribute
+/// fixed-width 129-byte binary blob and writes it as the HDF5 attribute
 /// `merkle_root`.
 ///
 /// # Arguments
@@ -2788,9 +2962,9 @@ mod tests {
         let attr = MerkleAttr::from_tree(&tree);
         let packed = attr.pack();
 
-        // Verify size (now 97 bytes with companion hash)
+        // Verify size (now 129 bytes with companion hash and grid hash)
         assert_eq!(packed.len(), MERKLE_ATTR_SIZE);
-        assert_eq!(packed.len(), 97);
+        assert_eq!(packed.len(), 129);
 
         // Unpack and verify round-trip
         let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
@@ -2799,6 +2973,8 @@ mod tests {
         assert_eq!(unpacked.integrity, attr.integrity);
         assert_eq!(unpacked.companion_hash, [0u8; HASH_SIZE]); // No companion for basic from_tree
         assert!(!unpacked.has_companion());
+        assert_eq!(unpacked.grid_hash, [0u8; HASH_SIZE]); // No grid hash for basic from_tree
+        assert!(!unpacked.has_grid_hash());
     }
 
     #[test]
@@ -2862,10 +3038,10 @@ mod tests {
 
     #[test]
     fn test_merkle_attr_invalid_size() {
-        // Too short (97 bytes expected)
-        assert!(MerkleAttr::unpack(&[0u8; 96]).is_err());
+        // Too short (129 bytes expected)
+        assert!(MerkleAttr::unpack(&[0u8; 128]).is_err());
         // Too long
-        assert!(MerkleAttr::unpack(&[0u8; 98]).is_err());
+        assert!(MerkleAttr::unpack(&[0u8; 130]).is_err());
         // Empty
         assert!(MerkleAttr::unpack(&[]).is_err());
     }
@@ -3136,13 +3312,71 @@ mod tests {
 
         // Pack and unpack
         let packed = attr.pack();
-        assert_eq!(packed.len(), MERKLE_ATTR_SIZE); // 97 bytes
+        assert_eq!(packed.len(), MERKLE_ATTR_SIZE); // 129 bytes
 
         let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
         assert_eq!(unpacked.root, attr.root);
         assert_eq!(unpacked.algorithm, attr.algorithm);
         assert_eq!(unpacked.companion_hash, companion_hash);
         assert!(unpacked.has_companion());
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_merkle_attr_with_companion_and_grid_hash() {
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let companion_hash = compute_sha256(b"test companion data");
+        let dims = vec![10u64, 20u64];
+        let chunk_shape = vec![2u64, 4u64];
+        let grid_hash = crate::subset_proof::compute_grid_hash(&dims, &chunk_shape, tree.algorithm());
+
+        let attr =
+            MerkleAttr::from_tree_with_companion_and_grid(&tree, companion_hash, grid_hash);
+
+        let packed = attr.pack();
+        assert_eq!(packed.len(), MERKLE_ATTR_SIZE); // 129 bytes
+
+        let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
+        assert_eq!(unpacked.root, attr.root);
+        assert_eq!(unpacked.companion_hash, companion_hash);
+        assert_eq!(unpacked.grid_hash, grid_hash);
+        assert!(unpacked.has_grid_hash());
+
+        // Correct dims/chunk_shape verify as Valid.
+        assert_eq!(
+            unpacked.verify_grid(&dims, &chunk_shape),
+            GridVerifyResult::Valid
+        );
+
+        // Tampered dims fail verification (this is the actual gap being closed:
+        // an attacker changing the declared shape/chunk grid is now detected).
+        let tampered_dims = vec![99u64, 20u64];
+        assert_eq!(
+            unpacked.verify_grid(&tampered_dims, &chunk_shape),
+            GridVerifyResult::HashMismatch
+        );
+
+        // Basic from_tree (no grid hash bound) reports NoGrid.
+        let no_grid_attr = MerkleAttr::from_tree(&tree);
+        assert_eq!(
+            no_grid_attr.verify_grid(&dims, &chunk_shape),
+            GridVerifyResult::NoGrid
+        );
+
+        // MerkleAttrRef mirrors the same behavior.
+        let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
+        assert!(attr_ref.has_grid_hash());
+        assert_eq!(
+            attr_ref.verify_grid(&dims, &chunk_shape).unwrap(),
+            GridVerifyResult::Valid
+        );
+        assert_eq!(
+            attr_ref.verify_grid(&tampered_dims, &chunk_shape).unwrap(),
+            GridVerifyResult::HashMismatch
+        );
     }
 
     #[test]
@@ -3410,13 +3644,13 @@ mod tests {
     #[test]
     fn test_merkle_attr_ref_invalid_size() {
         // Too short
-        assert!(MerkleAttrRef::from_slice(&[0u8; 96]).is_err());
+        assert!(MerkleAttrRef::from_slice(&[0u8; 128]).is_err());
         // Too long
-        assert!(MerkleAttrRef::from_slice(&[0u8; 98]).is_err());
+        assert!(MerkleAttrRef::from_slice(&[0u8; 130]).is_err());
         // Empty
         assert!(MerkleAttrRef::from_slice(&[]).is_err());
-        // Current size (97 bytes) should work
-        assert!(MerkleAttrRef::from_slice(&[0u8; 97]).is_ok());
+        // Current size (129 bytes) should work
+        assert!(MerkleAttrRef::from_slice(&[0u8; 129]).is_ok());
     }
 
     #[test]
@@ -3460,11 +3694,12 @@ mod tests {
             algorithm: HashAlg::Blake3,
             integrity: [0u8; HASH_SIZE],
             companion_hash: [0u8; HASH_SIZE],
+            grid_hash: [0u8; HASH_SIZE],
         };
         assert_eq!(attr.version(), MERKLE_ATTR_VERSION_0);
 
         // Size constants
-        assert_eq!(MERKLE_ATTR_SIZE, 97);
+        assert_eq!(MERKLE_ATTR_SIZE, 129);
     }
 
     /// Verify that `from_chunks_parallel` and `from_chunks` produce identical roots.
@@ -3700,6 +3935,7 @@ mod tests {
             algorithm: HashAlg::Blake3,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
+            grid_hash: [0u8; 32],
         };
 
         // 33 bytes is not a multiple of 32
@@ -3722,6 +3958,7 @@ mod tests {
             algorithm: HashAlg::Blake3,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
+            grid_hash: [0u8; 32],
         };
 
         // 2 nodes (64 bytes) - even count is invalid
@@ -3744,6 +3981,7 @@ mod tests {
             algorithm: HashAlg::Blake3,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
+            grid_hash: [0u8; 32],
         };
 
         // 5 nodes (160 bytes) -> padded_count = 3, not a power of 2
@@ -3765,6 +4003,7 @@ mod tests {
             algorithm: HashAlg::Blake3,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
+            grid_hash: [0u8; 32],
         };
 
         // Valid sizes: 1 node (1 leaf), 3 nodes (2 leaves), 7 nodes (4 leaves), etc.
