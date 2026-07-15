@@ -203,7 +203,7 @@ mod tests {
         let h = blake3_hex(b"");
         assert_eq!(
             h,
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9344f29bb835f6"
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
     }
 
