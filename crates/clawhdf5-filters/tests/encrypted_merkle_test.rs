@@ -42,6 +42,11 @@
 //! Therefore, under the threat model where the attacker controls storage but
 //! not the encryption oracle (i.e., cannot call `encrypt_chunk` after rollback),
 //! nonce reuse is cryptographically prevented.
+//!
+//! Requires the `chacha20` feature (not enabled by default); run with
+//! `cargo test -p clawhdf5-filters --features chacha20`.
+
+#![cfg(feature = "chacha20")]
 
 use clawhdf5_filters::{
     FilterPipeline, FilterPipelineConfig, FilteredChunk, Hash, VersionCounterStore, VersionWal,
