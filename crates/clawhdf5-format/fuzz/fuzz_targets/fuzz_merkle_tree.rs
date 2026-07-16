@@ -11,6 +11,7 @@ fuzz_target!(|data: &[u8]| {
         algorithm: HashAlg::Blake3,
         integrity: [0u8; 32],
         companion_hash: [1u8; 32], // Non-zero to indicate companion exists
+        grid_hash: [0u8; 32],
     };
 
     // Fuzz Dataset::reconstruct_tree with arbitrary tree_nodes data

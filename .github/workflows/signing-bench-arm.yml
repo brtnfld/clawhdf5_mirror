@@ -1,0 +1,37 @@
+name: Signing benchmark (ARM64)
+
+# P2.1 step 5 / RQ7 (S2-D2-Yr2 §7.7, Table 4) requires sign/verify latency
+# measurements on ARM in addition to x86-64 (with and without AVX-512). No
+# ARM hardware is available locally, so this collects that row set on a
+# GitHub-hosted aarch64 runner (free for public repos).
+#
+# Manual trigger only: this produces a research artifact meant to be
+# reviewed before it lands in the repo, not a per-commit regression check.
+# Download the "signing-bench-arm64" artifact from the run and commit the
+# CSV yourself after inspecting it.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run signing benchmark
+        env:
+          # Ephemeral runner hostnames would otherwise fragment ARM results
+          # across a new throwaway-named CSV on every run.
+          CLAWHDF5_BENCH_HOSTNAME: github-actions-arm64
+        run: |
+          cargo run --release -p clawhdf5-sign --example signing_bench \
+            --features "ed25519,mldsa"
+
+      - name: Upload benchmark CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-bench-arm64
+          path: crates/clawhdf5-format/benches/results/signing-github-actions-arm64.csv

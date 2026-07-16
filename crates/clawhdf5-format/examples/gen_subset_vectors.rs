@@ -125,6 +125,7 @@ fn main() {
             &delivered_c,
             &proof_c,
             &grid,
+            &grid.grid_hash,
             &contiguous,
             LeafOrder::RowMajor
         )
@@ -155,6 +156,7 @@ fn main() {
             &delivered_s,
             &proof_s,
             &grid,
+            &grid.grid_hash,
             &strided,
             LeafOrder::RowMajor
         )
@@ -186,6 +188,7 @@ fn main() {
             &delivered_r,
             &proof_r,
             &grid,
+            &grid.grid_hash,
             &random_points,
             LeafOrder::RowMajor
         )
