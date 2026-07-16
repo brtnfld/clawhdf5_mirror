@@ -500,6 +500,7 @@ fn checked_padded_leaf_count(grid: &ChunkGridParams) -> Result<usize, MerkleErro
 ///   match its claimed leaf hash.
 /// - [`MerkleError::TreeTooDeep`] if the grid's implied tree depth exceeds
 ///   the maximum allowed, including when the implied chunk count overflows.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct, independently-typed trust boundary (see doc comment above)
 pub fn verify_subset(
     root: &[u8; HASH_SIZE],
     alg: HashAlg,

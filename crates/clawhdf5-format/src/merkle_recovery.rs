@@ -386,3 +386,169 @@ mod tests {
         assert_eq!(applied_version, Some(2));
     }
 }
+
+/// Proves `SignatureVerifier` wires correctly to the *real* P2.1 hybrid
+/// signer (Ed25519 + ML-DSA-65), not just the mock verifiers
+/// (`AllowList`/`AlwaysValid`/byte-comparison maps) used everywhere else in
+/// this module's and `crash_vs_tamper_matrix.rs`'s tests. Those mocks prove
+/// the recovery *logic* (gating, ordering, error propagation); this proves
+/// the trait boundary itself is sound against genuine cryptography.
+///
+/// `clawhdf5-sign` is a dev-dependency only: `clawhdf5-format`'s production
+/// code still never depends on it (`SignatureVerifier` exists precisely to
+/// keep that decoupling), so this module is `#[cfg(test)]`-only.
+#[cfg(all(test, feature = "std"))]
+mod real_signature_tests {
+    use super::*;
+    use crate::merkle::HASH_SIZE;
+    use clawhdf5_sign::{
+        HashAlg, HybridSignature, SigningKey, VerifyingKey, canonical_payload,
+        mldsa::{MlDsaSigningKey, MlDsaVerifyingKey},
+        sign_root, verify_sig,
+    };
+
+    /// A `SignatureVerifier` backed by real Ed25519 + ML-DSA-65 verification.
+    ///
+    /// `ProvenanceRecord` carries only `(version, signed_root, hybrid_sig,
+    /// timestamp, snapshot_ref)` — not the companion hash or AlgID that also
+    /// feed the canonical payload (§sec:pq-hybrid). A real deployment's
+    /// verifier already knows these independently (e.g. from the file's own
+    /// `MerkleAttr`), so this test verifier captures them at construction,
+    /// mirroring that.
+    struct RealHybridVerifier {
+        companion_hash: [u8; HASH_SIZE],
+        alg_id: HashAlg,
+        ed_pub: VerifyingKey,
+        ml_pub: MlDsaVerifyingKey,
+    }
+
+    impl SignatureVerifier for RealHybridVerifier {
+        fn verify(&self, record: &ProvenanceRecord) -> bool {
+            let Ok(sig) = HybridSignature::from_bytes(&record.hybrid_sig) else {
+                return false;
+            };
+            let payload = canonical_payload(
+                &record.signed_root,
+                &self.companion_hash,
+                record.version,
+                record.timestamp,
+                self.alg_id,
+            );
+            verify_sig(&payload, &sig, &self.ed_pub, &self.ml_pub).is_ok()
+        }
+    }
+
+    fn generate_verifier(companion_hash: [u8; HASH_SIZE], alg_id: HashAlg) -> (SigningKey, MlDsaSigningKey, RealHybridVerifier) {
+        let ed_key = SigningKey::generate();
+        let ml_key = MlDsaSigningKey::generate();
+        let verifier = RealHybridVerifier {
+            companion_hash,
+            alg_id,
+            ed_pub: ed_key.verifying_key(),
+            ml_pub: ml_key.verifying_key(),
+        };
+        (ed_key, ml_key, verifier)
+    }
+
+    #[test]
+    fn select_restore_record_accepts_genuine_hybrid_signature() {
+        let companion_hash = [0x11; HASH_SIZE];
+        let alg_id = HashAlg::Blake3;
+        let (ed_key, ml_key, verifier) = generate_verifier(companion_hash, alg_id);
+
+        let root = [0x22; HASH_SIZE];
+        let version = 1u64;
+        let timestamp = 1_700_000_000u64;
+        let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
+        let sig = sign_root(&payload, &ed_key, &ml_key).expect("signing should succeed");
+
+        let mut journal = ProvenanceJournal::new();
+        journal
+            .append(ProvenanceRecord {
+                version,
+                signed_root: root,
+                hybrid_sig: sig.to_bytes().to_vec(),
+                timestamp,
+                snapshot_ref: String::from("snap-v1"),
+            })
+            .unwrap();
+
+        let selected =
+            select_restore_record(&journal, RestoreTarget::LastKnownGood, &verifier)
+                .expect("a genuine hybrid signature over the exact journaled fields must verify");
+        assert_eq!(selected.version, version);
+    }
+
+    #[test]
+    fn select_restore_record_rejects_signature_over_a_different_root() {
+        // The "stale signature" scenario (P2.2b crash-vs-tamper case (d)): a
+        // genuinely-produced signature, but not over the root actually
+        // journaled for this version — e.g. an attacker replaying an old
+        // signature against a newer/different root.
+        let companion_hash = [0x11; HASH_SIZE];
+        let alg_id = HashAlg::Blake3;
+        let (ed_key, ml_key, verifier) = generate_verifier(companion_hash, alg_id);
+
+        let signed_root = [0x22; HASH_SIZE];
+        let journaled_root = [0x33; HASH_SIZE];
+        let version = 1u64;
+        let timestamp = 1_700_000_000u64;
+        let payload = canonical_payload(&signed_root, &companion_hash, version, timestamp, alg_id);
+        let sig = sign_root(&payload, &ed_key, &ml_key).expect("signing should succeed");
+
+        let mut journal = ProvenanceJournal::new();
+        journal
+            .append(ProvenanceRecord {
+                version,
+                signed_root: journaled_root, // does not match what was signed
+                hybrid_sig: sig.to_bytes().to_vec(),
+                timestamp,
+                snapshot_ref: String::from("snap-v1"),
+            })
+            .unwrap();
+
+        let err = select_restore_record(&journal, RestoreTarget::Version(version), &verifier)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RestoreError::SignatureInvalid { version: v } if v == version
+        ));
+    }
+
+    #[test]
+    fn select_restore_record_rejects_signature_from_the_wrong_key() {
+        // A structurally well-formed hybrid signature, correctly over the
+        // journaled payload, but produced by a different keypair than the
+        // one this verifier trusts -- the forged-signature scenario.
+        let companion_hash = [0x11; HASH_SIZE];
+        let alg_id = HashAlg::Blake3;
+        let (_trusted_ed, _trusted_ml, verifier) = generate_verifier(companion_hash, alg_id);
+        let attacker_ed = SigningKey::generate();
+        let attacker_ml = MlDsaSigningKey::generate();
+
+        let root = [0x44; HASH_SIZE];
+        let version = 1u64;
+        let timestamp = 1_700_000_000u64;
+        let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
+        let forged_sig =
+            sign_root(&payload, &attacker_ed, &attacker_ml).expect("signing should succeed");
+
+        let mut journal = ProvenanceJournal::new();
+        journal
+            .append(ProvenanceRecord {
+                version,
+                signed_root: root,
+                hybrid_sig: forged_sig.to_bytes().to_vec(),
+                timestamp,
+                snapshot_ref: String::from("snap-v1"),
+            })
+            .unwrap();
+
+        let err = select_restore_record(&journal, RestoreTarget::Version(version), &verifier)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RestoreError::SignatureInvalid { version: v } if v == version
+        ));
+    }
+}
