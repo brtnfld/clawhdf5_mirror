@@ -16,4 +16,5 @@ path = "src/main.rs"
 clawhdf5 = { path = "../clawhdf5", version = "2.1.0" }
 clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["merkle"] }
 clawhdf5-filters = { path = "../clawhdf5-filters", version = "2.1.0", features = ["chacha20"] }
+clawhdf5-sign = { path = "../clawhdf5-sign", version = "2.1.0", features = ["ed25519", "mldsa"] }
 sha2 = { version = "0.10", default-features = false }

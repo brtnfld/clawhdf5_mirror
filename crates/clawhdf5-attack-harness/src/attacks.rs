@@ -244,12 +244,17 @@ pub fn subset_a_omitted_chunk(ds: &HarnessDataset) -> AttackResult {
         .collect();
 
     let start_time = Instant::now();
+    // `grid.grid_hash` stands in for the caller's already-verified
+    // MerkleAttr::grid_hash(): this harness builds `grid` itself (there's no
+    // real signed file here), so it's trivially self-consistent -- the
+    // omission attack this function tests is unrelated to grid-hash binding.
     let result = verify_subset(
         tree.root(),
         HashAlg::Blake3,
         &delivered,
         &proof,
         &grid,
+        &grid.grid_hash,
         &sel,
         LeafOrder::RowMajor,
     );
@@ -303,6 +308,7 @@ pub fn subset_b_substituted_chunk(ds: &HarnessDataset) -> AttackResult {
         &delivered,
         &proof,
         &grid,
+        &grid.grid_hash,
         &sel,
         LeafOrder::RowMajor,
     );
@@ -349,6 +355,7 @@ pub fn subset_c_wrong_coverage(ds: &HarnessDataset) -> AttackResult {
         &delivered,
         &proof,
         &grid,
+        &grid.grid_hash,
         &requested_sel,
         LeafOrder::RowMajor,
     );
@@ -369,14 +376,15 @@ pub fn subset_c_wrong_coverage(ds: &HarnessDataset) -> AttackResult {
 // Mechanism attacks: T3, T4a, T4b, T5, T6b, T7, T8.
 // ============================================================================
 
-/// P2.1 hybrid-signature stand-in: accepts only the exact byte string it was
-/// told is genuine for a given version. `clawhdf5-format`/`clawhdf5-agent`
-/// consume signature verification through exactly this trait
-/// ([`SignatureVerifier`]); this repo does not yet have the P2.1 hybrid-signing
-/// crate merged, so attacks that need "a signature" use this instead of a real
-/// Ed25519/ML-DSA-65 check. That substitution is disclosed inline wherever
-/// it's load-bearing (T3) and called out as an explicit gap where it would
-/// change the result (T5).
+/// Hybrid-signature stand-in for [`SignatureVerifier`], the trait
+/// `select_restore_record` (`clawhdf5-format::merkle_recovery`, P2.2b)
+/// actually consumes: accepts only the exact byte string it was told is
+/// genuine for a given version. The real `clawhdf5-sign` crate (Ed25519 +
+/// ML-DSA-65 hybrid signing, P2.1) is merged into this workspace -- see
+/// `t5_post_quantum_forgery`, which uses it directly -- but nothing yet
+/// implements `SignatureVerifier` backed by a real `HybridSignature`, so T3
+/// (which needs to plug into `select_restore_record`'s trait-based API) still
+/// uses this stand-in rather than real Ed25519/ML-DSA-65 verification.
 struct KnownGoodSignatures(std::collections::BTreeMap<u64, Vec<u8>>);
 impl SignatureVerifier for KnownGoodSignatures {
     fn verify(&self, r: &ProvenanceRecord) -> bool {
@@ -527,30 +535,72 @@ pub fn t4b_selective_chunk_rollback() -> AttackResult {
     }
 }
 
-/// T5 — harvest-now, forge-later: simulated forgery of the Ed25519 component
-/// of the hybrid signature, to confirm the ML-DSA-65 (post-quantum) component
-/// alone still blocks acceptance.
+/// T5 — harvest-now, forge-later: an adversary who has recovered the Ed25519
+/// private key (simulating a future CRQC breaking classical ECC via Shor's
+/// algorithm) tampers the root and re-signs it with the compromised Ed25519
+/// key, but cannot produce a matching ML-DSA-65 (post-quantum) signature
+/// without the ML-DSA private key. `verify_sig`'s strict-AND policy must
+/// reject the forgery on the ML-DSA-65 mismatch alone.
 ///
-/// **Out of scope — documented limitation.** The P2.1 hybrid-signing crate
-/// (Ed25519 + ML-DSA-65) is not merged into this workspace (only a stray,
-/// unwired `crates/clawhdf5-sign/` fuzz directory exists), so there is no
-/// dual-component signature to partially forge. Fabricating a fake "hybrid
-/// signature" object here would test nothing real. This is reported as
-/// **undetected** with the CSV's required `root_cause`, matching the P2.4
-/// artifact's own schema for attacks that are a genuine, disclosed gap rather
-/// than a silent skip.
+/// Uses the real `clawhdf5-sign` crate (Ed25519 + ML-DSA-65 hybrid signing,
+/// P2.1) directly -- that crate is merged into this workspace, just not yet
+/// wired into `clawhdf5-format`'s Merkle verification flow (no `MerkleAttr`/
+/// `Dataset` caller uses it), so this attack exercises `verify_sig` standalone
+/// rather than through an integrated file-level API.
 pub fn t5_post_quantum_forgery() -> AttackResult {
+    use clawhdf5_sign::mldsa::MlDsaSigningKey;
+    use clawhdf5_sign::{
+        HashAlg as SignHashAlg, SigningKey, canonical_payload, sign_root, verify_sig,
+    };
+
+    // Legitimate signer: genuine Ed25519 + ML-DSA-65 keypairs, genuine payload.
+    let ed_key = SigningKey::generate();
+    let ml_key = MlDsaSigningKey::generate();
+    let ed_pub = ed_key.verifying_key();
+    let ml_pub = ml_key.verifying_key();
+
+    let honest_root = [0x11u8; 32];
+    let companion_hash = [0x22u8; 32];
+    let honest_payload = canonical_payload(
+        &honest_root,
+        &companion_hash,
+        1,
+        1_700_000_000,
+        SignHashAlg::Blake3,
+    );
+    let genuine_sig = sign_root(&honest_payload, &ed_key, &ml_key).unwrap();
+    // Sanity: the genuine signature verifies before we attack anything.
+    debug_assert!(verify_sig(&honest_payload, &genuine_sig, &ed_pub, &ml_pub).is_ok());
+
+    let start_time = Instant::now();
+    // The adversary has recovered ed_key (simulated CRQC break), tampers the
+    // root, and re-signs the NEW payload with the compromised Ed25519 key --
+    // a perfectly valid Ed25519 signature over tampered data. They do not
+    // have ml_key, so they can only carry over the OLD ML-DSA-65 signature,
+    // which was computed over the honest payload, not this tampered one.
+    let tampered_root = [0xEEu8; 32];
+    let tampered_payload = canonical_payload(
+        &tampered_root,
+        &companion_hash,
+        1,
+        1_700_000_000,
+        SignHashAlg::Blake3,
+    );
+    let forged_ed25519_sig = ed_key.sign_payload(&tampered_payload);
+    let forged_sig =
+        clawhdf5_sign::HybridSignature::new(forged_ed25519_sig, genuine_sig.mldsa65_sig);
+
+    let result = verify_sig(&tampered_payload, &forged_sig, &ed_pub, &ml_pub);
+    let latency = start_time.elapsed();
+
     AttackResult {
         threat_class: "T5",
         attack_id: "T5",
         dataset: "n/a",
-        detected: false,
-        verifier_fn: "n/a",
-        latency: std::time::Duration::ZERO,
-        root_cause: Some(
-            "P2.1 hybrid signing (Ed25519 + ML-DSA-65) is not merged into this workspace; \
-             there is no dual-component signature to partially forge against. Requires P2.1.",
-        ),
+        detected: result.is_err(),
+        verifier_fn: "clawhdf5_sign::verify_sig",
+        latency,
+        root_cause: None,
     }
 }
 
@@ -613,10 +663,13 @@ pub fn t6b_algorithm_downgrade() -> AttackResult {
         latency,
         root_cause: if downgrade_succeeded {
             Some(
-                "No signature binds the hash-algorithm identifier into an unforgeable payload \
-                 for unsigned datasets; the in-band integrity hash only proves self-consistency, \
-                 which a full attacker rebuild trivially reproduces. Requires P2.1's signed \
-                 canonical_payload to cover alg_id (per Sec. merkle-storage, threat T6).",
+                "By design for an UNSIGNED dataset: no signature is in force, so the in-band \
+                 integrity hash only proves self-consistency, which a full attacker rebuild \
+                 trivially reproduces -- expected, not a gap. A SIGNED dataset would be \
+                 protected: clawhdf5_sign::canonical_payload (P2.1, merged) already binds \
+                 alg_id into the signed payload. That binding isn't wired into \
+                 clawhdf5-format's own Merkle verification flow, so this can't yet be \
+                 exercised end-to-end for a signed dataset (per Sec. merkle-storage, threat T6).",
             )
         } else {
             None
@@ -643,12 +696,16 @@ pub fn t7_verification_dos() -> AttackResult {
     };
 
     let start_time = Instant::now();
+    // The grid hash is self-consistent (built via ChunkGridParams::new) so
+    // this check passes and the actual DoS guard being tested --
+    // checked_padded_leaf_count -- is what's exercised, not GridHashMismatch.
     let result = verify_subset(
         &[0u8; 32],
         HashAlg::Blake3,
         &[],
         &proof,
         &hostile_grid,
+        &hostile_grid.grid_hash,
         &sel,
         LeafOrder::RowMajor,
     );
