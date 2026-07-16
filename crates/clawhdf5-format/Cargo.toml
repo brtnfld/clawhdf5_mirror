@@ -28,6 +28,13 @@ serde_json = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 clawhdf5-derive = { path = "../clawhdf5-derive", version = "2.1.0" }
 hostname = "0.4"
+# Dev-only: exercises merkle_recovery::SignatureVerifier against the real P2.1
+# hybrid signer, so the P2.2b recovery gates are proven against actual
+# Ed25519+ML-DSA-65 signatures, not just mock verifiers. clawhdf5-format's
+# production code never depends on clawhdf5-sign (SignatureVerifier is
+# injected precisely to avoid that), so this is not a circular dependency in
+# the normal build graph -- only in `cargo test`.
+clawhdf5-sign = { path = "../clawhdf5-sign", version = "2.1.0", features = ["ed25519", "mldsa"] }
 
 [[bench]]
 name = "bench"

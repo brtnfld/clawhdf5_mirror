@@ -86,6 +86,9 @@ pub enum MemoryError {
     Hdf5(String),
     Schema(String),
     NotFound(String),
+    /// A provenance-journal operation failed (P2.2b step 3), e.g. appending a
+    /// snapshot record with a non-increasing version.
+    Provenance(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -95,6 +98,7 @@ impl std::fmt::Display for MemoryError {
             MemoryError::Hdf5(e) => write!(f, "HDF5 error: {e}"),
             MemoryError::Schema(e) => write!(f, "schema error: {e}"),
             MemoryError::NotFound(e) => write!(f, "not found: {e}"),
+            MemoryError::Provenance(e) => write!(f, "provenance error: {e}"),
         }
     }
 }

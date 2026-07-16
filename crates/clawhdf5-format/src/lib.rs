@@ -83,6 +83,10 @@ pub mod link_message;
 pub mod local_heap;
 #[cfg(feature = "merkle")]
 pub mod merkle;
+#[cfg(feature = "merkle")]
+pub mod merkle_journal;
+#[cfg(feature = "merkle")]
+pub mod merkle_recovery;
 pub mod message_type;
 pub mod metadata_cache;
 pub mod metadata_index;
@@ -90,6 +94,9 @@ pub mod object_header;
 pub mod object_header_writer;
 #[cfg(feature = "parallel")]
 pub mod parallel_read;
+// The profiler's counters are AtomicU64, which some no_std targets
+// (e.g. thumbv7em) don't provide; profiling is meaningless there anyway.
+#[cfg(target_has_atomic = "64")]
 pub mod profiling;
 pub mod property_list;
 pub mod selection;

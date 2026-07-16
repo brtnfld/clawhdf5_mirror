@@ -4,7 +4,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 use crate::error::FormatError;
 use crate::filter_pipeline::{
@@ -190,7 +190,7 @@ fn scaleoffset_decompress(
     };
 
     if is_float {
-        let scale = 10f64.powi(cd[1] as i32);
+        let scale = pow10(cd[1] as i32);
         let minval = read_le_float(minval_bytes, elem_size);
         let fill_value = if fill_defined {
             let lo = *cd.get(8).unwrap_or(&0) as u64;
@@ -231,6 +231,28 @@ fn scaleoffset_decompress(
             .collect();
         Ok(write_elements(&values, elem_size, big_endian))
     }
+}
+
+/// Integer power of 10 for scale-offset decoding.
+///
+/// `f64::powi` lives in `std`, not `core`, so this crate computes it by
+/// repeated multiplication to stay `no_std`-clean. Exact for |exp| <= 22
+/// (every such power of 10 is representable in f64), which covers any
+/// plausible decimal scale factor from the filter's client data.
+///
+/// The exponent comes from the file's filter client data and is therefore
+/// attacker-controlled: the loop exits as soon as the accumulator saturates
+/// to infinity (~309 iterations, bit-identical result since `inf * 10.0`
+/// stays `inf`), so a hostile exponent cannot buy unbounded work.
+fn pow10(exp: i32) -> f64 {
+    let mut result = 1.0f64;
+    for _ in 0..exp.unsigned_abs() {
+        result *= 10.0;
+        if result.is_infinite() {
+            break;
+        }
+    }
+    if exp < 0 { 1.0 / result } else { result }
 }
 
 /// Read a little-endian float of `size` bytes (4 = f32, otherwise f64) as f64.
@@ -1451,5 +1473,25 @@ mod tests {
         assert!(scaleoffset_decompress(&[0u8; 3], &[2, 0, 1, 0, 4, 0, 0, 0], 4).is_err());
         // Missing client data entirely.
         assert!(scaleoffset_decompress(&[0u8; 32], &[2, 0], 4).is_err());
+    }
+
+    #[test]
+    fn pow10_agrees_with_powi_over_the_exact_range() {
+        // Pins the doc-comment claim: exact for |exp| <= 22, and identical to
+        // the std `powi` it replaced for no_std support.
+        for exp in -22..=22 {
+            assert_eq!(pow10(exp), 10f64.powi(exp), "pow10({exp})");
+        }
+    }
+
+    #[test]
+    fn pow10_saturates_promptly_on_hostile_exponents() {
+        // The exponent is attacker-controlled filter client data. The loop
+        // must terminate after saturation (~309 iterations), not run for
+        // ~2^31 — this test finishing at all is the regression assertion.
+        assert_eq!(pow10(i32::MAX), f64::INFINITY);
+        assert_eq!(pow10(i32::MIN), 0.0);
+        assert_eq!(pow10(400), f64::INFINITY);
+        assert_eq!(pow10(-400), 0.0);
     }
 }

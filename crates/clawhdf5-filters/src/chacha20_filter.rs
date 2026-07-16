@@ -10,12 +10,32 @@
 //! - **Integrity**: Poly1305 MAC (16-byte authentication tag)
 //! - **AEAD**: Authenticated Encryption with Associated Data
 //!
+//! # Key Separation (security-review follow-up, Remark A.5)
+//!
+//! The master DEK is never used directly for either encryption or nonce
+//! derivation. Two domain-separated subkeys are derived from it via BLAKE3's
+//! KDF mode with distinct context strings:
+//!
+//! ```text
+//! DEK_enc = BLAKE3-derive-key("clawhdf5 chacha20 encryption key v1", DEK)
+//! DEK_kdf = BLAKE3-derive-key("clawhdf5 chacha20 nonce-kdf key v1",  DEK)
+//! ```
+//!
+//! `DEK_enc` keys ChaCha20-Poly1305; `DEK_kdf` keys the nonce KDF. This
+//! implements the key-separation follow-up from the S2-D2-Yr2 security
+//! review (`docs/security-review-notes.md`, Remark A.5): the security proof
+//! models the AEAD and the nonce KDF as independently keyed oracles, and the
+//! subkey split makes the implementation match the model instead of relying
+//! on the (heuristic) independence of the two primitives under one key.
+//! Functionally equivalent to the review's suggested `HKDF-Expand(DEK, info)`
+//! with distinct `info` tags, using the codebase's BLAKE3 throughout.
+//!
 //! # Nonce Derivation
 //!
 //! To safely support in-place chunk updates, nonces are derived using BLAKE3:
 //!
 //! ```text
-//! nonce = BLAKE3-derive(DEK, chunk_idx || version_counter)
+//! nonce = BLAKE3-derive(DEK_kdf, chunk_idx || version_counter)
 //! ```
 //!
 //! This guarantees a unique nonce per (key, chunk, version) triple, preventing
@@ -106,19 +126,36 @@ impl core::fmt::Display for ChaCha20Error {
 
 impl std::error::Error for ChaCha20Error {}
 
-/// Derive a nonce from the DEK, chunk index, and version counter using BLAKE3.
+/// Derive the two domain-separated subkeys from the master DEK
+/// (security-review follow-up, Remark A.5).
+///
+/// Returns `(DEK_enc, DEK_kdf)`: the ChaCha20-Poly1305 encryption key and the
+/// nonce-KDF key. The master DEK itself must key neither primitive directly —
+/// [`encrypt_chunk`] / [`decrypt_chunk`] apply this split internally.
+#[inline]
+#[must_use]
+pub fn derive_subkeys(dek: &Dek) -> (Dek, Dek) {
+    let enc = blake3::derive_key("clawhdf5 chacha20 encryption key v1", dek);
+    let kdf = blake3::derive_key("clawhdf5 chacha20 nonce-kdf key v1", dek);
+    (enc, kdf)
+}
+
+/// Derive a nonce from a nonce-KDF key, chunk index, and version counter
+/// using BLAKE3.
 ///
 /// This implements the version-counter nonce derivation from S2-D2-Yr2 §7.3:
 ///
 /// ```text
-/// nonce = BLAKE3-derive(DEK, chunk_idx || version_counter)
+/// nonce = BLAKE3-derive(DEK_kdf, chunk_idx || version_counter)
 /// ```
 ///
 /// The derived nonce is 12 bytes (96 bits) as required by ChaCha20-Poly1305.
 ///
 /// # Arguments
 ///
-/// * `dek` - The 32-byte Data Encryption Key
+/// * `dek` - The 32-byte nonce-KDF key. In the chunk APIs this is `DEK_kdf`
+///   from [`derive_subkeys`], never the master DEK (Remark A.5 key
+///   separation).
 /// * `chunk_idx` - The chunk index (u64)
 /// * `version` - The per-chunk version counter (u64)
 ///
@@ -246,31 +283,6 @@ pub fn decrypt(
     }
 }
 
-/// Derive independent encryption and nonce-KDF subkeys from a single DEK.
-///
-/// Returns `(dek_enc, dek_kdf)`. Using domain-separated BLAKE3 derivation
-/// (distinct from the nonce derivation context in [`derive_nonce`]) means the
-/// raw DEK bytes are never used directly as either key: [`encrypt_chunk`] and
-/// [`decrypt_chunk`] key the AEAD cipher from `dek_enc` and the nonce KDF from
-/// `dek_kdf`. Both subkeys are cheap to recompute on demand, so this adds no
-/// storage cost beyond the wrapped DEK already persisted by the key store.
-#[must_use]
-pub fn derive_subkeys(dek: &Dek) -> (Dek, Dek) {
-    (
-        derive_subkey(dek, "clawhdf5 dek subkey v1 enc"),
-        derive_subkey(dek, "clawhdf5 dek subkey v1 nonce-kdf"),
-    )
-}
-
-fn derive_subkey(dek: &Dek, context: &str) -> Dek {
-    let mut hasher = blake3::Hasher::new_derive_key(context);
-    hasher.update(dek);
-    let hash = hasher.finalize();
-    let mut out = [0u8; KEY_SIZE];
-    out.copy_from_slice(hash.as_bytes());
-    out
-}
-
 /// Encrypt a chunk with automatic nonce derivation.
 ///
 /// This is the primary API for chunk encryption in the HDF5 filter pipeline.
@@ -295,9 +307,11 @@ pub fn encrypt_chunk(
     version: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ChaCha20Error> {
-    let (dek_enc, dek_kdf) = derive_subkeys(dek);
-    let nonce = derive_nonce(&dek_kdf, chunk_idx, version);
-    encrypt(&dek_enc, &nonce, plaintext, &[])
+    // Remark A.5 key separation: the AEAD and the nonce KDF are keyed by
+    // distinct subkeys, never the master DEK directly.
+    let (enc_key, kdf_key) = derive_subkeys(dek);
+    let nonce = derive_nonce(&kdf_key, chunk_idx, version);
+    encrypt(&enc_key, &nonce, plaintext, &[])
 }
 
 /// Decrypt a chunk with automatic nonce derivation.
@@ -321,9 +335,10 @@ pub fn decrypt_chunk(
     version: u64,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, ChaCha20Error> {
-    let (dek_enc, dek_kdf) = derive_subkeys(dek);
-    let nonce = derive_nonce(&dek_kdf, chunk_idx, version);
-    decrypt(&dek_enc, &nonce, ciphertext, &[])
+    // Remark A.5 key separation, mirroring `encrypt_chunk`.
+    let (enc_key, kdf_key) = derive_subkeys(dek);
+    let nonce = derive_nonce(&kdf_key, chunk_idx, version);
+    decrypt(&enc_key, &nonce, ciphertext, &[])
 }
 
 // ---- EncryptedChunkWriter: High-level API integrating WAL + version counters ----
@@ -418,12 +433,67 @@ pub struct EncryptedChunkWriter<W> {
     wal: VersionWal<W>,
     /// In-memory version counter store.
     versions: VersionCounterStore,
+    /// Dataset-level version counter, strictly incremented once per committed
+    /// mutation (P2.2b step 1, Remark A.13). This — not `max_version()` — is
+    /// what `commit_with_write_order` binds into the root attribute.
+    dataset_version: u64,
 }
 
 impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
-    /// Create a new encrypted chunk writer.
+    /// Create a new encrypted chunk writer for a fresh dataset (dataset
+    /// version starts at 0; the first commit persists version 1).
+    ///
+    /// When reopening an existing dataset, use
+    /// [`with_dataset_version`](Self::with_dataset_version) to seed the
+    /// counter from the persisted `merkle_version` attribute instead.
     pub fn new(dek: Dek, wal: VersionWal<W>, versions: VersionCounterStore) -> Self {
-        Self { dek, wal, versions }
+        Self::with_dataset_version(dek, wal, versions, 0)
+    }
+
+    /// Create a writer seeded with the dataset version read from the persisted
+    /// `merkle_version` attribute on open. Commits continue strictly upward
+    /// from `dataset_version`, so the persisted counter never regresses or
+    /// ties across commits (Remark A.13).
+    pub fn with_dataset_version(
+        dek: Dek,
+        wal: VersionWal<W>,
+        versions: VersionCounterStore,
+        dataset_version: u64,
+    ) -> Self {
+        Self {
+            dek,
+            wal,
+            versions,
+            dataset_version,
+        }
+    }
+
+    /// The high-water mark of dataset-level versions presented to storage.
+    ///
+    /// Strictly incremented by every
+    /// [`commit_with_write_order`](Self::commit_with_write_order) that reaches
+    /// the root-attribute step — including attempts that then fail, since a
+    /// version that may be on disk can never be reused (gaps are allowed,
+    /// ties are not). This is the value bound into the root attribute and the
+    /// signed payload — **not** `max_version()` (the max of per-chunk
+    /// counters), which is only non-decreasing and can tie or regress across
+    /// commits touching different chunks.
+    #[must_use]
+    pub fn dataset_version(&self) -> u64 {
+        self.dataset_version
+    }
+
+    /// Burn a dataset version the moment it is presented to storage, whether
+    /// or not the commit then succeeds.
+    ///
+    /// Internal seam for `commit_with_write_order` (in `write_order.rs`).
+    pub(crate) fn advance_dataset_version(&mut self, presented: u64) {
+        debug_assert!(
+            presented > self.dataset_version,
+            "dataset version must strictly increase: current={}, presented={presented}",
+            self.dataset_version
+        );
+        self.dataset_version = presented;
     }
 
     /// Encrypt a chunk with automatic version management.
@@ -457,8 +527,12 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
         // Step 1: Compute next version
         let version = self.versions.next_version(chunk_idx);
 
-        // Step 2: Journal to WAL BEFORE deriving nonce (crash safety)
-        self.wal.journal_version(chunk_idx, version)?;
+        // Step 2: Journal to WAL BEFORE deriving nonce (crash safety). The
+        // plaintext hash travels with the record so a crash-recovery replay
+        // can be verified against it rather than trusted blindly (Remark A.9).
+        let plaintext_hash = crate::version_wal::WalRecord::hash_plaintext(plaintext);
+        self.wal
+            .journal_version(chunk_idx, version, plaintext_hash)?;
 
         // Step 3: Reserve the version in-memory so the nonce can't be reused by a
         // subsequent encrypt of the same chunk before commit. `seed` is monotonic,
@@ -505,7 +579,14 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
         self.versions.get(chunk_idx)
     }
 
-    /// Get the maximum version across all chunks (dataset-level version).
+    /// Get the maximum version across all per-chunk counters.
+    ///
+    /// **Not the dataset-level version.** `max_k v_k` is only non-decreasing —
+    /// two different committed states can tie on it, and a commit to a
+    /// low-version chunk does not advance it — which is exactly the stateful-
+    /// verifier blind spot Remark A.13 (S2-D2-Yr2 security review) rules out.
+    /// Use [`dataset_version`](Self::dataset_version) for the persisted,
+    /// signed, strictly-per-commit counter.
     #[must_use]
     pub fn max_version(&self) -> u64 {
         self.versions.max_version()
@@ -526,16 +607,22 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
     /// crash-window nonce-reuse hole that would otherwise exist if the store started at 0
     /// while the WAL still held a pending version.
     ///
-    /// Returns the list of `(chunk_idx, version)` pairs that were pending. For each pair
-    /// the caller should promote the companion dataset to `version` and call
-    /// [`commit`](Self::commit) to finalize the record.
-    pub fn recover(&mut self) -> Result<Vec<(u64, u64)>, EncryptedWriteError> {
+    /// Returns the list of `(chunk_idx, version, plaintext_hash)` triples that were
+    /// pending. For each triple the caller **must** call
+    /// [`WalRecord::verify_replay_plaintext`](crate::version_wal::WalRecord::verify_replay_plaintext)
+    /// against its candidate replay plaintext and refuse to replay on mismatch
+    /// (Remark A.9 — see [`version_wal::WAL_RECORD_SIZE`](crate::version_wal::WAL_RECORD_SIZE)'s
+    /// doc comment for why the bare `(chunk_idx, version)` pair is not enough
+    /// to make replay safe on its own). Once verified, promote the companion
+    /// dataset to `version` and call [`commit`](Self::commit) to finalize the
+    /// record.
+    pub fn recover(&mut self) -> Result<Vec<(u64, u64, [u8; 32])>, EncryptedWriteError> {
         let uncommitted = self.wal.recover()?;
 
         // Seed the version store so journaled versions are treated as already consumed.
         // Without this, next_version() could hand back a version that was already used
         // to derive a nonce before the crash -> catastrophic keystream reuse.
-        for &(chunk_idx, version) in &uncommitted {
+        for &(chunk_idx, version, _) in &uncommitted {
             self.versions.seed(chunk_idx, version);
         }
 
@@ -565,6 +652,29 @@ mod tests {
             *byte = i as u8;
         }
         dek
+    }
+
+    /// Remark A.5 key separation: the chunk APIs must key the AEAD and the
+    /// nonce KDF with distinct subkeys, never the raw master DEK.
+    #[test]
+    fn chunk_apis_use_domain_separated_subkeys() {
+        let dek = test_dek();
+        let (enc_key, kdf_key) = derive_subkeys(&dek);
+
+        // The subkeys differ from the master DEK and from each other.
+        assert_ne!(enc_key, dek);
+        assert_ne!(kdf_key, dek);
+        assert_ne!(enc_key, kdf_key);
+
+        // encrypt_chunk is NOT raw-DEK encryption: ciphertext produced by
+        // keying the primitives with the master DEK directly must differ.
+        let raw_nonce = derive_nonce(&dek, 3, 1);
+        let raw_ct = encrypt(&dek, &raw_nonce, b"payload", &[]).unwrap();
+        let sep_ct = encrypt_chunk(&dek, 3, 1, b"payload").unwrap();
+        assert_ne!(raw_ct, sep_ct);
+
+        // And the separated path round-trips.
+        assert_eq!(decrypt_chunk(&dek, 3, 1, &sep_ct).unwrap(), b"payload");
     }
 
     #[test]
@@ -922,7 +1032,10 @@ mod tests {
 
         let uncommitted = writer.recover().unwrap();
         assert_eq!(uncommitted.len(), 1);
-        assert_eq!(uncommitted[0], (5, 1)); // chunk 5, version 1
+        assert_eq!(
+            uncommitted[0],
+            (5, 1, crate::version_wal::WalRecord::hash_plaintext(b"data"))
+        ); // chunk 5, version 1
     }
 
     #[test]
@@ -946,7 +1059,10 @@ mod tests {
         );
 
         // Each ciphertext decrypts only under its own reserved version.
-        assert_eq!(decrypt_chunk(&dek, 5, 1, &a.ciphertext).unwrap(), b"plaintext A");
+        assert_eq!(
+            decrypt_chunk(&dek, 5, 1, &a.ciphertext).unwrap(),
+            b"plaintext A"
+        );
         assert_eq!(
             decrypt_chunk(&dek, 5, 2, &b.ciphertext).unwrap(),
             b"plaintext B DIFFERENT"

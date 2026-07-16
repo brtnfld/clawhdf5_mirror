@@ -71,3 +71,8 @@ doc = false
 name = "fuzz_merkle_tree"
 path = "fuzz_targets/fuzz_merkle_tree.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_merkle_journal"
+path = "fuzz_targets/fuzz_merkle_journal.rs"
+doc = false

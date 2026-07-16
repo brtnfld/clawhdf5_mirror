@@ -41,6 +41,11 @@ pub use filter_pipeline::{
     compute_leaf_hash, compute_leaf_hash_plaintext, shuffle, unshuffle,
 };
 
+#[cfg(feature = "chacha20")]
+pub mod write_order;
+#[cfg(feature = "chacha20")]
+pub use write_order::{MerkleWriteSink, WriteOrderError, WriteStep};
+
 /// Decompress zlib-compressed data.
 ///
 /// Uses the fastest available backend. When `max_output_size` > 0,
