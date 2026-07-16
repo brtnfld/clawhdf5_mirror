@@ -18,6 +18,7 @@ members = [
     "crates/clawhdf5-napi",
     "crates/clawhdf5-bench",
     "crates/clawhdf5-sign",
+    "crates/clawhdf5-attack-harness",
 ]
 resolver = "2"
 

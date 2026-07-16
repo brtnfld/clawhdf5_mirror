@@ -1,0 +1,15 @@
+threat_class,attack_id,dataset,detected,verifier_fn,latency_ms,root_cause
+T1,T1a,synthetic,yes,verify_chunk,0.0009,
+T1,T1b,synthetic,yes,verify_root,0.0006,
+T2,T2,synthetic,yes,verify_dataset,0.0070,
+T6,T6a,synthetic,yes,MerkleAttr::unpack,0.0002,
+subset,subset-a,synthetic,yes,verify_subset,0.0000,
+subset,subset-b,synthetic,yes,verify_subset,0.0019,
+subset,subset-c,synthetic,yes,verify_subset,0.0004,
+T3,T3,n/a,yes,select_restore_record,0.0001,
+T4,T4a,n/a,yes,VersionObservationStore::observe,0.0001,
+T4,T4b,n/a,yes,compute_leaf_hash (leaf-hash recomputation),0.0001,
+T5,T5,n/a,no,n/a,0.0000,P2.1 hybrid signing (Ed25519 + ML-DSA-65) is not merged into this workspace; there is no dual-component signature to partially forge against. Requires P2.1.
+T6,T6b,n/a,no,verify_dataset / MerkleAttr::unpack,0.0013,"No signature binds the hash-algorithm identifier into an unforgeable payload for unsigned datasets; the in-band integrity hash only proves self-consistency, which a full attacker rebuild trivially reproduces. Requires P2.1's signed canonical_payload to cover alg_id (per Sec. merkle-storage, threat T6)."
+T7,T7,n/a,yes,verify_subset (checked_padded_leaf_count),0.0001,
+T8,T8,n/a,no,n/a (structure-hiding not implemented),0.0000,"Null sentinel H(0x02 || ""null"") is a fixed public constant, not PRF-masked with a Structure/Data Encryption Key; sparsity pattern is directly recoverable without decryption. Structure-hiding padded-binary-tree mode (Sec. merkle-storage) is scoped as future Phase-2 work, not yet implemented."
