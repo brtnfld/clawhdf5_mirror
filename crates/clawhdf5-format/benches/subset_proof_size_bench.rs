@@ -24,7 +24,7 @@ use std::time::Instant;
 use clawhdf5_format::merkle::{HashAlg, MerkleTree};
 use clawhdf5_format::selection::Selection;
 use clawhdf5_format::subset_proof::{
-    extract_subset, verify_subset, ChunkData, ChunkGridParams, LeafOrder, SubsetProof,
+    ChunkData, ChunkGridParams, LeafOrder, SubsetProof, extract_subset, verify_subset,
 };
 
 /// Total chunks in the test dataset (2^16 = 65,536).
@@ -557,7 +557,10 @@ fn main() {
     println!("P1.5 Part 4 & 6: Subset Proof Size Benchmark");
     println!("=============================================");
     println!("N = {} chunks (2^{})", N, (N as f64).log2() as usize);
-    println!("Theoretical bound: O(k * log N) = O(k * {})", (N as f64).log2() as usize);
+    println!(
+        "Theoretical bound: O(k * log N) = O(k * {})",
+        (N as f64).log2() as usize
+    );
     println!("warmup={WARMUP_TRIALS} trials={TRIALS} bootstrap_iterations={BOOTSTRAP_ITERATIONS}");
     println!();
 

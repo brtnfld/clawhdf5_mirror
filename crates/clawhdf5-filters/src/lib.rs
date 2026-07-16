@@ -21,7 +21,8 @@ pub mod chacha20_filter;
 #[cfg(feature = "chacha20")]
 pub use chacha20_filter::{
     ChaCha20Error, ChaCha20Nonce, EncryptedChunkResult, EncryptedChunkWriter, EncryptedWriteError,
-    KEY_SIZE, NONCE_SIZE, TAG_SIZE, decrypt, decrypt_chunk, derive_nonce, encrypt, encrypt_chunk,
+    KEY_SIZE, NONCE_SIZE, TAG_SIZE, decrypt, decrypt_chunk, derive_nonce, derive_subkeys, encrypt,
+    encrypt_chunk,
 };
 
 #[cfg(feature = "chacha20")]
@@ -39,6 +40,11 @@ pub use filter_pipeline::{
     FilterPipeline, FilterPipelineConfig, FilterPipelineError, FilteredChunk, HASH_SIZE, Hash,
     compute_leaf_hash, compute_leaf_hash_plaintext, shuffle, unshuffle,
 };
+
+#[cfg(feature = "chacha20")]
+pub mod write_order;
+#[cfg(feature = "chacha20")]
+pub use write_order::{MerkleWriteSink, WriteOrderError, WriteStep};
 
 /// Decompress zlib-compressed data.
 ///

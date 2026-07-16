@@ -55,6 +55,9 @@ parallel = ["rayon"]
 # linear cosine scan.
 hnsw = ["clawhdf5-ann"]
 agent = []
+# P2.2b step 3: tie the snapshot primitive to the certified Merkle root via the
+# append-only provenance journal. Pulls in clawhdf5-format's merkle machinery.
+merkle-provenance = ["clawhdf5-format/merkle"]
 gpu = ["clawhdf5-gpu/gpu-wgpu"]
 fast-math = ["matrixmultiply"]
 accelerate = ["accelerate-src", "cblas-sys"]

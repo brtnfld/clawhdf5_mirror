@@ -155,6 +155,15 @@ pub struct FilteredChunk {
 /// tag, and version counter of chunk k' in place of chunk k, because the index
 /// is baked into the hash.
 ///
+/// TODO(P2.4): this leaf formula is distinct from `clawhdf5-format`'s
+/// `HashAlg::hash_leaf` (`H(0x00 || chunk)`), which is what `verify_chunk` /
+/// `verify_dataset` recompute — so a `Dataset` built from an encrypted file's
+/// companion nodes cannot currently be verified by the format-side functions.
+/// The attack harness (P2.4) needs a version-aware verification path in
+/// `clawhdf5-format` (or a leaf-formula parameter on `Dataset`) before T4
+/// selective-rollback detection works end-to-end rather than only at the
+/// leaf-hash level (see `crash_vs_tamper_matrix.rs`, scenario e).
+///
 /// # Arguments
 ///
 /// * `chunk_idx` - The chunk index in the dataset
@@ -177,7 +186,10 @@ pub fn compute_leaf_hash(chunk_idx: u64, ciphertext: &[u8], version: u64) -> Has
     hasher.update(&chunk_idx.to_le_bytes()); // k
 
     // Ciphertext with length prefix (includes tag for AEAD)
-    #[expect(clippy::cast_possible_truncation, reason = "ciphertext length always < 4GB")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ciphertext length always < 4GB"
+    )]
     let ct_len = ciphertext.len() as u32;
     hasher.update(&ct_len.to_be_bytes()); // len(ct)
     hasher.update(ciphertext); // ct || tag
@@ -220,7 +232,10 @@ pub fn compute_leaf_hash_plaintext(chunk_idx: u64, chunk_data: &[u8], version: u
     hasher.update(&chunk_idx.to_le_bytes()); // k
 
     // Chunk data with length prefix
-    #[expect(clippy::cast_possible_truncation, reason = "chunk data length always < 4GB")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk data length always < 4GB"
+    )]
     let data_len = chunk_data.len() as u32;
     hasher.update(&data_len.to_be_bytes()); // len(data)
     hasher.update(chunk_data); // data
@@ -806,9 +821,7 @@ mod tests {
         let chunk_0 = pipeline
             .write(b"chunk zero data", Some(&dek), 0, 1)
             .unwrap();
-        let chunk_1 = pipeline
-            .write(b"chunk one data", Some(&dek), 1, 1)
-            .unwrap();
+        let chunk_1 = pipeline.write(b"chunk one data", Some(&dek), 1, 1).unwrap();
 
         // Verify both chunks pass at their correct positions
         assert!(pipeline.verify_leaf_hash(0, &chunk_0.ciphertext, 1, &chunk_0.leaf_hash));

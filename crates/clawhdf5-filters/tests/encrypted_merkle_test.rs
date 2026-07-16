@@ -11,8 +11,10 @@
 //!
 //! **Nonce reuse is impossible by construction** because:
 //!
-//! 1. The nonce is derived as `BLAKE3-KDF(DEK || chunk_idx || v_chunk)` where
-//!    `v_chunk` is a monotonically increasing version counter.
+//! 1. The nonce is derived as `BLAKE3-KDF(DEK_kdf || chunk_idx || v_chunk)`
+//!    where `v_chunk` is a monotonically increasing version counter and
+//!    `DEK_kdf` is the nonce-KDF subkey domain-separated from the master DEK
+//!    (Remark A.5 key separation; see `derive_subkeys`).
 //!
 //! 2. The WAL protocol ensures `v_chunk` is durably recorded BEFORE the nonce
 //!    is derived for encryption. A crash after journaling but before commit
@@ -72,10 +74,7 @@ fn generate_chunk_data(chunk_idx: u64, version: u64) -> Vec<u8> {
 }
 
 /// Verify that all leaf hashes in the tree match the expected hashes.
-fn verify_leaf_hashes(
-    tree: &MerkleTree,
-    chunks: &[FilteredChunk],
-) -> bool {
+fn verify_leaf_hashes(tree: &MerkleTree, chunks: &[FilteredChunk]) -> bool {
     for (idx, chunk) in chunks.iter().enumerate() {
         if let Some(stored_hash) = tree.leaf_hash(idx) {
             if stored_hash != &chunk.leaf_hash {
@@ -138,8 +137,8 @@ fn end_to_end_encrypted_256_chunk_dataset() {
     // - AEAD tag (Poly1305)
     // - Version counter (prevents rollback attacks)
     let leaf_hashes: Vec<Hash> = chunks.iter().map(|c| c.leaf_hash).collect();
-    let tree = MerkleTree::build(&leaf_hashes, HashAlg::Blake3)
-        .expect("Merkle tree build should succeed");
+    let tree =
+        MerkleTree::build(&leaf_hashes, HashAlg::Blake3).expect("Merkle tree build should succeed");
 
     assert_eq!(tree.leaf_count(), NUM_CHUNKS);
 
@@ -173,15 +172,13 @@ fn end_to_end_encrypted_256_chunk_dataset() {
 
     // The new ciphertext must differ from the original (different nonce)
     assert_ne!(
-        new_filtered.ciphertext,
-        chunks[OVERWRITE_CHUNK_IDX as usize].ciphertext,
+        new_filtered.ciphertext, chunks[OVERWRITE_CHUNK_IDX as usize].ciphertext,
         "ciphertext must change due to different nonce"
     );
 
     // The new leaf hash must differ (different ciphertext + version)
     assert_ne!(
-        new_filtered.leaf_hash,
-        chunks[OVERWRITE_CHUNK_IDX as usize].leaf_hash,
+        new_filtered.leaf_hash, chunks[OVERWRITE_CHUNK_IDX as usize].leaf_hash,
         "leaf hash must change after overwrite"
     );
 
@@ -216,8 +213,7 @@ fn end_to_end_encrypted_256_chunk_dataset() {
         .leaf_hash(OVERWRITE_CHUNK_IDX as usize)
         .expect("leaf hash should exist");
     assert_eq!(
-        stored_hash,
-        &chunks[OVERWRITE_CHUNK_IDX as usize].leaf_hash,
+        stored_hash, &chunks[OVERWRITE_CHUNK_IDX as usize].leaf_hash,
         "stored leaf hash should match filtered chunk"
     );
 
@@ -296,10 +292,7 @@ fn wrong_version_fails_decryption() {
         plaintext.len(),
     );
 
-    assert!(
-        result.is_err(),
-        "decryption with wrong version should fail"
-    );
+    assert!(result.is_err(), "decryption with wrong version should fail");
 }
 
 /// Test that tampering with ciphertext is detected.
@@ -320,7 +313,10 @@ fn tampered_ciphertext_detected() {
 
     // Decryption should fail (AEAD tag mismatch)
     let result = pipeline.read(&tampered, Some(&dek), 0, 1, plaintext.len());
-    assert!(result.is_err(), "tampered ciphertext should fail decryption");
+    assert!(
+        result.is_err(),
+        "tampered ciphertext should fail decryption"
+    );
 
     // Leaf hash verification should also fail
     assert!(
@@ -378,16 +374,36 @@ fn wal_crash_recovery_preserves_nonce_safety() {
     );
 
     // The nonces for the pre-crash and post-crash versions differ, so encrypting
-    // two different plaintexts can never reuse a keystream.
+    // two different plaintexts can never reuse a keystream. Uses the DEK_kdf
+    // subkey, exactly as the production chunk APIs do (Remark A.5).
+    let (_, kdf_key) = clawhdf5_filters::derive_subkeys(&dek);
     assert_ne!(
-        derive_nonce(&dek, 5, uncommitted_version),
-        derive_nonce(&dek, 5, retried.version),
+        derive_nonce(&kdf_key, 5, uncommitted_version),
+        derive_nonce(&kdf_key, 5, retried.version),
         "post-crash nonce must differ from the journaled-version nonce"
     );
 
     // Nonce reuse is impossible because:
     // - Idempotent replay uses the same version → same nonce → same ciphertext
     // - A new write uses a seeded, strictly higher version → different nonce
+
+    // P2.2b review regression: once the retried write actually commits, the
+    // abandoned pre-crash record must not linger as `Pending` forever. Before
+    // the fix, `VersionWal::commit_version` only resolved the newest matching
+    // record, leaving chunk 5 permanently reported by `recover()` (and so by
+    // `clawhdf5-format::merkle::verify_chunk_with_pending`) as unverified even
+    // though it is now fully committed and correct.
+    writer
+        .commit(5, retried.version)
+        .expect("committing the post-crash write should succeed");
+    let pending_after_commit = writer
+        .recover()
+        .expect("recovery should succeed after commit");
+    assert!(
+        pending_after_commit.is_empty(),
+        "the abandoned pre-crash record must not survive the post-crash commit, got {:?}",
+        pending_after_commit
+    );
 }
 
 /// Test position-swapping attack detection.

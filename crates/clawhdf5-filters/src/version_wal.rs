@@ -69,8 +69,6 @@ pub enum WalRecordStatus {
     Pending = 0x01,
     /// Record is committed (write completed successfully).
     Committed = 0x02,
-    /// Record was aborted (write failed, needs recovery).
-    Aborted = 0x03,
 }
 
 impl TryFrom<u8> for WalRecordStatus {
@@ -81,7 +79,6 @@ impl TryFrom<u8> for WalRecordStatus {
             0x00 => Ok(WalRecordStatus::Empty),
             0x01 => Ok(WalRecordStatus::Pending),
             0x02 => Ok(WalRecordStatus::Committed),
-            0x03 => Ok(WalRecordStatus::Aborted),
             _ => Err(WalError::InvalidRecordStatus(value)),
         }
     }
@@ -169,6 +166,14 @@ pub enum WalError {
     RecordNotFound { chunk_idx: u64 },
     /// Buffer too short for deserialization.
     BufferTooShort { expected: usize, actual: usize },
+    /// A non-empty WAL record slot failed its CRC check. The WAL cannot be
+    /// trusted for recovery: the corrupt slot might be a pending record whose
+    /// journaled version, if silently skipped, could later be reused for a
+    /// nonce — so all consumers fail closed instead.
+    CorruptRecord {
+        /// Zero-based slot index of the corrupt record.
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for WalError {
@@ -198,6 +203,13 @@ impl std::fmt::Display for WalError {
                 write!(
                     f,
                     "buffer too short: expected {expected} bytes, got {actual}"
+                )
+            }
+            WalError::CorruptRecord { index } => {
+                write!(
+                    f,
+                    "WAL record {index} failed its CRC check; the log cannot be \
+                     trusted for recovery (fail closed)"
                 )
             }
         }
@@ -324,9 +336,34 @@ impl<W: Read + Write + Seek> VersionWal<W> {
     /// Mark a journaled version as committed.
     ///
     /// This should be called AFTER the chunk is written and the companion
-    /// dataset is updated. The record status is changed to `Committed`.
+    /// dataset is updated. Every `Pending` record for `chunk_idx` is rewritten
+    /// with `Committed` status and a recomputed CRC — not just the newest one.
+    ///
+    /// A chunk can accumulate more than one `Pending` record for the same
+    /// `chunk_idx` if an earlier `encrypt_chunk` call was never committed
+    /// (abandoned by a crash, or simply superseded by a second call before the
+    /// first one committed): each call journals a new, strictly higher version
+    /// without resolving the previous one. Once *any* write to `chunk_idx`
+    /// commits, every such stale entry is moot — the version counter's strict
+    /// monotonicity already guarantees no nonce was reused, and the commit's
+    /// three-step write order has since overwritten the chunk data, companion
+    /// nodes, and root that the stale attempt could have left inconsistent.
+    /// Leaving them `Pending` would make [`recover`](Self::recover) — and so
+    /// `clawhdf5-format`'s `verify_chunk_with_pending` — report the chunk as
+    /// permanently unverified even though it is fully committed and correct.
+    /// Sweeping them here (rather than only the reverse-scan's first match)
+    /// closes that gap; reusing the existing `Committed` status also lets
+    /// [`compact`](Self::compact) reclaim their slots.
+    ///
+    /// # Errors
+    ///
+    /// - [`WalError::RecordNotFound`] if no pending record exists for `chunk_idx`.
+    /// - [`WalError::CorruptRecord`] if a non-empty slot fails its CRC check —
+    ///   the corrupt slot might itself be a record being committed, so the
+    ///   scan fails closed rather than skipping it.
     pub fn commit_version(&mut self, chunk_idx: u64) -> Result<(), WalError> {
-        // Find the pending record for this chunk
+        let mut found = false;
+
         for i in (0..self.record_count).rev() {
             let offset = WAL_HEADER_SIZE + i * WAL_RECORD_SIZE;
             self.writer.seek(SeekFrom::Start(offset as u64))?;
@@ -334,19 +371,31 @@ impl<W: Read + Write + Seek> VersionWal<W> {
             let mut buf = [0u8; WAL_RECORD_SIZE];
             self.writer.read_exact(&mut buf)?;
 
-            if let Ok(record) = WalRecord::from_bytes(&buf)
-                && record.chunk_idx == chunk_idx
-                && record.status == WalRecordStatus::Pending
-            {
-                // Update status to committed
+            // Zeroed slots are freed space left behind by compact().
+            if buf == [0u8; WAL_RECORD_SIZE] {
+                continue;
+            }
+
+            let record =
+                WalRecord::from_bytes(&buf).map_err(|_| WalError::CorruptRecord { index: i })?;
+            if record.chunk_idx == chunk_idx && record.status == WalRecordStatus::Pending {
+                // Rewrite the whole record so the CRC stays valid.
+                let committed = WalRecord {
+                    status: WalRecordStatus::Committed,
+                    chunk_idx: record.chunk_idx,
+                    version: record.version,
+                };
                 self.writer.seek(SeekFrom::Start(offset as u64))?;
-                self.writer.write_all(&[WalRecordStatus::Committed as u8])?;
-                self.writer.flush()?;
-                return Ok(());
+                self.writer.write_all(&committed.to_bytes())?;
+                found = true;
             }
         }
 
-        Err(WalError::RecordNotFound { chunk_idx })
+        if !found {
+            return Err(WalError::RecordNotFound { chunk_idx });
+        }
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Recover uncommitted records from the WAL.
@@ -354,6 +403,18 @@ impl<W: Read + Write + Seek> VersionWal<W> {
     /// Returns a list of (chunk_idx, version) pairs for records that were
     /// journaled but not committed. These chunks need to have their writes
     /// replayed with the journaled version.
+    ///
+    /// # Fail-closed corruption handling
+    ///
+    /// A non-empty record slot that fails its CRC check aborts recovery with
+    /// [`WalError::CorruptRecord`] instead of being skipped. The corrupt slot
+    /// might be a *pending* record: silently dropping it would mean its
+    /// journaled version is never seeded into the version store, and a later
+    /// write to the same chunk could re-derive the same nonce — the exact
+    /// keystream reuse the WAL exists to prevent. The caller must fall back
+    /// to operator intervention / full re-verification rather than trust a
+    /// log it cannot fully read. (Zeroed slots from [`compact`](Self::compact)
+    /// are expected free space and are skipped.)
     pub fn recover(&mut self) -> Result<Vec<(u64, u64)>, WalError> {
         let mut uncommitted = Vec::new();
 
@@ -366,9 +427,13 @@ impl<W: Read + Write + Seek> VersionWal<W> {
                 break;
             }
 
-            if let Ok(record) = WalRecord::from_bytes(&buf)
-                && record.status == WalRecordStatus::Pending
-            {
+            if buf == [0u8; WAL_RECORD_SIZE] {
+                continue;
+            }
+
+            let record =
+                WalRecord::from_bytes(&buf).map_err(|_| WalError::CorruptRecord { index: i })?;
+            if record.status == WalRecordStatus::Pending {
                 uncommitted.push((record.chunk_idx, record.version));
             }
         }
@@ -385,16 +450,19 @@ impl<W: Read + Write + Seek> VersionWal<W> {
     ///
     /// The generic `W: Write + Seek` bound provides no way to truncate the
     /// underlying storage (there is no `set_len` in `std::io`), so the file's byte
-    /// length does not shrink. The freed tail slots are zeroed instead; because a
-    /// zeroed record fails its CRC check, [`recover`](Self::recover) and
-    /// [`commit_version`](Self::commit_version) skip them, so reopening the WAL is
-    /// still correct — only the on-disk footprint stays at its high-water mark until
-    /// a `File`-backed truncation path is added.
+    /// length does not shrink. The freed tail slots are zeroed instead;
+    /// [`recover`](Self::recover) and [`commit_version`](Self::commit_version)
+    /// recognize all-zero slots as freed space and skip them, so reopening the
+    /// WAL is still correct — only the on-disk footprint stays at its
+    /// high-water mark until a `File`-backed truncation path is added.
     pub fn compact(&mut self) -> Result<(), WalError> {
         let old_count = self.record_count;
         let mut pending_records = Vec::new();
 
-        // Collect all pending records
+        // Collect all pending records. Zeroed slots are freed space from a
+        // previous compaction; any other CRC-invalid slot means the log is
+        // corrupt and must not be silently rewritten around (fail closed,
+        // same rationale as `recover`).
         for i in 0..old_count {
             let offset = WAL_HEADER_SIZE + i * WAL_RECORD_SIZE;
             self.writer.seek(SeekFrom::Start(offset as u64))?;
@@ -404,9 +472,13 @@ impl<W: Read + Write + Seek> VersionWal<W> {
                 break;
             }
 
-            if let Ok(record) = WalRecord::from_bytes(&buf)
-                && record.status == WalRecordStatus::Pending
-            {
+            if buf == [0u8; WAL_RECORD_SIZE] {
+                continue;
+            }
+
+            let record =
+                WalRecord::from_bytes(&buf).map_err(|_| WalError::CorruptRecord { index: i })?;
+            if record.status == WalRecordStatus::Pending {
                 pending_records.push(record);
             }
         }
@@ -533,7 +605,14 @@ impl VersionCounterStore {
 
     /// Get the maximum version across all chunks.
     ///
-    /// This is used as the dataset-level version in the signed root.
+    /// **Must not be used as the dataset-level version in the signed root.**
+    /// `max_k v_k` is only non-decreasing, not strictly increasing, across
+    /// commits: a mutation that doesn't touch the currently-maximal chunk
+    /// leaves it unchanged, so two different honest states can tie — the
+    /// freshness blind spot Remark A.13 (S2-D2-Yr2 security review) requires
+    /// P2.2b to close. The persisted dataset version is the strictly-
+    /// per-commit counter (`EncryptedChunkWriter::dataset_version`). This
+    /// accessor remains for per-chunk bookkeeping only.
     #[must_use]
     pub fn max_version(&self) -> u64 {
         self.max_version
@@ -590,13 +669,12 @@ impl VersionCounterStore {
         // `count` is attacker-controlled: compute the required length with checked
         // arithmetic so a huge value can't overflow past the bounds check below or
         // trigger an unbounded pre-allocation.
-        let expected_len = count
-            .checked_mul(16)
-            .and_then(|n| n.checked_add(8))
-            .ok_or(WalError::BufferTooShort {
+        let expected_len = count.checked_mul(16).and_then(|n| n.checked_add(8)).ok_or(
+            WalError::BufferTooShort {
                 expected: usize::MAX,
                 actual: buf.len(),
-            })?;
+            },
+        )?;
         if buf.len() < expected_len {
             return Err(WalError::BufferTooShort {
                 expected: expected_len,
@@ -687,6 +765,116 @@ mod tests {
         let uncommitted = wal.recover().unwrap();
         assert_eq!(uncommitted.len(), 1);
         assert!(uncommitted.contains(&(1, 1)));
+    }
+
+    /// B1 regression (P2.2 review): committing must rewrite the whole record
+    /// with a recomputed CRC. Flipping only the status byte would leave every
+    /// committed record failing `from_bytes` forever — indistinguishable from
+    /// bit rot, and silently erasing the CRC's diagnostic value.
+    #[test]
+    fn commit_version_leaves_record_readable_with_valid_crc() {
+        let buf = Cursor::new(Vec::new());
+        let mut wal = VersionWal::new(buf, 100).unwrap();
+
+        wal.journal_version(7, 3).unwrap();
+        wal.commit_version(7).unwrap();
+
+        // Read the raw record back and parse it: it must be a VALID record
+        // with Committed status, not a CRC failure.
+        let mut inner = wal.writer;
+        inner.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64)).unwrap();
+        let mut raw = [0u8; WAL_RECORD_SIZE];
+        inner.read_exact(&mut raw).unwrap();
+
+        let record =
+            WalRecord::from_bytes(&raw).expect("a committed record must still pass its CRC check");
+        assert_eq!(record.status, WalRecordStatus::Committed);
+        assert_eq!(record.chunk_idx, 7);
+        assert_eq!(record.version, 3);
+    }
+
+    /// P2.2b review regression: an abandoned pending record (journaled but
+    /// never committed — e.g. superseded by a crash-then-retry, or by a
+    /// second `encrypt_chunk` call before the first one committed) must not
+    /// stay `Pending` forever once a later write to the *same* chunk commits.
+    /// Before this fix, `commit_version` only rewrote the newest matching
+    /// record (found first by its reverse scan), silently orphaning older
+    /// pending records for the same `chunk_idx` — which made `recover()`, and
+    /// so `clawhdf5-format`'s `verify_chunk_with_pending`, report the chunk as
+    /// permanently unverified even after it fully committed at a later
+    /// version.
+    #[test]
+    fn commit_version_resolves_all_stale_pending_records_for_chunk() {
+        let buf = Cursor::new(Vec::new());
+        let mut wal = VersionWal::new(buf, 100).unwrap();
+
+        // Two journaled-but-uncommitted attempts for the same chunk, as
+        // happens when the first is abandoned (crashed or superseded) before
+        // the second is journaled.
+        wal.journal_version(5, 1).unwrap();
+        wal.journal_version(5, 2).unwrap();
+        assert_eq!(wal.recover().unwrap(), vec![(5, 1), (5, 2)]);
+
+        // Committing the chunk (as the successful retry does) must resolve
+        // BOTH pending records, not just the newest.
+        wal.commit_version(5).unwrap();
+        assert!(
+            wal.recover().unwrap().is_empty(),
+            "a stale pending record must not survive a later commit for the same chunk"
+        );
+    }
+
+    /// B1 regression (P2.2 review): a corrupted non-empty record aborts
+    /// recovery instead of being silently skipped. The corrupt slot might be
+    /// a pending record whose journaled version, if dropped, could later be
+    /// reused for a nonce.
+    #[test]
+    fn recover_fails_closed_on_corrupt_record() {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut wal = VersionWal::new(&mut buf, 100).unwrap();
+            wal.journal_version(0, 1).unwrap();
+            wal.journal_version(1, 1).unwrap();
+        }
+
+        // Bit-rot one byte inside the first record (leave it non-zero).
+        let pos = WAL_HEADER_SIZE + 5;
+        buf.get_mut()[pos] ^= 0xFF;
+
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        let mut wal = VersionWal::new(&mut buf, 100).unwrap();
+        assert!(matches!(
+            wal.recover(),
+            Err(WalError::CorruptRecord { index: 0 })
+        ));
+    }
+
+    /// Companion to the fail-closed recovery test: commit_version and
+    /// compact also refuse to operate around a corrupt slot.
+    #[test]
+    fn commit_and_compact_fail_closed_on_corrupt_record() {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut wal = VersionWal::new(&mut buf, 100).unwrap();
+            wal.journal_version(0, 1).unwrap();
+            wal.journal_version(1, 1).unwrap();
+        }
+        let pos = WAL_HEADER_SIZE + 5;
+        buf.get_mut()[pos] ^= 0xFF;
+
+        buf.seek(SeekFrom::Start(0)).unwrap();
+        let mut wal = VersionWal::new(&mut buf, 100).unwrap();
+
+        // The corrupt slot is index 0; committing chunk 0 must not silently
+        // scan past it and report "not found".
+        assert!(matches!(
+            wal.commit_version(0),
+            Err(WalError::CorruptRecord { index: 0 })
+        ));
+        assert!(matches!(
+            wal.compact(),
+            Err(WalError::CorruptRecord { index: 0 })
+        ));
     }
 
     #[test]

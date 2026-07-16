@@ -30,10 +30,24 @@
 use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
+use alloc::vec;
+
+#[cfg(not(feature = "std"))]
+use alloc::string::ToString;
+
+#[cfg(not(feature = "std"))]
 use alloc::borrow::Cow;
 
 #[cfg(feature = "std")]
 use std::borrow::Cow;
+
+#[cfg(not(feature = "std"))]
+use alloc::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "std")]
+use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
 
 /// Size of hash output in bytes (256 bits).
 pub(crate) const HASH_SIZE: usize = 32;
@@ -92,6 +106,39 @@ pub enum MerkleError {
     /// and chunk grid (see `subset_proof::verify_subset`). This means the
     /// prover delivered a proof for a different region than was requested.
     SelectionMismatch,
+    /// The dataset's persisted version is lower than the highest version this
+    /// verifier has previously observed for the same file (threat T4, rollback).
+    ///
+    /// Raised by [`VersionObservationStore::observe`] on open (P2.2b step 1).
+    VersionRollback {
+        /// The version read from the file being opened.
+        observed: u64,
+        /// The highest version previously observed for this file.
+        highest_seen: u64,
+    },
+    /// The provenance journal bytes are malformed, truncated, or internally
+    /// inconsistent (bad magic, a length that runs past the buffer,
+    /// non-monotonic record versions, or invalid UTF-8 in a snapshot
+    /// reference). Raised when parsing the append-only journal (P2.2b step 3).
+    JournalCorrupt,
+    /// The provenance journal's format-version byte is valid-looking but not
+    /// one this build understands. Distinct from [`JournalCorrupt`] so a
+    /// future format bump fails with an actionable message instead of
+    /// reading as tampering.
+    JournalUnsupportedVersion {
+        /// The format-version byte found in the journal header.
+        found: u8,
+    },
+    /// A record appended to the provenance journal did not strictly increase
+    /// the version. This is caller misuse of the append-only API (one record
+    /// per commit, strictly increasing), not evidence of an attack — unlike
+    /// [`MerkleError::VersionRollback`], which a verifier raises on open.
+    JournalNonMonotonic {
+        /// The version of the record the caller tried to append.
+        appended: u64,
+        /// The version of the last record already in the journal.
+        last: u64,
+    },
 }
 
 /// Reasons why a merkle attribute is invalid.
@@ -160,6 +207,37 @@ impl core::fmt::Display for MerkleError {
                     "subset proof's chunk set does not match the requested selection"
                 )
             }
+            MerkleError::VersionRollback {
+                observed,
+                highest_seen,
+            } => {
+                write!(
+                    f,
+                    "dataset version rollback: observed version {} is lower than \
+                     highest previously seen {} (T4)",
+                    observed, highest_seen
+                )
+            }
+            MerkleError::JournalCorrupt => {
+                write!(f, "provenance journal is malformed or inconsistent")
+            }
+            MerkleError::JournalUnsupportedVersion { found } => {
+                write!(
+                    f,
+                    "provenance journal format version {} is not supported by this build \
+                     (expected {})",
+                    found,
+                    crate::merkle_journal::MERKLE_JOURNAL_VERSION
+                )
+            }
+            MerkleError::JournalNonMonotonic { appended, last } => {
+                write!(
+                    f,
+                    "provenance journal append must strictly increase the version: \
+                     tried to append version {} after {}",
+                    appended, last
+                )
+            }
         }
     }
 }
@@ -218,7 +296,127 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::NoncePending => VerifyResponse::Halt,
         MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
         MerkleError::SelectionMismatch => VerifyResponse::Halt,
+        // T4 rollback is adversarial: fail closed.
+        MerkleError::VersionRollback { .. } => VerifyResponse::Halt,
+        // A corrupt or unreadable provenance journal cannot be trusted for
+        // recovery: fail closed. Non-monotonic appends are caller misuse and
+        // likewise never proceed.
+        MerkleError::JournalCorrupt => VerifyResponse::Halt,
+        MerkleError::JournalUnsupportedVersion { .. } => VerifyResponse::Halt,
+        MerkleError::JournalNonMonotonic { .. } => VerifyResponse::Halt,
     }
+}
+
+/// Whether a dataset's Merkle root carries a hybrid signature (P2.2b step 5).
+///
+/// Determines whether a detected inconsistency may be repaired by rehashing,
+/// per Sec. merkle-storage, "Crash consistency": an unsigned dataset has no
+/// authenticity guarantee to violate, so rebuilding from on-disk chunk data is
+/// safe; a signed dataset must never be auto-rehashed and re-signed, since
+/// doing so over tampered chunks would launder the corruption under a fresh,
+/// validly-signed root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningContext {
+    /// No hybrid signature is in force for this dataset.
+    Unsigned,
+    /// A hybrid signature certifies the root.
+    Signed,
+}
+
+/// Operator-selected policy for the halt/quarantine/alert decision (Sec.
+/// merkle-storage, "Error response and recovery").
+///
+/// The choice among the three is an operational one, not derivable from the
+/// error variant alone: `Halt` is the correct default for automated
+/// pipelines and archival ingest; `Quarantine` is appropriate when forensic
+/// inspection of the affected data is required before disposal; `AlertAndContinue`
+/// is acceptable only in interactive, non-critical exploration workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ResponsePolicy {
+    /// Refuse all further access to the file (default).
+    #[default]
+    Halt,
+    /// Deny writes, allow read-only access only under explicit operator
+    /// acknowledgement.
+    Quarantine,
+    /// Log and notify, then proceed read-only without the integrity
+    /// guarantee.
+    AlertAndContinue,
+}
+
+/// Whether it is safe to offer an automatic repair alongside the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// No repair is safe; the response alone applies.
+    None,
+    /// The tree may be rebuilt by rehashing on-disk chunk data. Only ever
+    /// returned for [`SigningContext::Unsigned`].
+    RebuildByRehash,
+}
+
+/// The outcome of [`resolve_response`]: the halt/quarantine/alert response,
+/// plus whether an automatic repair is safe to attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedResponse {
+    /// The halt/quarantine/alert response to apply.
+    pub response: VerifyResponse,
+    /// Whether an automatic repair may be attempted instead of / alongside
+    /// the response.
+    pub recovery: RecoveryAction,
+}
+
+/// The full P2.2b error-response policy (Sec. merkle-storage, "Error response
+/// and recovery" and "Crash consistency"), the seam that [`default_response`]
+/// existed to mark out in Phase 1.
+///
+/// For the three errors that signal a detected content inconsistency
+/// (`HashMismatch`, `CompanionTampered`, `SignatureInvalid`), the caller's
+/// chosen `policy` selects the response, and `signing` determines whether a
+/// rebuild-by-rehash repair is offered: never for [`SigningContext::Signed`]
+/// (fail closed — no auto-rehash-and-resign), always for
+/// [`SigningContext::Unsigned`] (no authenticity guarantee is at risk).
+///
+/// Every other `MerkleError` variant (malformed input, out-of-bounds access,
+/// a pending WAL entry, T4 version rollback, a corrupt provenance journal)
+/// falls outside this policy and stays unconditionally `Halt` with no
+/// recovery option, regardless of `policy` or `signing`.
+///
+/// Callers must log the file path, dataset name, chunk index (if
+/// applicable), and the error variant before acting on the resolved
+/// response — see the `clawhdf5-agent` wiring that consumes this function.
+#[must_use]
+pub fn resolve_response(
+    e: &MerkleError,
+    policy: ResponsePolicy,
+    signing: SigningContext,
+) -> ResolvedResponse {
+    let is_content_inconsistency = matches!(
+        e,
+        MerkleError::HashMismatch { .. }
+            | MerkleError::CompanionTampered
+            | MerkleError::SignatureInvalid
+    );
+
+    if !is_content_inconsistency {
+        return ResolvedResponse {
+            response: VerifyResponse::Halt,
+            recovery: RecoveryAction::None,
+        };
+    }
+
+    let response = match policy {
+        ResponsePolicy::Halt => VerifyResponse::Halt,
+        ResponsePolicy::Quarantine => VerifyResponse::Quarantine,
+        ResponsePolicy::AlertAndContinue => VerifyResponse::Alert,
+    };
+    let recovery = match signing {
+        // Fail closed: never auto-rehash and re-sign on-disk data.
+        SigningContext::Signed => RecoveryAction::None,
+        SigningContext::Unsigned => RecoveryAction::RebuildByRehash,
+    };
+
+    ResolvedResponse { response, recovery }
 }
 
 /// Hash algorithm selection for Merkle tree construction.
@@ -1155,6 +1353,115 @@ impl MerkleAttr {
     }
 }
 
+// ===== P2.2b Part 1: persisted dataset version counter + rollback (T4) guard =====
+
+/// Attribute name for the persisted dataset version counter (P2.2b step 1).
+///
+/// The spec (§7, P2.2b) names this `_merkle_version`; this codebase follows its
+/// existing unprefixed attribute convention ([`MERKLE_ATTR_NAME`] = `merkle_root`,
+/// [`MERKLE_NODES_ATTR_NAME`] = `merkle_nodes`).
+pub const MERKLE_VERSION_ATTR_NAME: &str = "merkle_version";
+
+/// Serialized size of the version attribute: one big-endian `u64` (8 bytes).
+pub const MERKLE_VERSION_ATTR_SIZE: usize = 8;
+
+/// Pack a dataset version counter into its on-disk attribute bytes.
+///
+/// Encoded big-endian to match the `version` field of the P2.1
+/// `canonical_payload`, so the identical integer encoding is the one bound into
+/// the hybrid signature. The signature — not this attribute's bytes — is what
+/// authenticates the version at rest; [`VersionObservationStore`] enforces
+/// monotonicity across opens (T4).
+#[must_use]
+pub fn pack_merkle_version(version: u64) -> [u8; MERKLE_VERSION_ATTR_SIZE] {
+    version.to_be_bytes()
+}
+
+/// Unpack a dataset version counter from its on-disk attribute bytes.
+///
+/// # Errors
+///
+/// Returns [`MerkleError::InvalidAttribute`] with [`InvalidAttrReason::WrongSize`]
+/// if `data` is not exactly [`MERKLE_VERSION_ATTR_SIZE`] bytes.
+pub fn unpack_merkle_version(data: &[u8]) -> Result<u64, MerkleError> {
+    let bytes: [u8; MERKLE_VERSION_ATTR_SIZE] =
+        data.try_into().map_err(|_| MerkleError::InvalidAttribute {
+            reason: InvalidAttrReason::WrongSize,
+        })?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// Tracks the highest dataset version a verifier has previously observed, keyed
+/// by file identity, and enforces monotonicity across opens (threat T4).
+///
+/// P2.2b step 1: *"On open, a verifier rejects a file whose version is lower than
+/// the highest it has previously observed."* A long-running verifier persists or
+/// caches this mapping between runs (e.g. alongside the signed roots it has seen);
+/// this type provides the in-memory monotonic guard and the specific rejection
+/// error. The `key` is any stable identifier for the file — a path, a URI, or a
+/// content id — chosen by the caller.
+#[derive(Debug, Clone, Default)]
+pub struct VersionObservationStore {
+    /// Highest version seen per file key.
+    observed: BTreeMap<String, u64>,
+}
+
+impl VersionObservationStore {
+    /// Create an empty observation store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            observed: BTreeMap::new(),
+        }
+    }
+
+    /// Record the version observed for `key` on open, rejecting a rollback.
+    ///
+    /// If `version` is greater than or equal to the highest previously observed
+    /// for `key` (or `key` is new), it becomes the new high-water mark and `Ok(())`
+    /// is returned. If it is strictly lower, the open is rejected with
+    /// [`MerkleError::VersionRollback`] and the high-water mark is left unchanged.
+    ///
+    /// Equal versions are accepted: re-opening the same version of a file is normal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MerkleError::VersionRollback`] if `version` is below the recorded
+    /// high-water mark for `key`.
+    pub fn observe(&mut self, key: &str, version: u64) -> Result<(), MerkleError> {
+        match self.observed.get(key) {
+            Some(&highest) if version < highest => Err(MerkleError::VersionRollback {
+                observed: version,
+                highest_seen: highest,
+            }),
+            Some(&highest) if version == highest => Ok(()),
+            _ => {
+                // New key, or a strictly higher version: advance the high-water mark.
+                self.observed.insert(String::from(key), version);
+                Ok(())
+            }
+        }
+    }
+
+    /// The highest version observed for `key`, if any has been recorded.
+    #[must_use]
+    pub fn highest(&self, key: &str) -> Option<u64> {
+        self.observed.get(key).copied()
+    }
+
+    /// Number of distinct files being tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.observed.len()
+    }
+
+    /// Whether the store has no observations yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.observed.is_empty()
+    }
+}
+
 /// Zero-copy reference to packed merkle attribute data.
 ///
 /// This struct holds a reference to the raw attribute bytes using [`Cow`],
@@ -1821,11 +2128,10 @@ pub fn verify_root(d: &Dataset<'_>) -> Result<bool, MerkleError> {
         // No companion hash stored - tree is inline or empty
         // Verify integrity of the merkle attribute itself
         let packed = d.merkle_attr.pack();
-        let attr_ref = MerkleAttrRef::from_slice(&packed).map_err(|_| {
-            MerkleError::InvalidAttribute {
+        let attr_ref =
+            MerkleAttrRef::from_slice(&packed).map_err(|_| MerkleError::InvalidAttribute {
                 reason: InvalidAttrReason::WrongSize,
-            }
-        })?;
+            })?;
         attr_ref.verify_integrity()?;
         Ok(true)
     }
@@ -1847,11 +2153,6 @@ pub fn verify_root(d: &Dataset<'_>) -> Result<bool, MerkleError> {
 /// - [`MerkleError::HashMismatch`] if recomputed root doesn't match stored root
 /// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
 pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
-    // TODO: Check WAL for uncommitted entries affecting this chunk.
-    // If the WAL has a pending write for this chunk index, return
-    // MerkleError::NoncePending to signal that verification cannot proceed
-    // until the WAL is flushed. This requires integration with clawhdf5-agent.
-
     // 1. Bounds check against actual chunks
     if idx >= d.chunk_count() {
         return Err(MerkleError::HyperslabOutOfBounds { idx });
@@ -1874,6 +2175,64 @@ pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
     } else {
         Err(MerkleError::HashMismatch { chunk_idx: idx })
     }
+}
+
+/// A set of chunk indices with in-flight (journaled but uncommitted) writes.
+///
+/// P2.2b step 2: a chunk that has an uncommitted per-chunk WAL entry — from the
+/// P2.2 version WAL in `clawhdf5-filters` — is mid-update on disk and cannot be
+/// meaningfully verified until the write commits. `clawhdf5-format` stays
+/// decoupled from the WAL (and from `std`) by consulting this abstract view
+/// rather than the concrete WAL type; callers build it from the WAL's
+/// `recover()` output, e.g.:
+///
+/// ```ignore
+/// // uncommitted: Vec<(u64 /* chunk_idx */, u64 /* version */)> from wal.recover()
+/// let pending: BTreeSet<u64> = uncommitted.iter().map(|&(idx, _)| idx).collect();
+/// verify_chunk_with_pending(&dataset, idx, &pending)?;
+/// ```
+pub trait PendingChunks {
+    /// Whether chunk `chunk_idx` has an uncommitted WAL entry.
+    fn is_pending(&self, chunk_idx: u64) -> bool;
+}
+
+impl PendingChunks for BTreeSet<u64> {
+    fn is_pending(&self, chunk_idx: u64) -> bool {
+        self.contains(&chunk_idx)
+    }
+}
+
+impl PendingChunks for [u64] {
+    fn is_pending(&self, chunk_idx: u64) -> bool {
+        self.contains(&chunk_idx)
+    }
+}
+
+/// Verify a chunk, first rejecting it if it has an uncommitted WAL entry.
+///
+/// This is the WAL-aware counterpart to [`verify_chunk`] (P2.2b step 2). A chunk
+/// whose per-chunk version WAL record is still `Pending` — journaled but not yet
+/// committed through the three-step write order — is reported as
+/// [`MerkleError::NoncePending`] before any hash comparison, because its on-disk
+/// data, companion nodes, and root attribute may be mid-update and mutually
+/// inconsistent. When the chunk is not pending, behavior is identical to
+/// [`verify_chunk`].
+///
+/// # Errors
+///
+/// - [`MerkleError::NoncePending`] if `idx` has an uncommitted WAL entry
+/// - [`MerkleError::HyperslabOutOfBounds`] if `idx` exceeds chunk count
+/// - [`MerkleError::HashMismatch`] if the chunk's hash does not match the tree
+/// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
+pub fn verify_chunk_with_pending<P: PendingChunks + ?Sized>(
+    d: &Dataset<'_>,
+    idx: usize,
+    pending: &P,
+) -> Result<bool, MerkleError> {
+    if pending.is_pending(idx as u64) {
+        return Err(MerkleError::NoncePending);
+    }
+    verify_chunk(d, idx)
 }
 
 /// Verify all chunks in a dataset (full O(N) integrity check).
@@ -2482,6 +2841,16 @@ mod tests {
                 reason: InvalidAttrReason::WrongSize,
             },
             MerkleError::SelectionMismatch,
+            MerkleError::VersionRollback {
+                observed: 1,
+                highest_seen: 2,
+            },
+            MerkleError::JournalCorrupt,
+            MerkleError::JournalUnsupportedVersion { found: 0xFF },
+            MerkleError::JournalNonMonotonic {
+                appended: 1,
+                last: 2,
+            },
         ];
 
         for err in &errors {
@@ -2497,6 +2866,110 @@ mod tests {
     #[test]
     fn test_verify_response_default_is_halt() {
         assert_eq!(VerifyResponse::default(), VerifyResponse::Halt);
+    }
+
+    // ===== P2.2b Part 5: full halt/quarantine/alert policy =====
+
+    #[test]
+    fn resolve_response_follows_policy_for_content_inconsistency_errors() {
+        let content_errors = [
+            MerkleError::HashMismatch { chunk_idx: 7 },
+            MerkleError::CompanionTampered,
+            MerkleError::SignatureInvalid,
+        ];
+        let cases = [
+            (ResponsePolicy::Halt, VerifyResponse::Halt),
+            (ResponsePolicy::Quarantine, VerifyResponse::Quarantine),
+            (ResponsePolicy::AlertAndContinue, VerifyResponse::Alert),
+        ];
+
+        for err in &content_errors {
+            for (policy, expected) in &cases {
+                let resolved = resolve_response(err, *policy, SigningContext::Signed);
+                assert_eq!(
+                    resolved.response, *expected,
+                    "{err:?} under {policy:?} should resolve to {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_response_signed_never_offers_rebuild() {
+        // Fail closed: never auto-rehash and re-sign on-disk data, regardless
+        // of which halt/quarantine/alert policy is selected.
+        for err in [
+            MerkleError::HashMismatch { chunk_idx: 0 },
+            MerkleError::CompanionTampered,
+            MerkleError::SignatureInvalid,
+        ] {
+            for policy in [
+                ResponsePolicy::Halt,
+                ResponsePolicy::Quarantine,
+                ResponsePolicy::AlertAndContinue,
+            ] {
+                let resolved = resolve_response(&err, policy, SigningContext::Signed);
+                assert_eq!(resolved.recovery, RecoveryAction::None);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_response_unsigned_offers_rebuild_by_rehash() {
+        // No authenticity guarantee is at risk, so a rebuild is safe.
+        for err in [
+            MerkleError::HashMismatch { chunk_idx: 0 },
+            MerkleError::CompanionTampered,
+        ] {
+            let resolved = resolve_response(&err, ResponsePolicy::Halt, SigningContext::Unsigned);
+            assert_eq!(resolved.recovery, RecoveryAction::RebuildByRehash);
+        }
+    }
+
+    #[test]
+    fn resolve_response_ignores_policy_and_signing_outside_content_inconsistency() {
+        // Malformed input, bounds errors, T4 rollback, and journal corruption
+        // are outside the halt/quarantine/alert menu: always Halt, never a
+        // repair, no matter what policy or signing context is passed in.
+        let other_errors = [
+            MerkleError::MissingChunkGridMetadata,
+            MerkleError::HyperslabOutOfBounds { idx: 3 },
+            MerkleError::TreeTooDeep { depth: 50 },
+            MerkleError::NoncePending,
+            MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            },
+            MerkleError::SelectionMismatch,
+            MerkleError::VersionRollback {
+                observed: 1,
+                highest_seen: 2,
+            },
+            MerkleError::JournalCorrupt,
+            MerkleError::JournalUnsupportedVersion { found: 0xFF },
+            MerkleError::JournalNonMonotonic {
+                appended: 1,
+                last: 2,
+            },
+        ];
+
+        for err in &other_errors {
+            for policy in [
+                ResponsePolicy::Halt,
+                ResponsePolicy::Quarantine,
+                ResponsePolicy::AlertAndContinue,
+            ] {
+                for signing in [SigningContext::Signed, SigningContext::Unsigned] {
+                    let resolved = resolve_response(err, policy, signing);
+                    assert_eq!(resolved.response, VerifyResponse::Halt);
+                    assert_eq!(resolved.recovery, RecoveryAction::None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn response_policy_default_is_halt() {
+        assert_eq!(ResponsePolicy::default(), ResponsePolicy::Halt);
     }
 
     /// Regression fixture for the verification API error variants.
@@ -3601,7 +4074,10 @@ mod tests {
 
         // Tampered chunk should fail
         let result = verify_chunk(&tampered_dataset, 512);
-        assert!(matches!(result, Err(MerkleError::HashMismatch { chunk_idx: 512 })));
+        assert!(matches!(
+            result,
+            Err(MerkleError::HashMismatch { chunk_idx: 512 })
+        ));
 
         // Untampered chunk should still pass
         assert!(verify_chunk(&tampered_dataset, 0).is_ok());
@@ -3631,7 +4107,10 @@ mod tests {
 
         // Tampered dataset should fail with the correct chunk index
         let result = verify_dataset(&tampered_dataset);
-        assert!(matches!(result, Err(MerkleError::HashMismatch { chunk_idx: 512 })));
+        assert!(matches!(
+            result,
+            Err(MerkleError::HashMismatch { chunk_idx: 512 })
+        ));
     }
 
     /// Verify that `verify_root` returns `Ok(true)` even when chunk data is
@@ -3708,7 +4187,9 @@ mod tests {
         let result = dataset.reconstruct_tree();
         assert!(matches!(
             result,
-            Err(MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize })
+            Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize
+            })
         ));
     }
 
@@ -3730,7 +4211,9 @@ mod tests {
         let result = dataset.reconstruct_tree();
         assert!(matches!(
             result,
-            Err(MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize })
+            Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize
+            })
         ));
     }
 
@@ -3752,7 +4235,9 @@ mod tests {
         let result = dataset.reconstruct_tree();
         assert!(matches!(
             result,
-            Err(MerkleError::InvalidAttribute { reason: InvalidAttrReason::WrongSize })
+            Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize
+            })
         ));
     }
 
@@ -3801,14 +4286,187 @@ mod tests {
 
         // Try to verify with 3 chunks but tree only has 2 leaves
         let chunk2 = b"chunk2".to_vec();
-        let too_many_refs: Vec<&[u8]> = vec![
-            chunk0.as_slice(),
-            chunk1.as_slice(),
-            chunk2.as_slice(),
-        ];
+        let too_many_refs: Vec<&[u8]> =
+            vec![chunk0.as_slice(), chunk1.as_slice(), chunk2.as_slice()];
 
         let dataset = Dataset::from_owned(merkle_attr, flat_nodes, too_many_refs);
         let result = verify_dataset(&dataset);
         assert!(matches!(result, Err(MerkleError::MissingChunkGridMetadata)));
+    }
+
+    // ===== P2.2b Part 1: version persistence + rollback guard =====
+
+    #[test]
+    fn merkle_version_pack_unpack_roundtrip() {
+        for v in [0u64, 1, 7, 255, 256, u32::MAX as u64, u64::MAX] {
+            let packed = pack_merkle_version(v);
+            assert_eq!(packed.len(), MERKLE_VERSION_ATTR_SIZE);
+            assert_eq!(unpack_merkle_version(&packed).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn merkle_version_is_big_endian() {
+        // Must match canonical_payload's big-endian `version` encoding (P2.1),
+        // so the on-disk attribute and the signed bytes agree.
+        assert_eq!(pack_merkle_version(1), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            pack_merkle_version(0x0102_0304_0506_0708),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn merkle_version_unpack_rejects_wrong_size() {
+        assert!(matches!(
+            unpack_merkle_version(&[0u8; 7]),
+            Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize
+            })
+        ));
+        assert!(matches!(
+            unpack_merkle_version(&[0u8; 9]),
+            Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize
+            })
+        ));
+        assert!(matches!(
+            unpack_merkle_version(&[]),
+            Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize
+            })
+        ));
+    }
+
+    #[test]
+    fn observation_store_accepts_monotonic_and_records_high_water_mark() {
+        let mut store = VersionObservationStore::new();
+        assert!(store.is_empty());
+
+        // First observation of a file is always accepted.
+        store.observe("file-a", 3).unwrap();
+        assert_eq!(store.highest("file-a"), Some(3));
+
+        // Re-opening the same version is fine.
+        store.observe("file-a", 3).unwrap();
+        assert_eq!(store.highest("file-a"), Some(3));
+
+        // A newer version advances the high-water mark.
+        store.observe("file-a", 5).unwrap();
+        assert_eq!(store.highest("file-a"), Some(5));
+
+        // Independent files are tracked separately.
+        store.observe("file-b", 1).unwrap();
+        assert_eq!(store.highest("file-b"), Some(1));
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn observation_store_rejects_rollback() {
+        let mut store = VersionObservationStore::new();
+        store.observe("file", 10).unwrap();
+
+        // A file presenting an older version than we've seen is a T4 rollback.
+        let err = store.observe("file", 9).unwrap_err();
+        assert!(matches!(
+            err,
+            MerkleError::VersionRollback {
+                observed: 9,
+                highest_seen: 10
+            }
+        ));
+
+        // The high-water mark is unchanged after a rejected rollback.
+        assert_eq!(store.highest("file"), Some(10));
+
+        // Rollback fails closed.
+        assert_eq!(default_response(&err), VerifyResponse::Halt);
+    }
+
+    #[test]
+    fn observation_store_unknown_file_has_no_high_water_mark() {
+        let store = VersionObservationStore::new();
+        assert_eq!(store.highest("never-seen"), None);
+    }
+
+    // ===== P2.2b Part 2: WAL-aware verify_chunk (NoncePending) =====
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn verify_chunk_with_pending_reports_nonce_pending() {
+        let chunks = make_tampering_test_chunks();
+        let dataset = make_dataset_from_chunks(&chunks);
+
+        // With no pending entries, behavior matches plain verify_chunk.
+        let empty: BTreeSet<u64> = BTreeSet::new();
+        assert!(verify_chunk_with_pending(&dataset, 0, &empty).is_ok());
+        assert!(verify_chunk_with_pending(&dataset, 512, &empty).is_ok());
+
+        // Mark chunk 512 as having an uncommitted WAL entry.
+        let mut pending: BTreeSet<u64> = BTreeSet::new();
+        pending.insert(512);
+
+        // The pending chunk is rejected with NoncePending BEFORE any hash check,
+        // while other chunks still verify normally.
+        assert!(matches!(
+            verify_chunk_with_pending(&dataset, 512, &pending),
+            Err(MerkleError::NoncePending)
+        ));
+        assert!(verify_chunk_with_pending(&dataset, 0, &pending).is_ok());
+
+        // NoncePending fails closed.
+        assert_eq!(
+            default_response(&MerkleError::NoncePending),
+            VerifyResponse::Halt
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn verify_chunk_with_pending_takes_precedence_over_tampering() {
+        // A pending chunk must report NoncePending even if its on-disk data would
+        // otherwise fail as HashMismatch: the write is simply not done yet.
+        let chunks = make_tampering_test_chunks();
+        let dataset = make_dataset_from_chunks(&chunks);
+
+        let mut tampered_chunks = chunks.clone();
+        tampered_chunks[512][0] ^= 0xFF;
+        let tampered_refs: Vec<&[u8]> = tampered_chunks.iter().map(|c| c.as_slice()).collect();
+        let tampered = Dataset {
+            merkle_attr: dataset.merkle_attr.clone(),
+            tree_nodes: dataset.tree_nodes.clone(),
+            chunks: tampered_refs,
+        };
+
+        // Without pending: HashMismatch.
+        assert!(matches!(
+            verify_chunk(&tampered, 512),
+            Err(MerkleError::HashMismatch { chunk_idx: 512 })
+        ));
+
+        // With pending: NoncePending wins.
+        let pending: &[u64] = &[512];
+        assert!(matches!(
+            verify_chunk_with_pending(&tampered, 512, pending),
+            Err(MerkleError::NoncePending)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn verify_chunk_with_pending_slice_impl() {
+        let chunks = make_tampering_test_chunks();
+        let dataset = make_dataset_from_chunks(&chunks);
+
+        // The `[u64]` impl lets callers pass a slice directly.
+        let none: &[u64] = &[];
+        assert!(verify_chunk_with_pending(&dataset, 3, none).is_ok());
+
+        let pending: &[u64] = &[1, 3, 7];
+        assert!(matches!(
+            verify_chunk_with_pending(&dataset, 3, pending),
+            Err(MerkleError::NoncePending)
+        ));
+        assert!(verify_chunk_with_pending(&dataset, 4, pending).is_ok());
     }
 }
