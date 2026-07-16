@@ -177,7 +177,14 @@ fn scenario_a_crash_between_companion_and_root_write_diverges_by_signing_context
     ));
     // The WAL entry for chunk 0's mutation is still pending: commit() (which
     // only runs after all three steps succeed) never ran.
-    assert_eq!(writer.recover().unwrap(), vec![(0, 2)]);
+    assert_eq!(
+        writer.recover().unwrap(),
+        vec![(
+            0,
+            2,
+            clawhdf5_filters::WalRecord::hash_plaintext(b"post-crash replacement payload")
+        )]
+    );
 
     // On reopen: chunk data and companion nodes reflect the mutation, but the
     // root attribute is still the pre-mutation one (step 3 never landed).

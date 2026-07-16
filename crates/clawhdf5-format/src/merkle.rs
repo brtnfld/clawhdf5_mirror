@@ -2380,8 +2380,11 @@ pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
 /// `recover()` output, e.g.:
 ///
 /// ```ignore
-/// // uncommitted: Vec<(u64 /* chunk_idx */, u64 /* version */)> from wal.recover()
-/// let pending: BTreeSet<u64> = uncommitted.iter().map(|&(idx, _)| idx).collect();
+/// // uncommitted: Vec<(u64 /* chunk_idx */, u64 /* version */, [u8; 32] /* plaintext_hash */)>
+/// // from wal.recover() -- the third field lets a crash-recovery caller verify
+/// // replay-determinism (Remark A.9) before re-encrypting; this trait only
+/// // needs chunk_idx membership.
+/// let pending: BTreeSet<u64> = uncommitted.iter().map(|&(idx, _, _)| idx).collect();
 /// verify_chunk_with_pending(&dataset, idx, &pending)?;
 /// ```
 pub trait PendingChunks {

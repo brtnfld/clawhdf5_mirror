@@ -527,8 +527,12 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
         // Step 1: Compute next version
         let version = self.versions.next_version(chunk_idx);
 
-        // Step 2: Journal to WAL BEFORE deriving nonce (crash safety)
-        self.wal.journal_version(chunk_idx, version)?;
+        // Step 2: Journal to WAL BEFORE deriving nonce (crash safety). The
+        // plaintext hash travels with the record so a crash-recovery replay
+        // can be verified against it rather than trusted blindly (Remark A.9).
+        let plaintext_hash = crate::version_wal::WalRecord::hash_plaintext(plaintext);
+        self.wal
+            .journal_version(chunk_idx, version, plaintext_hash)?;
 
         // Step 3: Reserve the version in-memory so the nonce can't be reused by a
         // subsequent encrypt of the same chunk before commit. `seed` is monotonic,
@@ -603,16 +607,22 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
     /// crash-window nonce-reuse hole that would otherwise exist if the store started at 0
     /// while the WAL still held a pending version.
     ///
-    /// Returns the list of `(chunk_idx, version)` pairs that were pending. For each pair
-    /// the caller should promote the companion dataset to `version` and call
-    /// [`commit`](Self::commit) to finalize the record.
-    pub fn recover(&mut self) -> Result<Vec<(u64, u64)>, EncryptedWriteError> {
+    /// Returns the list of `(chunk_idx, version, plaintext_hash)` triples that were
+    /// pending. For each triple the caller **must** call
+    /// [`WalRecord::verify_replay_plaintext`](crate::version_wal::WalRecord::verify_replay_plaintext)
+    /// against its candidate replay plaintext and refuse to replay on mismatch
+    /// (Remark A.9 — see [`version_wal::WAL_RECORD_SIZE`](crate::version_wal::WAL_RECORD_SIZE)'s
+    /// doc comment for why the bare `(chunk_idx, version)` pair is not enough
+    /// to make replay safe on its own). Once verified, promote the companion
+    /// dataset to `version` and call [`commit`](Self::commit) to finalize the
+    /// record.
+    pub fn recover(&mut self) -> Result<Vec<(u64, u64, [u8; 32])>, EncryptedWriteError> {
         let uncommitted = self.wal.recover()?;
 
         // Seed the version store so journaled versions are treated as already consumed.
         // Without this, next_version() could hand back a version that was already used
         // to derive a nonce before the crash -> catastrophic keystream reuse.
-        for &(chunk_idx, version) in &uncommitted {
+        for &(chunk_idx, version, _) in &uncommitted {
             self.versions.seed(chunk_idx, version);
         }
 
@@ -1022,7 +1032,10 @@ mod tests {
 
         let uncommitted = writer.recover().unwrap();
         assert_eq!(uncommitted.len(), 1);
-        assert_eq!(uncommitted[0], (5, 1)); // chunk 5, version 1
+        assert_eq!(
+            uncommitted[0],
+            (5, 1, crate::version_wal::WalRecord::hash_plaintext(b"data"))
+        ); // chunk 5, version 1
     }
 
     #[test]

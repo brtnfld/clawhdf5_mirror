@@ -46,8 +46,25 @@ use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Size of a single WAL record in bytes.
-/// Format: status (1) + chunk_idx (8) + version (8) + checksum (4) = 21 bytes
-pub const WAL_RECORD_SIZE: usize = 21;
+/// Format: status (1) + chunk_idx (8) + version (8) + plaintext_hash (32) +
+/// checksum (4) = 53 bytes.
+///
+/// `plaintext_hash` (BLAKE3 of the plaintext journaled alongside this
+/// `(chunk_idx, version)`) is what closes the WAL replay-determinism gap
+/// (S2-D2-Yr2 security review, Remark A.9): the nonce-uniqueness argument for
+/// crash recovery assumes any replay of a journaled record re-encrypts the
+/// identical plaintext that was current when the record was journaled, but
+/// nothing previously checked that assumption. A caller recovering from a
+/// crash must call [`WalRecord::verify_replay_plaintext`] against its
+/// candidate replay plaintext and refuse to replay on mismatch — replaying
+/// with a *different* plaintext under the version's already-derived nonce is
+/// a keystream reuse, not a safe idempotent retry.
+pub const WAL_RECORD_SIZE: usize = 53;
+
+/// Size, in bytes, of the checksummed prefix of a WAL record (everything
+/// except the trailing checksum itself): status (1) + chunk_idx (8) +
+/// version (8) + plaintext_hash (32) = 49 bytes.
+const WAL_RECORD_CHECKSUM_PREFIX: usize = 49;
 
 /// Magic bytes for WAL file header.
 pub const WAL_MAGIC: [u8; 4] = *b"CWAL";
@@ -93,17 +110,44 @@ pub struct WalRecord {
     pub chunk_idx: u64,
     /// New version counter for the chunk.
     pub version: u64,
+    /// BLAKE3 hash of the plaintext being encrypted under `(chunk_idx,
+    /// version)`. Journaled so a crash-recovery replay can be verified
+    /// against it (Remark A.9) rather than trusted blindly. See
+    /// [`verify_replay_plaintext`](Self::verify_replay_plaintext).
+    pub plaintext_hash: [u8; 32],
 }
 
 impl WalRecord {
     /// Create a new pending WAL record.
     #[must_use]
-    pub fn new_pending(chunk_idx: u64, version: u64) -> Self {
+    pub fn new_pending(chunk_idx: u64, version: u64, plaintext_hash: [u8; 32]) -> Self {
         Self {
             status: WalRecordStatus::Pending,
             chunk_idx,
             version,
+            plaintext_hash,
         }
+    }
+
+    /// Hash a candidate plaintext the same way this record's
+    /// `plaintext_hash` field is computed when journaling.
+    #[must_use]
+    pub fn hash_plaintext(plaintext: &[u8]) -> [u8; 32] {
+        *blake3::hash(plaintext).as_bytes()
+    }
+
+    /// Verify that `plaintext` is the same plaintext that was journaled for
+    /// this record (WAL replay-determinism, Remark A.9).
+    ///
+    /// A crash-recovery caller **must** call this before re-encrypting a
+    /// recovered chunk with its journaled version, and **must** refuse to
+    /// replay on a `false` result: proceeding anyway re-derives the version's
+    /// already-fixed nonce for a *different* plaintext than whatever was
+    /// encrypted (or about to be encrypted) before the crash — a catastrophic
+    /// keystream reuse, not a safe idempotent retry.
+    #[must_use]
+    pub fn verify_replay_plaintext(&self, plaintext: &[u8]) -> bool {
+        constant_time_eq_32(&Self::hash_plaintext(plaintext), &self.plaintext_hash)
     }
 
     /// Serialize this record to bytes.
@@ -113,17 +157,18 @@ impl WalRecord {
         buf[0] = self.status as u8;
         buf[1..9].copy_from_slice(&self.chunk_idx.to_le_bytes());
         buf[9..17].copy_from_slice(&self.version.to_le_bytes());
-        // Compute CRC32 checksum over the first 17 bytes
-        let checksum = crc32_checksum(&buf[..17]);
-        buf[17..21].copy_from_slice(&checksum.to_le_bytes());
+        buf[17..49].copy_from_slice(&self.plaintext_hash);
+        // Compute CRC32 checksum over the checksummed prefix.
+        let checksum = crc32_checksum(&buf[..WAL_RECORD_CHECKSUM_PREFIX]);
+        buf[49..53].copy_from_slice(&checksum.to_le_bytes());
         buf
     }
 
     /// Deserialize a record from bytes.
     pub fn from_bytes(buf: &[u8; WAL_RECORD_SIZE]) -> Result<Self, WalError> {
         // Verify checksum
-        let stored_checksum = u32::from_le_bytes([buf[17], buf[18], buf[19], buf[20]]);
-        let computed_checksum = crc32_checksum(&buf[..17]);
+        let stored_checksum = u32::from_le_bytes([buf[49], buf[50], buf[51], buf[52]]);
+        let computed_checksum = crc32_checksum(&buf[..WAL_RECORD_CHECKSUM_PREFIX]);
         if stored_checksum != computed_checksum {
             return Err(WalError::ChecksumMismatch {
                 expected: computed_checksum,
@@ -138,13 +183,27 @@ impl WalRecord {
         let version = u64::from_le_bytes([
             buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
         ]);
+        let mut plaintext_hash = [0u8; 32];
+        plaintext_hash.copy_from_slice(&buf[17..49]);
 
         Ok(Self {
             status,
             chunk_idx,
             version,
+            plaintext_hash,
         })
     }
+}
+
+/// Constant-time comparison of two 32-byte arrays (avoids leaking, via
+/// timing, how much of a candidate replay plaintext's hash matched the
+/// journaled one).
+fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 /// Errors that can occur during WAL operations.
@@ -316,12 +375,25 @@ impl<W: Read + Write + Seek> VersionWal<W> {
     ///
     /// This must be called BEFORE deriving the nonce and encrypting the chunk.
     /// The record is written with `Pending` status and synced to disk.
-    pub fn journal_version(&mut self, chunk_idx: u64, version: u64) -> Result<(), WalError> {
+    ///
+    /// `plaintext_hash` is the BLAKE3 hash of the plaintext about to be
+    /// encrypted under `(chunk_idx, version)` — see
+    /// [`WalRecord::hash_plaintext`]. Journaling it is what lets
+    /// [`recover`](Self::recover)'s caller verify, via
+    /// [`WalRecord::verify_replay_plaintext`], that a crash-recovery replay
+    /// is re-encrypting the identical plaintext rather than a different one
+    /// under the same already-derived nonce (Remark A.9).
+    pub fn journal_version(
+        &mut self,
+        chunk_idx: u64,
+        version: u64,
+        plaintext_hash: [u8; 32],
+    ) -> Result<(), WalError> {
         if self.record_count >= self.max_records {
             return Err(WalError::WalFull);
         }
 
-        let record = WalRecord::new_pending(chunk_idx, version);
+        let record = WalRecord::new_pending(chunk_idx, version, plaintext_hash);
         let offset = WAL_HEADER_SIZE + self.record_count * WAL_RECORD_SIZE;
 
         self.writer.seek(SeekFrom::Start(offset as u64))?;
@@ -384,6 +456,7 @@ impl<W: Read + Write + Seek> VersionWal<W> {
                     status: WalRecordStatus::Committed,
                     chunk_idx: record.chunk_idx,
                     version: record.version,
+                    plaintext_hash: record.plaintext_hash,
                 };
                 self.writer.seek(SeekFrom::Start(offset as u64))?;
                 self.writer.write_all(&committed.to_bytes())?;
@@ -400,9 +473,13 @@ impl<W: Read + Write + Seek> VersionWal<W> {
 
     /// Recover uncommitted records from the WAL.
     ///
-    /// Returns a list of (chunk_idx, version) pairs for records that were
-    /// journaled but not committed. These chunks need to have their writes
-    /// replayed with the journaled version.
+    /// Returns a list of `(chunk_idx, version, plaintext_hash)` triples for
+    /// records that were journaled but not committed. These chunks need to
+    /// have their writes replayed with the journaled version — and the
+    /// caller **must** verify the replay plaintext against `plaintext_hash`
+    /// via [`WalRecord::verify_replay_plaintext`] before doing so, refusing
+    /// to replay on mismatch (Remark A.9; see [`WAL_RECORD_SIZE`]'s doc
+    /// comment).
     ///
     /// # Fail-closed corruption handling
     ///
@@ -415,7 +492,7 @@ impl<W: Read + Write + Seek> VersionWal<W> {
     /// to operator intervention / full re-verification rather than trust a
     /// log it cannot fully read. (Zeroed slots from [`compact`](Self::compact)
     /// are expected free space and are skipped.)
-    pub fn recover(&mut self) -> Result<Vec<(u64, u64)>, WalError> {
+    pub fn recover(&mut self) -> Result<Vec<(u64, u64, [u8; 32])>, WalError> {
         let mut uncommitted = Vec::new();
 
         for i in 0..self.record_count {
@@ -434,7 +511,7 @@ impl<W: Read + Write + Seek> VersionWal<W> {
             let record =
                 WalRecord::from_bytes(&buf).map_err(|_| WalError::CorruptRecord { index: i })?;
             if record.status == WalRecordStatus::Pending {
-                uncommitted.push((record.chunk_idx, record.version));
+                uncommitted.push((record.chunk_idx, record.version, record.plaintext_hash));
             }
         }
 
@@ -719,9 +796,13 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Placeholder plaintext hash for tests that only exercise version/chunk
+    /// bookkeeping and don't care about the journaled hash's actual value.
+    const PH: [u8; 32] = [0xAB; 32];
+
     #[test]
     fn wal_record_roundtrip() {
-        let record = WalRecord::new_pending(42, 7);
+        let record = WalRecord::new_pending(42, 7, PH);
         let bytes = record.to_bytes();
         let decoded = WalRecord::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, record);
@@ -729,11 +810,28 @@ mod tests {
 
     #[test]
     fn wal_record_checksum_detects_corruption() {
-        let record = WalRecord::new_pending(42, 7);
+        let record = WalRecord::new_pending(42, 7, PH);
         let mut bytes = record.to_bytes();
         // Corrupt a byte
         bytes[5] ^= 0xFF;
         assert!(WalRecord::from_bytes(&bytes).is_err());
+    }
+
+    /// Remark A.9 (WAL replay-determinism): a crash-recovery replay must be
+    /// verified against the journaled plaintext hash, not trusted blindly.
+    /// This is the core property in isolation, independent of
+    /// `EncryptedChunkWriter`/`VersionWal` plumbing.
+    #[test]
+    fn verify_replay_plaintext_accepts_matching_and_rejects_mismatched() {
+        let journaled = b"the plaintext that was actually encrypted pre-crash";
+        let record = WalRecord::new_pending(0, 1, WalRecord::hash_plaintext(journaled));
+
+        assert!(record.verify_replay_plaintext(journaled));
+        assert!(!record.verify_replay_plaintext(b"a different plaintext"));
+        // Even a single-byte difference must be rejected.
+        assert!(!record.verify_replay_plaintext(
+            b"the plaintext that was actually encrypted pre-crasH"
+        ));
     }
 
     #[test]
@@ -741,16 +839,16 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut wal = VersionWal::new(buf, 100).unwrap();
 
-        wal.journal_version(0, 1).unwrap();
-        wal.journal_version(1, 1).unwrap();
-        wal.journal_version(0, 2).unwrap();
+        wal.journal_version(0, 1, PH).unwrap();
+        wal.journal_version(1, 1, PH).unwrap();
+        wal.journal_version(0, 2, PH).unwrap();
 
         // Check that records are recoverable
         let uncommitted = wal.recover().unwrap();
         assert_eq!(uncommitted.len(), 3);
-        assert!(uncommitted.contains(&(0, 1)));
-        assert!(uncommitted.contains(&(1, 1)));
-        assert!(uncommitted.contains(&(0, 2)));
+        assert!(uncommitted.contains(&(0, 1, PH)));
+        assert!(uncommitted.contains(&(1, 1, PH)));
+        assert!(uncommitted.contains(&(0, 2, PH)));
     }
 
     #[test]
@@ -758,13 +856,13 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut wal = VersionWal::new(buf, 100).unwrap();
 
-        wal.journal_version(0, 1).unwrap();
-        wal.journal_version(1, 1).unwrap();
+        wal.journal_version(0, 1, PH).unwrap();
+        wal.journal_version(1, 1, PH).unwrap();
         wal.commit_version(0).unwrap();
 
         let uncommitted = wal.recover().unwrap();
         assert_eq!(uncommitted.len(), 1);
-        assert!(uncommitted.contains(&(1, 1)));
+        assert!(uncommitted.contains(&(1, 1, PH)));
     }
 
     /// B1 regression (P2.2 review): committing must rewrite the whole record
@@ -776,7 +874,7 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut wal = VersionWal::new(buf, 100).unwrap();
 
-        wal.journal_version(7, 3).unwrap();
+        wal.journal_version(7, 3, PH).unwrap();
         wal.commit_version(7).unwrap();
 
         // Read the raw record back and parse it: it must be a VALID record
@@ -811,9 +909,9 @@ mod tests {
         // Two journaled-but-uncommitted attempts for the same chunk, as
         // happens when the first is abandoned (crashed or superseded) before
         // the second is journaled.
-        wal.journal_version(5, 1).unwrap();
-        wal.journal_version(5, 2).unwrap();
-        assert_eq!(wal.recover().unwrap(), vec![(5, 1), (5, 2)]);
+        wal.journal_version(5, 1, PH).unwrap();
+        wal.journal_version(5, 2, PH).unwrap();
+        assert_eq!(wal.recover().unwrap(), vec![(5, 1, PH), (5, 2, PH)]);
 
         // Committing the chunk (as the successful retry does) must resolve
         // BOTH pending records, not just the newest.
@@ -833,8 +931,8 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         {
             let mut wal = VersionWal::new(&mut buf, 100).unwrap();
-            wal.journal_version(0, 1).unwrap();
-            wal.journal_version(1, 1).unwrap();
+            wal.journal_version(0, 1, PH).unwrap();
+            wal.journal_version(1, 1, PH).unwrap();
         }
 
         // Bit-rot one byte inside the first record (leave it non-zero).
@@ -856,8 +954,8 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         {
             let mut wal = VersionWal::new(&mut buf, 100).unwrap();
-            wal.journal_version(0, 1).unwrap();
-            wal.journal_version(1, 1).unwrap();
+            wal.journal_version(0, 1, PH).unwrap();
+            wal.journal_version(1, 1, PH).unwrap();
         }
         let pos = WAL_HEADER_SIZE + 5;
         buf.get_mut()[pos] ^= 0xFF;
@@ -884,8 +982,8 @@ mod tests {
         // Create and populate WAL
         {
             let mut wal = VersionWal::new(&mut buf, 100).unwrap();
-            wal.journal_version(0, 1).unwrap();
-            wal.journal_version(1, 1).unwrap();
+            wal.journal_version(0, 1, PH).unwrap();
+            wal.journal_version(1, 1, PH).unwrap();
         }
 
         // Reopen and verify
@@ -940,9 +1038,9 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut wal = VersionWal::new(buf, 100).unwrap();
 
-        wal.journal_version(0, 1).unwrap();
-        wal.journal_version(1, 1).unwrap();
-        wal.journal_version(2, 1).unwrap();
+        wal.journal_version(0, 1, PH).unwrap();
+        wal.journal_version(1, 1, PH).unwrap();
+        wal.journal_version(2, 1, PH).unwrap();
 
         // Commit chunk 1; it should no longer be part of the pending set.
         wal.commit_version(1).unwrap();
@@ -954,17 +1052,17 @@ mod tests {
         // recover() must still report exactly the two pending records.
         let after = wal.recover().unwrap();
         assert_eq!(after.len(), 2);
-        assert!(after.contains(&(0, 1)));
-        assert!(after.contains(&(2, 1)));
+        assert!(after.contains(&(0, 1, PH)));
+        assert!(after.contains(&(2, 1, PH)));
         assert!(
-            !after.iter().any(|&(k, _)| k == 1),
+            !after.iter().any(|&(k, _, _)| k == 1),
             "committed record must not reappear after compaction"
         );
 
         // The relocated pending records remain intact and committable.
         wal.commit_version(0).unwrap();
         let remaining = wal.recover().unwrap();
-        assert_eq!(remaining, vec![(2, 1)]);
+        assert_eq!(remaining, vec![(2, 1, PH)]);
 
         // The already-committed chunk is gone: it cannot be committed again.
         assert!(matches!(
@@ -980,9 +1078,9 @@ mod tests {
         // Journal three, commit one, then compact — all on one handle.
         {
             let mut wal = VersionWal::new(&mut buf, 100).unwrap();
-            wal.journal_version(0, 1).unwrap();
-            wal.journal_version(1, 1).unwrap();
-            wal.journal_version(2, 1).unwrap();
+            wal.journal_version(0, 1, PH).unwrap();
+            wal.journal_version(1, 1, PH).unwrap();
+            wal.journal_version(2, 1, PH).unwrap();
             wal.commit_version(1).unwrap();
             wal.compact().unwrap();
         }
@@ -993,9 +1091,9 @@ mod tests {
         let mut wal = VersionWal::new(&mut buf, 100).unwrap();
         let recovered = wal.recover().unwrap();
         assert_eq!(recovered.len(), 2);
-        assert!(recovered.contains(&(0, 1)));
-        assert!(recovered.contains(&(2, 1)));
-        assert!(!recovered.iter().any(|&(k, _)| k == 1));
+        assert!(recovered.contains(&(0, 1, PH)));
+        assert!(recovered.contains(&(2, 1, PH)));
+        assert!(!recovered.iter().any(|&(k, _, _)| k == 1));
     }
 
     #[test]

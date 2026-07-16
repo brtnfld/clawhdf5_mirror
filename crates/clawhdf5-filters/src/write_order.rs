@@ -504,7 +504,10 @@ mod tests {
         // clawhdf5-format's verify_chunk_with_pending) will report NoncePending
         // until the write is retried and completed.
         let pending = writer.recover().unwrap();
-        assert_eq!(pending, vec![(5, result.version)]);
+        assert_eq!(
+            pending,
+            vec![(5, result.version, crate::version_wal::WalRecord::hash_plaintext(b"payload"))]
+        );
     }
 
     #[test]
@@ -529,6 +532,9 @@ mod tests {
         ));
         // Steps 1 and 2 completed and synced; step 3 write failed before its sync.
         assert_eq!(sink.log, vec![Op::Chunk(3), Op::Sync, Op::Nodes, Op::Sync]);
-        assert_eq!(writer.recover().unwrap(), vec![(3, result.version)]);
+        assert_eq!(
+            writer.recover().unwrap(),
+            vec![(3, result.version, crate::version_wal::WalRecord::hash_plaintext(b"payload"))]
+        );
     }
 }

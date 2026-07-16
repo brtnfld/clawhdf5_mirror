@@ -362,7 +362,20 @@ fn wal_crash_recovery_preserves_nonce_safety() {
 
     let uncommitted = writer.recover().expect("recovery should succeed");
     assert_eq!(uncommitted.len(), 1);
-    assert_eq!(uncommitted[0], (5, uncommitted_version));
+    let (recovered_chunk, recovered_version, recovered_plaintext_hash) = uncommitted[0];
+    assert_eq!((recovered_chunk, recovered_version), (5, uncommitted_version));
+
+    // Remark A.9 (WAL replay-determinism): the journaled hash must match the
+    // plaintext that was actually being encrypted pre-crash, and must reject a
+    // different candidate replay plaintext -- proceeding with a mismatched
+    // plaintext under the already-derived nonce would be a keystream reuse.
+    let pre_crash_record = clawhdf5_filters::WalRecord::new_pending(
+        recovered_chunk,
+        recovered_version,
+        recovered_plaintext_hash,
+    );
+    assert!(pre_crash_record.verify_replay_plaintext(b"pre-crash data"));
+    assert!(!pre_crash_record.verify_replay_plaintext(b"a different plaintext entirely"));
 
     // CRITICAL: recover() seeds the version store with the journaled version, so a
     // subsequent write of NEW data to the same chunk must use a strictly higher
