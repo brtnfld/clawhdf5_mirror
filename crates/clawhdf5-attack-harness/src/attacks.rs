@@ -7,11 +7,15 @@
 //!
 //! Attacks are split into two groups:
 //!
-//! - **Dataset attacks** (T1a, T1b, T2, T6a, subset-a/b/c) run against the
-//!   [`HarnessDataset`] — either the real GOES-18 file's actual on-disk HDF5
-//!   chunks, or the synthetic fallback — because they only need "a chunked
-//!   Merkle-protected byte blob" and get more authentic coverage from real
-//!   satellite chunk boundaries and filter-compressed sizes when available.
+//! - **Dataset attacks** (T1a, T1c, T1b, T2a, T2b, T6a, subset-a/b/c) run
+//!   against the [`HarnessDataset`] — either the real GOES-18 file's actual
+//!   on-disk HDF5 chunks, or the synthetic fallback — because they only need
+//!   "a chunked Merkle-protected byte blob" and get more authentic coverage
+//!   from real satellite chunk boundaries and filter-compressed sizes when
+//!   available. T1a/T2a are the "easy" storage-tamper/bit-flip baselines;
+//!   T1c (a valid-after-pipeline compressed-stream substitution) and T2b
+//!   (a burst error) are the harder, directed-adversary variants
+//!   §`sec:adversarial` explicitly calls for.
 //! - **Mechanism attacks** (T3, T4a, T4b, T5, T6b, T7, T8) target a specific
 //!   primitive (the provenance journal, the version counter, the AEAD leaf
 //!   formula, the null-sentinel padding) that isn't meaningfully expressed in
@@ -100,6 +104,90 @@ pub fn t1a_chunk_data_tamper(ds: &HarnessDataset) -> AttackResult {
     }
 }
 
+/// T1c — storage-level tampering of a *compressed* payload, crafted to remain
+/// valid after the filter pipeline. This is the specific harder case
+/// §`sec:adversarial` calls out under T1a: *"modifications of compressed
+/// payloads designed to remain valid after the filter pipeline."*
+///
+/// The distinction from T1a matters. T1a flips a raw byte; if the stored chunk
+/// were a real deflate stream, a random flip would almost always make it fail
+/// to decode, so the *pipeline itself* rejects it at the decompression stage
+/// before the integrity layer is even consulted — the integrity check never
+/// has to do any work. A directed adversary who wants to change the actual
+/// scientific values, not just trigger a decode error, instead substitutes a
+/// *different, still-well-formed* deflate stream that decompresses cleanly to
+/// attacker-chosen data. That modification survives the filter pipeline
+/// intact; only the Merkle leaf hash over the stored (compressed) bytes catches
+/// it. This attack builds that exact substitution and confirms `verify_chunk`
+/// rejects it.
+pub fn t1c_compressed_payload_tamper(ds: &HarnessDataset) -> AttackResult {
+    use clawhdf5_filters::{deflate_compress, deflate_decompress};
+
+    // The stored (post-filter) representation is the deflate-compressed chunk.
+    let plaintext_chunks: Vec<&[u8]> = ds.all_chunks(&ds.bytes);
+    let compressed: Vec<Vec<u8>> = plaintext_chunks
+        .iter()
+        .map(|c| deflate_compress(c, 6).expect("deflate compression should not fail"))
+        .collect();
+
+    // Merkle state is committed over the ORIGINAL compressed chunks (this is
+    // the honest, signed-root state the attacker cannot recompute).
+    let comp_refs: Vec<&[u8]> = compressed.iter().map(|c| c.as_slice()).collect();
+    let tree = MerkleTree::from_chunks(&comp_refs, HashAlg::Blake3);
+    let mut nodes = Vec::with_capacity(tree.nodes().len() * 32);
+    for n in tree.nodes() {
+        nodes.extend_from_slice(n);
+    }
+    let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash(&nodes));
+
+    let victim = ds.chunk_count() / 2;
+
+    // Craft a DIFFERENT but still-valid deflate stream: take the victim's
+    // plaintext, change the actual data (the values a real attacker cares
+    // about), and recompress. The result is a well-formed deflate stream that
+    // decodes without error -- it "remains valid after the filter pipeline" --
+    // but to different bytes than the committed chunk.
+    let mut victim_plaintext = plaintext_chunks[victim].to_vec();
+    if victim_plaintext.is_empty() {
+        victim_plaintext.push(0x01);
+    } else {
+        victim_plaintext[0] ^= 0xFF;
+    }
+    let forged_stream =
+        deflate_compress(&victim_plaintext, 6).expect("deflate compression should not fail");
+
+    // Confirm the forged stream genuinely survives the pipeline: it decompresses
+    // without error, to the attacker's chosen data, and differs from the honest
+    // compressed chunk. If any of these fail this isn't the attack we claim.
+    let survives_pipeline = matches!(
+        deflate_decompress(&forged_stream, victim_plaintext.len().max(1)),
+        Ok(ref d) if *d == victim_plaintext
+    ) && forged_stream != compressed[victim];
+
+    // Substitute the forged compressed stream into the STORED bytes, keeping the
+    // committed attr/nodes -- exactly what a storage-level adversary can do.
+    let mut tampered_compressed = compressed.clone();
+    tampered_compressed[victim] = forged_stream;
+    let tampered_refs: Vec<&[u8]> = tampered_compressed.iter().map(|c| c.as_slice()).collect();
+    let view = Dataset::from_owned(attr, nodes, tampered_refs);
+
+    let start_time = Instant::now();
+    let result = verify_chunk(&view, victim);
+    let latency = start_time.elapsed();
+
+    let detected = survives_pipeline
+        && matches!(result, Err(MerkleError::HashMismatch { chunk_idx }) if chunk_idx == victim);
+    AttackResult {
+        threat_class: "T1",
+        attack_id: "T1c",
+        dataset: ds.label,
+        detected,
+        verifier_fn: "verify_chunk",
+        latency,
+        root_cause: None,
+    }
+}
+
 /// T1b — storage-level tampering (internal tree nodes): modify a companion
 /// node without altering the root. `verify_root` must detect it via the
 /// companion-integrity hash.
@@ -127,9 +215,12 @@ pub fn t1b_companion_node_tamper(ds: &HarnessDataset) -> AttackResult {
     }
 }
 
-/// T2 — silent data corruption: a single-bit flip standing in for a hardware
-/// bit-rot / firmware fault on an otherwise-untouched chunk. `verify_dataset`
-/// (the full O(N) rehash) must detect it and name the right chunk.
+/// T2a — silent data corruption, single-bit: a lone bit flip standing in for a
+/// hardware bit-rot / firmware fault on an otherwise-untouched chunk.
+/// `verify_dataset` (the full O(N) rehash) must detect it and name the right
+/// chunk. `sec:adversarial` asks for *"single-bit **and** burst-error
+/// injection"*; this is the single-bit half, with the burst half in
+/// [`t2b_burst_error_corruption`].
 ///
 /// **Spec-mapping note.** This follows `sec:threat`'s T2 definition ("silent
 /// modifications to stored *chunks*") and `sec:adversarial`'s elaboration
@@ -143,7 +234,7 @@ pub fn t1b_companion_node_tamper(ds: &HarnessDataset) -> AttackResult {
 /// letter names which attack; this file follows the canonical
 /// `sec:threat`/`sec:adversarial` taxonomy since that's what the rest of
 /// the paper (and this harness's own CSV output) is organized around.
-pub fn t2_single_bit_corruption(ds: &HarnessDataset) -> AttackResult {
+pub fn t2a_single_bit_corruption(ds: &HarnessDataset) -> AttackResult {
     let (_, attr, nodes) = build_merkle_state(ds);
     let victim = ds.chunk_count().saturating_sub(1);
 
@@ -160,7 +251,44 @@ pub fn t2_single_bit_corruption(ds: &HarnessDataset) -> AttackResult {
         matches!(result, Err(MerkleError::HashMismatch { chunk_idx }) if chunk_idx == victim);
     AttackResult {
         threat_class: "T2",
-        attack_id: "T2",
+        attack_id: "T2a",
+        dataset: ds.label,
+        detected,
+        verifier_fn: "verify_dataset",
+        latency,
+        root_cause: None,
+    }
+}
+
+/// T2b — silent data corruption, burst error: a contiguous run of bytes is
+/// corrupted at once, standing in for a multi-byte fault (a failing disk
+/// sector, a DMA glitch, a torn write) rather than a lone bit flip. This is
+/// the burst-error half of `sec:adversarial`'s *"single-bit and burst-error
+/// injection"*; `verify_dataset` must still detect it and name the right chunk.
+pub fn t2b_burst_error_corruption(ds: &HarnessDataset) -> AttackResult {
+    let (_, attr, nodes) = build_merkle_state(ds);
+    let victim = ds.chunk_count().saturating_sub(1);
+
+    let mut tampered = ds.bytes.clone();
+    let (start, end) = ds.chunk_ranges[victim];
+    // Corrupt a contiguous 16-byte burst inside the victim chunk (clamped to
+    // the chunk's own length so a short final chunk can't overrun into the
+    // next one). XOR 0xAA guarantees every touched byte actually changes.
+    let burst_end = (start + 16).min(end);
+    for b in &mut tampered[start..burst_end] {
+        *b ^= 0xAA;
+    }
+
+    let start_time = Instant::now();
+    let view = dataset_view(attr, nodes, ds, &tampered);
+    let result = verify_dataset(&view);
+    let latency = start_time.elapsed();
+
+    let detected =
+        matches!(result, Err(MerkleError::HashMismatch { chunk_idx }) if chunk_idx == victim);
+    AttackResult {
+        threat_class: "T2",
+        attack_id: "T2b",
         dataset: ds.label,
         detected,
         verifier_fn: "verify_dataset",
