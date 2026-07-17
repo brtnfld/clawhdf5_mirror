@@ -1,16 +1,25 @@
 //! Test-dataset fixtures for the attack harness.
 //!
-//! P2.4 calls for the NOAA GOES-18 dataset. This repo does not commit real
-//! satellite data (see `test-vectors/README.md`), so the harness works two ways:
+//! P2.4 calls for the NOAA and EQSIM datasets. This repo does not commit real
+//! satellite/HPC data (large binary files don't belong in source control), so
+//! the harness works two ways for *each* dataset:
 //!
-//! - **Real dataset**: point it at a real, pre-downloaded GOES-18 ABI L1b file
-//!   (see `docs/NOAA_DATA.md`) via `--file <path>`. The harness reads the
-//!   dataset's *actual* on-disk HDF5 chunk layout (address + compressed size
-//!   per chunk, via `clawhdf5_format::chunked_read`), so tampering attacks
-//!   flip real bytes inside a real, filtered (shuffle+deflate) HDF5 chunk.
-//! - **Synthetic fallback** (default, no args): a small in-process dataset with
-//!   the same chunked shape, so `cargo run` is reproducible with no network
-//!   access or manual download step.
+//! - **Real dataset**: point it at a real, pre-downloaded file via `--file
+//!   <path>` (NOAA GOES-18 ABI L1b, see `docs/NOAA_DATA.md`) or `--eqsim-file
+//!   <path>` (an EQSIM HDF5 output file). The harness reads the dataset's
+//!   *actual* on-disk HDF5 chunk layout (address + compressed size per chunk,
+//!   via `clawhdf5_format::chunked_read`), so tampering attacks flip real
+//!   bytes inside a real, filtered (shuffle+deflate) HDF5 chunk.
+//! - **Synthetic fallback** (default, no args): a small in-process dataset
+//!   with a representative chunked shape for each of the two datasets, so
+//!   `cargo run` alone reproduces the full attack matrix on both datasets
+//!   with no network access, no manual download step, and nothing large
+//!   committed to the repo. NOAA's synthetic shape mimics a GOES-18 tile
+//!   (many small chunks); EQSIM's mimics an HPC checkpoint/restart write
+//!   (fewer, larger chunks) — see `synthetic_noaa_dataset`/
+//!   `synthetic_eqsim_dataset`. Labels always say `(synthetic)` when this
+//!   path is taken, so the committed `attack-results/matrix.csv` never
+//!   implies real data was used unless it genuinely was.
 //!
 //! Either way, the harness treats the loaded bytes as an opaque byte buffer
 //! plus a chunk address/size table — attacks tamper it with raw
@@ -29,8 +38,11 @@ use clawhdf5_format::superblock::Superblock;
 /// A dataset the harness runs attacks against: raw file bytes plus the byte
 /// range of each physical chunk within them.
 pub struct HarnessDataset {
-    /// Human-readable dataset label for the results CSV (`NOAA-GOES18` or
-    /// `synthetic`).
+    /// Human-readable dataset label for the results CSV, e.g.
+    /// `NOAA-GOES18`, `NOAA-GOES18 (synthetic)`, `EQSIM`, or
+    /// `EQSIM (synthetic)`. Always carries the `(synthetic)` suffix when the
+    /// bytes are the in-process fallback rather than a real downloaded file,
+    /// so the label itself discloses whether real data was used.
     pub label: &'static str,
     /// The complete file bytes.
     pub bytes: Vec<u8>,
@@ -60,8 +72,14 @@ impl HarnessDataset {
     }
 }
 
-/// Load a real GOES-18 ABI L1b file and extract the named dataset's (usually
-/// `"Rad"`) real, on-disk chunk layout.
+/// Load a real HDF5 file (NOAA GOES-18 ABI L1b, an EQSIM output file, or any
+/// other chunked HDF5/NetCDF4 file) and extract the named dataset's (e.g.
+/// `"Rad"` for GOES-18) real, on-disk chunk layout.
+///
+/// `label` is attached to the returned [`HarnessDataset`] verbatim for the
+/// results CSV — callers pass a real-data label (e.g. `"NOAA-GOES18"` or
+/// `"EQSIM"`), never a `(synthetic)`-suffixed one, since this function only
+/// ever returns real, on-disk bytes.
 ///
 /// Mirrors `clawhdf5/examples/goes18_chunk_test.rs`'s chunk-index dispatch so
 /// it handles whichever chunk-index type (B-tree v1, single chunk, fixed
@@ -74,6 +92,7 @@ impl HarnessDataset {
 pub fn load_real_dataset(
     path: &std::path::Path,
     dataset_name: &str,
+    label: &'static str,
 ) -> Result<HarnessDataset, Box<dyn std::error::Error>> {
     // The dataset's true element-space shape (needed by the fixed/extensible
     // array chunk-index readers below) lives in the Dataspace message; reuse
@@ -225,14 +244,15 @@ pub fn load_real_dataset(
         .collect::<Result<Vec<(usize, usize)>, String>>()?;
 
     Ok(HarnessDataset {
-        label: "NOAA-GOES18",
+        label,
         bytes,
         chunk_ranges,
     })
 }
 
-/// Build a small synthetic dataset with the same "many small filtered chunks"
-/// shape as a real GOES-18 tile, requiring no network access or download.
+/// Build a small synthetic dataset with `num_chunks` chunks of `chunk_size`
+/// bytes each, requiring no network access, no download, and nothing large
+/// committed to the repo.
 ///
 /// Each chunk gets distinct, deterministic pseudo-random bytes so a tampered
 /// chunk is unambiguously distinguishable from its neighbors.
@@ -240,9 +260,9 @@ pub fn load_real_dataset(
 /// # Panics
 ///
 /// Panics if `chunk_size == 0` (there would be no byte to stamp with the
-/// chunk's index). The one call site in `main.rs` hardcodes a nonzero size;
-/// this is a documented precondition rather than a silently-wrong dataset.
-pub fn synthetic_dataset(num_chunks: usize, chunk_size: usize) -> HarnessDataset {
+/// chunk's index). Both call sites below hardcode a nonzero size; this is a
+/// documented precondition rather than a silently-wrong dataset.
+fn synthetic_dataset(num_chunks: usize, chunk_size: usize, label: &'static str) -> HarnessDataset {
     assert!(
         chunk_size > 0,
         "synthetic_dataset: chunk_size must be nonzero"
@@ -263,13 +283,32 @@ pub fn synthetic_dataset(num_chunks: usize, chunk_size: usize) -> HarnessDataset
             bytes.push(next_byte());
         }
         // Make each chunk's index recoverable from its own bytes, matching
-        // the way real satellite chunks carry distinguishable content.
+        // the way real satellite/simulation chunks carry distinguishable
+        // content.
         bytes[start] = i as u8;
         chunk_ranges.push((start, start + chunk_size));
     }
     HarnessDataset {
-        label: "synthetic",
+        label,
         bytes,
         chunk_ranges,
     }
+}
+
+/// Synthetic stand-in for the NOAA GOES-18 dataset: many small chunks, the
+/// same "satellite imagery tile" shape as a real GOES-18 `Rad` chunk
+/// (typically 226×226, comparable byte size to the 512-byte chunks here).
+#[must_use]
+pub fn synthetic_noaa_dataset() -> HarnessDataset {
+    synthetic_dataset(16, 512, "NOAA-GOES18 (synthetic)")
+}
+
+/// Synthetic stand-in for the EQSIM earthquake-simulation dataset: fewer,
+/// larger chunks, representative of an HPC checkpoint/restart write (one
+/// large contiguous block per rank/timestep) rather than NOAA's many small
+/// imagery tiles — see S2-D2-Yr2 §7.4 ("Datasets"): EQSIM is "representative
+/// of HPC checkpoint/restart patterns."
+#[must_use]
+pub fn synthetic_eqsim_dataset() -> HarnessDataset {
+    synthetic_dataset(4, 4096, "EQSIM (synthetic)")
 }

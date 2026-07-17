@@ -63,14 +63,16 @@ pub fn to_csv(results: &[AttackResult]) -> String {
 
 /// Print a human-readable results table to stdout.
 pub fn print_table(results: &[AttackResult]) {
+    // 24 chars fits the longest dataset label, `NOAA-GOES18 (synthetic)`
+    // (23 chars), with room to spare.
     println!(
-        "{:<4} {:<8} {:<12} {:<9} {:<28} {:>12}  root_cause",
+        "{:<4} {:<8} {:<24} {:<9} {:<28} {:>12}  root_cause",
         "T#", "attack", "dataset", "detected", "verifier_fn", "latency_ms"
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(122));
     for r in results {
         println!(
-            "{:<4} {:<8} {:<12} {:<9} {:<28} {:>12.4}  {}",
+            "{:<4} {:<8} {:<24} {:<9} {:<28} {:>12.4}  {}",
             r.threat_class,
             r.attack_id,
             r.dataset,
@@ -80,7 +82,7 @@ pub fn print_table(results: &[AttackResult]) {
             r.root_cause.unwrap_or(""),
         );
     }
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(122));
     // Plain counts only -- whether every undetected attack actually has a
     // documented root_cause isn't known yet at this point (main() checks that
     // afterward, and prints its own, accurate summary once it has); asserting
