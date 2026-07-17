@@ -7,7 +7,8 @@
 //! ```text
 //! cargo run -p clawhdf5-attack-harness --release
 //! cargo run -p clawhdf5-attack-harness --release -- --file /path/to/goes18_sample.nc
-//! cargo run -p clawhdf5-attack-harness --release -- --eqsim-file /path/to/eqsim_output.h5
+//! cargo run -p clawhdf5-attack-harness --release -- \
+//!     --eqsim-file /path/to/eqsim_output.h5 --eqsim-dataset <dataset-name>
 //! ```
 //!
 //! P2.4 requires the full attack suite on **both** the NOAA and EQSIM
@@ -17,9 +18,12 @@
 //! whole suite, on both datasets, is reproducible from a single bare
 //! `cargo run` with no network access, no manual download step, and nothing
 //! large committed to the repo. Pointing `--file`/`--eqsim-file` at a real,
-//! pre-downloaded file (see `docs/NOAA_DATA.md` for NOAA) runs the same
-//! attacks against that dataset's actual on-disk HDF5 chunk layout instead;
-//! the two flags are independent, so either, both, or neither may be given.
+//! pre-downloaded file runs the same attacks against that dataset's actual
+//! on-disk HDF5 chunk layout instead; the two flags are independent, so
+//! either, both, or neither may be given. See `docs/NOAA_DATA.md` for where
+//! to obtain a real GOES-18 file (`--file` defaults its dataset name to
+//! `"Rad"`), and `docs/EQSIM_DATA.md` for EQSIM -- `--eqsim-file` has no
+//! assumed dataset name and requires `--eqsim-dataset <name>` alongside it.
 //!
 //! Writes `attack-results/matrix.csv` (relative to the crate root), the P2.4
 //! artifact: `threat_class, attack_id, dataset, detected, verifier_fn,
@@ -94,23 +98,42 @@ fn load_noaa_dataset() -> HarnessDataset {
 
 /// Load the EQSIM dataset: a real EQSIM output file if `--eqsim-file <path>`
 /// was given and loads successfully, otherwise the synthetic fallback.
+///
+/// Unlike NOAA's `"Rad"`, EQSIM output files have no single conventional
+/// dataset/variable name this harness can assume -- see `docs/EQSIM_DATA.md`
+/// for how to find it in a given file (e.g. `h5dump -n`). `--eqsim-file`
+/// therefore *requires* `--eqsim-dataset <name>` alongside it; guessing a
+/// name and silently falling back to synthetic on failure would make a
+/// broken `--eqsim-file` invocation look like a successful real-data run
+/// (the CSV's dataset column would still just say `EQSIM (synthetic)`,
+/// hiding that the real file was never actually read).
 fn load_eqsim_dataset() -> HarnessDataset {
     let file_arg = parse_path_arg("--eqsim-file").unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
     if let Some(path) = file_arg {
-        // EQSIM output files don't have a single conventional dataset name
-        // the way GOES-18's "Rad" does; "Rad" is used here only as a
-        // placeholder default and will simply fail over to synthetic for a
-        // real file that doesn't happen to have a dataset by that name --
-        // callers with a real EQSIM file and a different dataset name should
-        // call `fixture::load_real_dataset` directly instead of this binary.
-        match fixture::load_real_dataset(&path, "Rad", "EQSIM") {
+        let dataset_name = parse_path_arg("--eqsim-dataset")
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            })
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "error: --eqsim-file requires --eqsim-dataset <name> alongside it -- \
+                     EQSIM output files have no single conventional dataset name to assume \
+                     (see docs/EQSIM_DATA.md, e.g. `h5dump -n {}` to find one)",
+                    path.display()
+                );
+                std::process::exit(1);
+            });
+        let dataset_name = dataset_name.to_string_lossy();
+        match fixture::load_real_dataset(&path, &dataset_name, "EQSIM") {
             Ok(ds) => {
                 println!(
-                    "Loaded real EQSIM dataset: {} ({} chunks, {} bytes)",
+                    "Loaded real EQSIM dataset: {} [{}] ({} chunks, {} bytes)",
                     path.display(),
+                    dataset_name,
                     ds.chunk_count(),
                     ds.bytes.len()
                 );
@@ -118,15 +141,17 @@ fn load_eqsim_dataset() -> HarnessDataset {
             }
             Err(e) => {
                 eprintln!(
-                    "warning: failed to load real EQSIM dataset at {} ({e}); falling back to synthetic",
-                    path.display()
+                    "error: failed to load real EQSIM dataset at {} [{}] ({e})",
+                    path.display(),
+                    dataset_name
                 );
+                std::process::exit(1);
             }
         }
     }
     let ds = fixture::synthetic_eqsim_dataset();
     println!(
-        "Using synthetic EQSIM-shaped dataset ({} chunks, {} bytes) -- pass --eqsim-file <path> for a real EQSIM run",
+        "Using synthetic EQSIM-shaped dataset ({} chunks, {} bytes) -- pass --eqsim-file <path> --eqsim-dataset <name> for a real EQSIM run",
         ds.chunk_count(),
         ds.bytes.len()
     );
