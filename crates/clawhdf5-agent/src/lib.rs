@@ -26,6 +26,8 @@ pub mod consolidation;
 pub mod decision_gate;
 pub mod entity_extract;
 pub mod ephemeral;
+#[cfg(feature = "integrity")]
+pub mod integrity;
 pub mod knowledge;
 pub mod memory_strategy;
 pub mod multimodal;
@@ -89,6 +91,11 @@ pub enum MemoryError {
     /// A provenance-journal operation failed (P2.2b step 3), e.g. appending a
     /// snapshot record with a non-increasing version.
     Provenance(String),
+    /// The persisted memory content failed its Merkle integrity check on read
+    /// (P2.4 Finding 1): the stored `_merkle_root` attribute does not match the
+    /// content re-hashed from disk, indicating storage-level tampering or
+    /// corruption. Fail-closed: the caller must not trust the loaded data.
+    Integrity(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -99,6 +106,7 @@ impl std::fmt::Display for MemoryError {
             MemoryError::Schema(e) => write!(f, "schema error: {e}"),
             MemoryError::NotFound(e) => write!(f, "not found: {e}"),
             MemoryError::Provenance(e) => write!(f, "provenance error: {e}"),
+            MemoryError::Integrity(e) => write!(f, "integrity error: {e}"),
         }
     }
 }

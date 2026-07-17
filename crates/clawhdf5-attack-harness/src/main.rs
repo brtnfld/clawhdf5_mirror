@@ -27,8 +27,8 @@
 //!
 //! Writes `attack-results/matrix.csv` (relative to the crate root), the P2.4
 //! artifact: `threat_class, attack_id, dataset, detected, verifier_fn,
-//! latency_ms, root_cause`. The mechanism attacks (T3, T4a, T4b, T5, T6b, T7,
-//! T8) target a specific primitive rather than "a chunk in a dataset" (see
+//! latency_ms, root_cause`. The mechanism attacks (T1d, T3, T4a, T4b, T5, T6b,
+//! T7, T8) target a specific primitive rather than "a chunk in a dataset" (see
 //! `attacks.rs`'s module doc) and so run once, independent of dataset,
 //! reported with `dataset = n/a`.
 
@@ -207,6 +207,7 @@ fn main() {
     results.extend(run_dataset_attacks(&eqsim_ds));
     // Mechanism attacks (purpose-built minimal fixtures, independent of
     // dataset -- see the module doc above).
+    results.push(attacks::t1d_directed_companion_forgery());
     results.push(attacks::t3_provenance_forgery());
     results.push(attacks::t4a_whole_file_rollback());
     results.push(attacks::t4b_selective_chunk_rollback());

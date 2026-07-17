@@ -16,10 +16,13 @@
 //!   T1c (a valid-after-pipeline compressed-stream substitution) and T2b
 //!   (a burst error) are the harder, directed-adversary variants
 //!   §`sec:adversarial` explicitly calls for.
-//! - **Mechanism attacks** (T3, T4a, T4b, T5, T6b, T7, T8) target a specific
-//!   primitive (the provenance journal, the version counter, the AEAD leaf
-//!   formula, the null-sentinel padding) that isn't meaningfully expressed in
-//!   terms of "a chunk in the dataset," so each builds its own minimal fixture.
+//! - **Mechanism attacks** (T1d, T3, T4a, T4b, T5, T6b, T7, T8) target a
+//!   specific primitive (the companion-integrity self-check, the provenance
+//!   journal, the version counter, the AEAD leaf formula, the null-sentinel
+//!   padding) that isn't meaningfully expressed in terms of "a chunk in the
+//!   dataset," so each builds its own minimal fixture. T1d is the directed
+//!   companion-forgery variant of T1b, reported undetected-by-design for
+//!   unsigned data (same root cause as T6b).
 
 use std::time::Instant;
 
@@ -191,6 +194,15 @@ pub fn t1c_compressed_payload_tamper(ds: &HarnessDataset) -> AttackResult {
 /// T1b — storage-level tampering (internal tree nodes): modify a companion
 /// node without altering the root. `verify_root` must detect it via the
 /// companion-integrity hash.
+///
+/// **Naive vs directed adversary.** This flips a companion node but leaves the
+/// stored `companion_hash` alone, so `verify_root`'s self-consistency check
+/// (`companion_hash == SHA-256(nodes)`) fires — the naive-adversary case, which
+/// is genuinely caught. A *directed* adversary against an **unsigned** dataset
+/// recomputes `companion_hash` over the tampered nodes and walks straight
+/// through; that variant is [`t1d_directed_companion_forgery`], reported
+/// undetected-by-design with the same root cause as T6b (no signature ⇒ only
+/// self-consistency, which a full rebuild reproduces).
 pub fn t1b_companion_node_tamper(ds: &HarnessDataset) -> AttackResult {
     let (_, attr, nodes) = build_merkle_state(ds);
 
@@ -212,6 +224,75 @@ pub fn t1b_companion_node_tamper(ds: &HarnessDataset) -> AttackResult {
         verifier_fn: "verify_root",
         latency,
         root_cause: None,
+    }
+}
+
+/// T1d — directed companion forgery on an **unsigned** dataset: the same
+/// companion-node tamper as T1b, but the adversary also recomputes the stored
+/// `companion_hash` over the tampered nodes, producing a fully self-consistent
+/// attribute. This is the directed-adversary companion analogue of T1c/T2b.
+///
+/// **Documented limitation (undetected by design for unsigned data).**
+/// `verify_root` on an unsigned dataset only checks self-consistency
+/// (`companion_hash == SHA-256(nodes)`, and the attribute's own
+/// `H(0x03 || root || alg_id)` integrity hash). None of that is bound to an
+/// unforgeable value, so an attacker with storage access who rebuilds the
+/// companion array and its hash together defeats it — the exact same root
+/// cause as T6b (algorithm downgrade). A **signed** dataset is protected:
+/// `clawhdf5_sign::canonical_payload` (P2.1, merged) already folds the
+/// `companion_hash` into the signed payload, so this rebuild would fail the
+/// signature check. That binding isn't wired into `clawhdf5-format`'s Merkle
+/// verification flow yet, so it can't be exercised end-to-end here — hence this
+/// is reported undetected rather than silently omitted. (Note this is the
+/// *format-primitive* limitation; the P2.4 Finding-1 agent wiring rehashes
+/// content from disk and never trusts stored companion nodes, so it is not
+/// affected.)
+pub fn t1d_directed_companion_forgery() -> AttackResult {
+    // Minimal own fixture (mechanism attack): a small unsigned chunk set.
+    let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
+    let honest_tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
+    let mut honest_nodes = Vec::new();
+    for n in honest_tree.nodes() {
+        honest_nodes.extend_from_slice(n);
+    }
+
+    let start_time = Instant::now();
+    // Directed tamper: flip a companion node AND recompute the companion hash
+    // over the tampered nodes, so the attribute is internally self-consistent.
+    let mut tampered_nodes = honest_nodes.clone();
+    tampered_nodes[0] ^= 0xFF;
+    let forged_attr =
+        MerkleAttr::from_tree_with_companion(&honest_tree, companion_hash(&tampered_nodes));
+    let view = Dataset::from_owned(forged_attr, tampered_nodes.clone(), chunks.clone());
+    let result = verify_root(&view);
+    let latency = start_time.elapsed();
+
+    // Confirm a real directed forgery: the nodes genuinely changed AND the
+    // recomputed companion hash still matches them (self-consistent).
+    let forgery_is_self_consistent = tampered_nodes != honest_nodes;
+    let bypassed = forgery_is_self_consistent && matches!(result, Ok(true));
+
+    AttackResult {
+        threat_class: "T1",
+        attack_id: "T1d",
+        dataset: "n/a",
+        detected: !bypassed,
+        verifier_fn: "verify_root",
+        latency,
+        root_cause: if bypassed {
+            Some(
+                "By design for an UNSIGNED dataset: verify_root only checks companion \
+                 self-consistency (companion_hash == SHA-256(nodes)) and the attribute's own \
+                 H(0x03 || root || alg_id) integrity hash, neither bound to an unforgeable \
+                 value -- a full attacker rebuild of the companion array and its hash \
+                 reproduces both. Same root cause as T6b. A SIGNED dataset would be protected: \
+                 clawhdf5_sign::canonical_payload (P2.1, merged) folds companion_hash into the \
+                 signed payload; that binding isn't wired into clawhdf5-format's Merkle \
+                 verification flow yet (per Sec. merkle-storage, threat T6).",
+            )
+        } else {
+            None
+        },
     }
 }
 

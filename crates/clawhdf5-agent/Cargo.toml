@@ -11,6 +11,7 @@ categories = ["database", "science", "algorithms"]
 
 [dependencies]
 clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["parallel", "fast-checksum"] }
+sha2 = { version = "0.10", default-features = false, optional = true }
 clawhdf5 = { path = "../clawhdf5", version = "2.1.0" }
 clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0", features = ["mmap"] }
 clawhdf5-accel = { path = "../clawhdf5-accel", version = "2.1.0" }
@@ -45,7 +46,7 @@ name = "memory_bench"
 harness = false
 
 [features]
-default = ["float16", "hnsw"]
+default = ["float16", "hnsw", "integrity"]
 float16 = ["half"]
 parallel = ["rayon"]
 # HNSW approximate-nearest-neighbour acceleration for the vector stage of
@@ -58,6 +59,13 @@ agent = []
 # P2.2b step 3: tie the snapshot primitive to the certified Merkle root via the
 # append-only provenance journal. Pulls in clawhdf5-format's merkle machinery.
 merkle-provenance = ["clawhdf5-format/merkle"]
+# P2.4 Finding 1: compute a Merkle root over the persisted memory content on
+# write and re-verify it on read, so storage-level tampering of a memory .h5 is
+# caught end-to-end (not just by the standalone attack harness). On by default;
+# reuses clawhdf5-format's merkle primitives. Files written without it (or by
+# older versions) carry no `_merkle_root` attribute and load unverified for
+# backward compatibility.
+integrity = ["clawhdf5-format/merkle", "dep:sha2"]
 gpu = ["clawhdf5-gpu/gpu-wgpu"]
 fast-math = ["matrixmultiply"]
 accelerate = ["accelerate-src", "cblas-sys"]
