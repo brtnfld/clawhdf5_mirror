@@ -19,6 +19,7 @@ members = [
     "crates/clawhdf5-bench",
     "crates/clawhdf5-sign",
     "crates/clawhdf5-attack-harness",
+    "crates/clawhdf5-secure-demo",
 ]
 resolver = "2"
 
