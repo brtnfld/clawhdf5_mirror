@@ -29,3 +29,10 @@ version = "2.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/redclawsystems/clawhdf5"
+
+# hdf5-metno-sys 0.12.0's build script rejects H5_VERSION strings from the
+# HDF5 2.x `develop` branch (e.g. "2.2.0") -- its version regex only lists
+# minors 2.0/2.1. Vendored copy adds 2.2 so `clawhdf5-bench --features
+# libhdf5-compare` can link against a self-built HDF5 develop for comparison.
+[patch.crates-io]
+hdf5-metno-sys = { path = "vendor/hdf5-metno-sys-0.12.0" }
