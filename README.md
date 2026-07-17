@@ -8,7 +8,7 @@
 [![LongMemEval](https://img.shields.io/badge/LongMemEval-Hit@5%2046%25%20BM25--only-blue.svg)](BENCHMARKS.md#longmemeval-results)
 [![Footprint](https://img.shields.io/badge/footprint-6.5%20KB%2Frecord-lightgrey.svg)](BENCHMARKS.md#memory-footprint)
 
-ClawhDF5 is a pure-Rust HDF5 implementation combined with a research-grade agent memory engine. It gives AI agents persistent, searchable, cryptographically verifiable memory — all stored in a single portable file.
+ClawHDF5 is a pure-Rust HDF5 implementation combined with a research-grade agent memory engine. It gives AI agents persistent, searchable, cryptographically verifiable memory — all stored in a single portable file.
 
 ```
 cargo add clawhdf5-agent --features agent
@@ -57,7 +57,7 @@ Benchmarked on Intel i7-12650H (10C/16T), 384-dim embeddings, Criterion.rs.
 | Spreading activation | **17 µs** | 100 entities |
 | Temporal range query | **716 ns** | 10K timestamps |
 | Consolidation cycle | **164 µs** | 1K records |
-| Memory write (WAL) | **134 µs** | per record |
+| Memory write (WAL) | **18 µs** | per record (group-commit append; HDF5 batched at flush) |
 | Importance gate | **61 ns** | per record |
 
 ### HDF5 Core I/O (vs h5py/C HDF5)
@@ -68,6 +68,19 @@ Benchmarked on Intel i7-12650H (10C/16T), 384-dim embeddings, Criterion.rs.
 | Write 1M f64 | 0.82 ms | 1.60 ms | **2×** |
 | Read 1M f64 | 0.28 ms | 0.65 ms | **2.3×** |
 | Zero-copy mmap | 313 ns | N/A | — |
+
+### Chunked Write Throughput (codec comparison)
+
+Measured with Criterion on f32 matrices. Auto-shuffle is applied before all compression codecs
+by default (AoS→SoA byte transpose, +157–204% throughput for float data):
+
+| Codec | 128×128 f32 | 512×512 f32 | Notes |
+|-------|-------------|-------------|-------|
+| Zstd level 3 | **148 µs / 422 MiB/s** | **1.34 ms / 748 MiB/s** | With auto-shuffle |
+| Deflate level 6 | 153 µs / 407 MiB/s | 1.39 ms / 719 MiB/s | With auto-shuffle |
+| Pcodec | 528 µs / 118 MiB/s | 1.69 ms / 591 MiB/s | Best compression ratio |
+
+Use `.with_zstd(3)` or `.with_deflate(6)` for write-heavy workloads — both now perform at ~720–750 MiB/s on large matrices. Use `.with_pcodec()` for write-once/read-many workloads where compression ratio matters more than encode speed. Disable auto-shuffle with `.without_shuffle()` for byte arrays that don't benefit from AoS→SoA transposition.
 
 > ¹ MemX ([arxiv:2603.16171](https://arxiv.org/abs/2603.16171), March 2026): Rust + libSQL, claims <90ms at 100K records.
 
@@ -393,6 +406,7 @@ ClawhDF5's agent memory design draws from 15+ recent papers:
 | `fast-checksum` | no | crc32fast-accelerated checksums |
 | `lz4` | no | LZ4 block compression filter (id 32004) |
 | `zstd` | no | Zstandard compression filter (id 32015) |
+| `pcodec` | no | Pcodec lossless numerical codec (id 32023, via `pco` crate) |
 | `system-zlib` / `zlib-rs` | no | Alternative zlib backends for deflate |
 | `blake3_hash` | no | BLAKE3 content hashing for provenance |
 
@@ -415,7 +429,8 @@ cargo test --workspace            # all 417+ tests
 cargo test -p clawhdf5-agent      # agent memory tests
 
 # Benchmarks
-cargo bench -p clawhdf5-agent     # full benchmark suite
+cargo bench -p clawhdf5-agent               # agent memory suite
+cargo bench -p clawhdf5-bench               # h5bench-equivalent I/O suite
 ```
 
 ---

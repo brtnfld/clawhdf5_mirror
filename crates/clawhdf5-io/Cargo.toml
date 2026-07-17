@@ -17,12 +17,15 @@ tokio = { version = "1", features = ["fs", "io-util"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+mpi = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
 
 [features]
 default = []
 mmap = ["memmap2", "libc"]
 async = ["tokio"]
 hsds = ["reqwest", "serde", "serde_json", "async"]
+mpi-io = ["mpi"]

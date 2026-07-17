@@ -7,6 +7,7 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::ChunkOptions;
+use crate::data_layout::VdsMapping;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
@@ -379,6 +380,12 @@ pub struct DatasetBuilder {
     pub(crate) compact: bool,
     /// Per-dataset alignment in bytes (0 = no special alignment).
     pub(crate) alignment: usize,
+    /// Virtual Dataset (VDS) source mappings.
+    ///
+    /// When set, this dataset uses Virtual Dataset layout (v4 class 3). The
+    /// `data` field is ignored; instead the global heap blob is built from
+    /// these mappings and a VDS layout message is emitted.
+    pub(crate) virtual_sources: Option<Vec<VdsMapping>>,
     #[cfg(feature = "provenance")]
     pub(crate) provenance: Option<ProvenanceConfig>,
 }
@@ -396,6 +403,7 @@ impl DatasetBuilder {
             fill_time: FillTime::default(),
             compact: false,
             alignment: 0,
+            virtual_sources: None,
             #[cfg(feature = "provenance")]
             provenance: None,
         }
@@ -551,6 +559,11 @@ impl DatasetBuilder {
 
     /// Enable zstd compression at `level` (1-22). HDF5 filter ID 32015.
     /// Implies chunked storage. Requires the `zstd` cargo feature.
+    ///
+    /// **Recommended for write-heavy workloads:** Zstd level 3 encodes at
+    /// ~500+ MiB/s vs deflate's ~300 MiB/s at the same or better compression
+    /// ratio (see arXiv 2604.06221). Shuffle is applied automatically before
+    /// compression; call `.without_shuffle()` to disable it.
     pub fn with_zstd(&mut self, level: u32) -> &mut Self {
         self.chunk_options.zstd_level = Some(level);
         self
@@ -563,9 +576,32 @@ impl DatasetBuilder {
         self
     }
 
+    /// Enable Pcodec lossless numerical compression (clawhdf5 filter ID 32023).
+    ///
+    /// Pcodec achieves 30–94% better compression ratio than Zstd for f32/f64
+    /// columns at 1–5 GiB/s decompression speed (arXiv:2502.06112). Requires
+    /// the `pcodec` cargo feature.
+    pub fn with_pcodec(&mut self) -> &mut Self {
+        self.chunk_options.pcodec = true;
+        self
+    }
+
     /// Enable shuffle filter (usually combined with deflate or zstd).
+    /// Note: shuffle is auto-applied before any compression codec by default.
     pub fn with_shuffle(&mut self) -> &mut Self {
         self.chunk_options.shuffle = true;
+        self
+    }
+
+    /// Disable the automatic shuffle pre-filter.
+    ///
+    /// By default, the shuffle filter is applied before any compression codec
+    /// (deflate, Zstd, LZ4, Pcodec) to improve compression ratios on float/int
+    /// arrays. Call this to disable it, e.g. for already-shuffled data or when
+    /// storing byte arrays where shuffle hurts compression.
+    pub fn without_shuffle(&mut self) -> &mut Self {
+        self.chunk_options.no_shuffle = true;
+        self.chunk_options.shuffle = false;
         self
     }
 
@@ -603,6 +639,23 @@ impl DatasetBuilder {
         self
     }
 
+    /// Configure this dataset as a Virtual Dataset (VDS).
+    ///
+    /// The supplied `mappings` list describes each source → virtual region
+    /// correspondence. The dataset will use HDF5 layout class 3 (Virtual).
+    /// Any previously set `data` is ignored when virtual sources are present.
+    ///
+    /// `datatype` and `shape` must still be set via `with_*_data()` or
+    /// `with_shape()` / `with_f64_data()` etc.; the actual raw bytes are
+    /// not written for VDS datasets. A non-empty `mappings` list is required;
+    /// an empty list is silently ignored (no VDS layout is written).
+    pub fn with_virtual_sources(&mut self, mappings: Vec<VdsMapping>) -> &mut Self {
+        if !mappings.is_empty() {
+            self.virtual_sources = Some(mappings);
+        }
+        self
+    }
+
     /// Attach SHINES provenance metadata (SHA-256, creator, timestamp).
     ///
     /// The SHA-256 hash of the raw dataset bytes is computed automatically
@@ -630,6 +683,8 @@ pub struct GroupBuilder {
     pub(crate) name: String,
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) attrs: Vec<(String, AttrValue)>,
+    /// (link_name, target_file, target_path)
+    pub(crate) external_links: Vec<(String, String, String)>,
 }
 
 impl GroupBuilder {
@@ -638,6 +693,7 @@ impl GroupBuilder {
             name: name.to_string(),
             datasets: Vec::new(),
             attrs: Vec::new(),
+            external_links: Vec::new(),
         }
     }
 
@@ -650,12 +706,28 @@ impl GroupBuilder {
         self.attrs.push((name.to_string(), value));
     }
 
+    /// Add an external link: a named pointer to an object in another HDF5 file.
+    pub fn add_external_link(
+        &mut self,
+        name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> &mut Self {
+        self.external_links.push((
+            name.to_string(),
+            target_file.to_string(),
+            target_path.to_string(),
+        ));
+        self
+    }
+
     /// Consume the builder, returning a FinishedGroup to add to FileWriter.
     pub fn finish(self) -> FinishedGroup {
         FinishedGroup {
             name: self.name,
             datasets: self.datasets,
             attrs: self.attrs,
+            external_links: self.external_links,
         }
     }
 }
@@ -665,4 +737,6 @@ pub struct FinishedGroup {
     pub(crate) name: String,
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) attrs: Vec<(String, AttrValue)>,
+    /// (link_name, target_file, target_path)
+    pub(crate) external_links: Vec<(String, String, String)>,
 }

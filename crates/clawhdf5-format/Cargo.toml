@@ -22,6 +22,8 @@ k12 = { version = "0.3", optional = true }
 hmac = { version = "0.12", optional = true, default-features = false }
 ed25519_dalek = { package = "ed25519-dalek", version = "2", optional = true, default-features = false, features = ["rand_core", "zeroize"] }
 rand_core = { version = "0.6", optional = true, default-features = false, features = ["getrandom"] }
+libaec-sys = { path = "../libaec-sys", version = "0.1", optional = true }
+pco = { version = "1.0", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
@@ -58,6 +60,8 @@ blake3_hash = ["blake3"]
 k12_hash = ["k12"]
 merkle = ["sha2", "blake3", "k12"]
 baselines = ["sha2", "hmac", "ed25519_dalek", "rand_core"]
+szip = ["libaec-sys"]
+pcodec = ["dep:pco"]
 
 [[bench]]
 name = "parallel_decompress_bench"

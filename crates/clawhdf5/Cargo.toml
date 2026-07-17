@@ -43,6 +43,7 @@ apple-compression = []
 zstd = ["clawhdf5-format/zstd"]
 blake3_hash = ["clawhdf5-format/blake3_hash"]
 lz4 = ["clawhdf5-format/lz4"]
+pcodec = ["clawhdf5-format/pcodec"]
 
 [package.metadata.docs.rs]
 features = ["mmap"]

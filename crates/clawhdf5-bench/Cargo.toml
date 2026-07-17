@@ -25,8 +25,44 @@ path = "src/bin/consolidation_efficiency.rs"
 name = "ephemeral_perf"
 path = "src/bin/ephemeral_perf.rs"
 
+[[bin]]
+name = "mpi_io_bench"
+path = "src/bin/mpi_io_bench.rs"
+required-features = ["mpi-io"]
+
+# ---------------------------------------------------------------------------
+# h5bench-equivalent Criterion benchmarks
+# ---------------------------------------------------------------------------
+
+[[bench]]
+name = "h5bench_write"
+harness = false
+
+[[bench]]
+name = "h5bench_read"
+harness = false
+
+[[bench]]
+name = "h5bench_meta"
+harness = false
+
 [dependencies]
 clawhdf5-agent = { path = "../clawhdf5-agent" }
+clawhdf5-io = { path = "../clawhdf5-io" }
+mpi = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# Optional: libhdf5 C wrapper for side-by-side comparison (requires system libhdf5).
+# Enable with: cargo bench -p clawhdf5-bench --features libhdf5-compare
+# Uses hdf5-metno (fork of hdf5 crate) which supports HDF5 1.14.x.
+hdf5 = { version = "0.12", optional = true, package = "hdf5-metno" }
+
+[dev-dependencies]
+clawhdf5 = { path = "../clawhdf5", features = ["zstd", "pcodec"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+# When enabled, benchmarks add matching libhdf5 variants for side-by-side comparison.
+libhdf5-compare = ["hdf5"]
+mpi-io = ["clawhdf5-io/mpi-io", "mpi"]

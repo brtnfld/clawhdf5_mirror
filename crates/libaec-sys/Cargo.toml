@@ -1,0 +1,8 @@
+[package]
+name = "libaec-sys"
+version = "0.1.0"
+edition = "2024"
+links = "aec"
+
+[build-dependencies]
+pkg-config = "0.3"
