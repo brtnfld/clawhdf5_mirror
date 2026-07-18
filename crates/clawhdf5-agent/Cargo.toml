@@ -11,7 +11,7 @@ categories = ["database", "science", "algorithms"]
 
 [dependencies]
 clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0", features = ["parallel", "fast-checksum"] }
-sha2 = { version = "0.10", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false }
 clawhdf5 = { path = "../clawhdf5", version = "2.1.0" }
 clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0", features = ["mmap"] }
 clawhdf5-accel = { path = "../clawhdf5-accel", version = "2.1.0" }
@@ -65,7 +65,7 @@ merkle-provenance = ["clawhdf5-format/merkle"]
 # reuses clawhdf5-format's merkle primitives. Files written without it (or by
 # older versions) carry no `_merkle_root` attribute and load unverified for
 # backward compatibility.
-integrity = ["clawhdf5-format/merkle", "dep:sha2"]
+integrity = ["clawhdf5-format/merkle"]
 gpu = ["clawhdf5-gpu/gpu-wgpu"]
 fast-math = ["matrixmultiply"]
 accelerate = ["accelerate-src", "cblas-sys"]

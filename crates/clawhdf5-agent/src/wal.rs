@@ -2,6 +2,46 @@
 //!
 //! Binary WAL format alongside the main .h5 file enables fast append-only
 //! writes without rewriting the entire HDF5 file on every save.
+//!
+//! # Integrity (P2.4 red-team finding)
+//!
+//! The main .h5 file's `_merkle_root` attribute (see the `integrity` module)
+//! only covers content that made it into a flush — it says nothing about
+//! entries sitting in the `.h5.wal` sidecar, which `HDF5Memory::open` replays
+//! into the live cache *after* that root verifies. A version-1 WAL had no
+//! integrity protection at all (just a magic/version/count header), so an
+//! attacker with write access to the sidecar could append a forged `Save` or
+//! `Tombstone` record and have it silently accepted on the next open — with
+//! the poisoned state then laundered into a fresh, valid root on the next
+//! flush.
+//!
+//! Version 2 closes the naive case: every entry is followed by a 32-byte
+//! SHA-256 hash chained over the previous entry's hash and this entry's own
+//! bytes (`chain_i = SHA256(chain_{i-1} || entry_bytes_i)`, `chain_0` derived
+//! from the header). An appended or edited entry that doesn't carry the
+//! correct chain value is rejected with [`MemoryError::Integrity`] rather than
+//! silently replayed. This is distinguished from ordinary crash truncation (a
+//! partially written last entry, which `read_entries` has always tolerated
+//! for crash safety): rejection only fires when a *complete* entry plus its
+//! trailer hash were read but the hash doesn't match, never when bytes are
+//! simply missing at EOF.
+//!
+//! **Documented limitation (unsigned, like the main file's Merkle root before
+//! P2.1 signing).** This chain hash is unkeyed: the algorithm is public and
+//! the current chain tip is derivable by anyone who can read the file. It
+//! stops an attacker who appends or edits an entry naively (without also
+//! recomputing the chain over everything before it) — the realistic case for
+//! "an attacker with write access to the sidecar" absent WAL-specific
+//! reverse-engineering. It does **not** stop a fully capable adversary who
+//! reads the whole WAL, recomputes the correct chain, and appends a
+//! self-consistent forged entry — the same class of gap T6b/T1d document for
+//! an unsigned Merkle tree. Closing that would need a MAC or signature keyed
+//! by material the write side alone controls, which no infrastructure in this
+//! crate currently provides for the WAL.
+//!
+//! Version 1 files are still read (unauthenticated, for backward
+//! compatibility with WALs written before this change); every freshly created
+//! or truncated WAL is written as version 2.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -10,7 +50,34 @@ use std::path::{Path, PathBuf};
 use crate::MemoryError;
 
 const WAL_MAGIC: [u8; 4] = [0x45, 0x48, 0x57, 0x4C]; // "EHWL"
-const WAL_VERSION: u8 = 1;
+/// Legacy, unauthenticated format: no trailing hash after each entry. Still
+/// read for backward compatibility; never written by this code.
+const WAL_VERSION_V1: u8 = 1;
+/// Current format: each entry followed by a 32-byte chained BLAKE3 hash. See
+/// the module doc for the chaining scheme. Always written for new/truncated
+/// WAL files.
+const WAL_VERSION_V2: u8 = 2;
+const WAL_VERSION: u8 = WAL_VERSION_V2;
+const CHAIN_HASH_SIZE: usize = 32;
+
+/// The chain's starting value, derived from the header rather than a fixed
+/// all-zero seed so two WALs with different magic/version don't share a chain
+/// origin (a cosmetic hardening; the header itself isn't secret).
+fn initial_chain() -> [u8; CHAIN_HASH_SIZE] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(WAL_MAGIC);
+    hasher.update([WAL_VERSION_V2]);
+    hasher.finalize().into()
+}
+
+fn chain_next(prev: &[u8; CHAIN_HASH_SIZE], entry_bytes: &[u8]) -> [u8; CHAIN_HASH_SIZE] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(prev);
+    hasher.update(entry_bytes);
+    hasher.finalize().into()
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +125,22 @@ pub struct WalFile {
     entry_count: u32,
     /// Entries written since the last header count update.
     pending_header_sync: u32,
+    /// Format version of this file: `WAL_VERSION_V1` (legacy, no chaining) or
+    /// `WAL_VERSION_V2` (chained hash trailer per entry).
+    version: u8,
+    /// Running chain tip after the last verified entry, used to compute the
+    /// next entry's trailer when `version == WAL_VERSION_V2`. Unused for v1.
+    chain_tip: [u8; CHAIN_HASH_SIZE],
 }
 
 impl WalFile {
-    /// Open or create a WAL file. If it exists, read the header and entry count.
+    /// Open or create a WAL file. If it exists, read the header and entry
+    /// count, and — for a version-2 file — replay existing entries to
+    /// recover the current chain tip so further appends continue the chain
+    /// correctly. A genuine chain-hash mismatch during that replay (as
+    /// opposed to ordinary crash truncation) is propagated as
+    /// [`MemoryError::Integrity`], refusing to append onto a WAL whose
+    /// history can't be trusted.
     pub fn open(path: &Path) -> Result<Self, MemoryError> {
         if path.exists() {
             // Read existing header
@@ -77,15 +156,25 @@ impl WalFile {
             }
             let mut ver = [0u8; 1];
             f.read_exact(&mut ver)?;
-            if ver[0] != WAL_VERSION {
+            let version = ver[0];
+            if version != WAL_VERSION_V1 && version != WAL_VERSION_V2 {
                 return Err(MemoryError::Schema(format!(
-                    "unsupported WAL version {}",
-                    ver[0]
+                    "unsupported WAL version {version}"
                 )));
             }
             let mut count_buf = [0u8; 4];
             f.read_exact(&mut count_buf)?;
             let entry_count = u32::from_le_bytes(count_buf);
+
+            // Replay to recover the chain tip (v2 only; v1 has none). This
+            // also surfaces a genuine tamper/corruption as an error here,
+            // before any further append trusts a broken chain.
+            let chain_tip = if version == WAL_VERSION_V2 {
+                parse_entries(&mut f, version)?.1
+            } else {
+                initial_chain()
+            };
+
             // Seek to end for appending
             f.seek(SeekFrom::End(0))?;
             Ok(Self {
@@ -93,9 +182,11 @@ impl WalFile {
                 file: Some(f),
                 entry_count,
                 pending_header_sync: 0,
+                version,
+                chain_tip,
             })
         } else {
-            // Create new WAL
+            // Create new WAL, always in the current (v2) format.
             let mut f = File::create(path)?;
             f.write_all(&WAL_MAGIC)?;
             f.write_all(&[WAL_VERSION])?;
@@ -106,6 +197,8 @@ impl WalFile {
                 file: Some(f),
                 entry_count: 0,
                 pending_header_sync: 0,
+                version: WAL_VERSION,
+                chain_tip: initial_chain(),
             })
         }
     }
@@ -139,12 +232,7 @@ impl WalFile {
         serialize_str(&mut buf, &entry.source_channel);
         serialize_str(&mut buf, &entry.session_id);
         serialize_str(&mut buf, &entry.tags);
-
-        let f = self
-            .file
-            .as_mut()
-            .ok_or_else(|| MemoryError::Io(std::io::Error::other("WAL file not open")))?;
-        f.write_all(&buf)?;
+        self.write_entry_bytes(&buf)?;
 
         self.entry_count += 1;
         self.pending_header_sync += 1;
@@ -160,12 +248,7 @@ impl WalFile {
         buf[0] = WalEntryType::Tombstone as u8;
         buf[1..9].copy_from_slice(&timestamp.to_le_bytes());
         buf[9..13].copy_from_slice(&(index as u32).to_le_bytes());
-
-        let f = self
-            .file
-            .as_mut()
-            .ok_or_else(|| MemoryError::Io(std::io::Error::other("WAL file not open")))?;
-        f.write_all(&buf)?;
+        self.write_entry_bytes(&buf)?;
 
         self.entry_count += 1;
         self.pending_header_sync += 1;
@@ -175,12 +258,36 @@ impl WalFile {
         Ok(())
     }
 
+    /// Write one entry's already-serialized bytes, appending the chained hash
+    /// trailer when this file is in the current (v2) format.
+    fn write_entry_bytes(&mut self, buf: &[u8]) -> Result<(), MemoryError> {
+        let next_tip = if self.version == WAL_VERSION_V2 {
+            Some(chain_next(&self.chain_tip, buf))
+        } else {
+            None
+        };
+        let f = self
+            .file
+            .as_mut()
+            .ok_or_else(|| MemoryError::Io(std::io::Error::other("WAL file not open")))?;
+        f.write_all(buf)?;
+        if let Some(tip) = next_tip {
+            f.write_all(&tip)?;
+            self.chain_tip = tip;
+        }
+        Ok(())
+    }
+
     /// Read all entries from the WAL (for replay on open).
     ///
     /// Reads until EOF — the header `entry_count` is used only for pre-allocation
     /// (and may be stale if written with deferred group-commit updates). This
-    /// tolerates both truncated files (crash mid-write) and stale header counts
-    /// (crash before the next group-commit header sync).
+    /// tolerates truncated files (crash mid-write) and stale header counts
+    /// (crash before the next group-commit header sync). For a version-2 file,
+    /// a *complete* entry whose chain hash doesn't match is real tampering or
+    /// corruption, not truncation, and fails closed with
+    /// [`MemoryError::Integrity`] — see the module doc's documented limitation
+    /// on what this chain hash does and doesn't defend against.
     pub fn read_entries(path: &Path) -> Result<Vec<WalEntry>, MemoryError> {
         if !path.exists() {
             return Ok(Vec::new());
@@ -192,87 +299,18 @@ impl WalFile {
         if header[0..4] != WAL_MAGIC {
             return Err(MemoryError::Schema("invalid WAL magic bytes".into()));
         }
-        if header[4] != WAL_VERSION {
+        let version = header[4];
+        if version != WAL_VERSION_V1 && version != WAL_VERSION_V2 {
             return Err(MemoryError::Schema(format!(
-                "unsupported WAL version {}",
-                header[4]
+                "unsupported WAL version {version}"
             )));
         }
-        // entry_count is a pre-allocation hint only — we read until EOF.
-        let entry_count_hint = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
-        let mut entries = Vec::with_capacity(entry_count_hint as usize);
-
-        loop {
-            // Read entry type — EOF here is normal end-of-log, not an error
-            let mut type_buf = [0u8; 1];
-            if f.read_exact(&mut type_buf).is_err() {
-                break;
-            }
-            let entry_type = match WalEntryType::from_u8(type_buf[0]) {
-                Some(et) => et,
-                None => break,
-            };
-
-            let mut ts_buf = [0u8; 8];
-            if f.read_exact(&mut ts_buf).is_err() {
-                break;
-            }
-            let timestamp = f64::from_le_bytes(ts_buf);
-
-            match entry_type {
-                WalEntryType::Save => {
-                    let Ok(chunk) = read_len_prefixed_str(&mut f) else {
-                        break;
-                    };
-                    let Ok(embedding) = read_embedding(&mut f) else {
-                        break;
-                    };
-                    let Ok(source_channel) = read_len_prefixed_str(&mut f) else {
-                        break;
-                    };
-                    let Ok(session_id) = read_len_prefixed_str(&mut f) else {
-                        break;
-                    };
-                    let Ok(tags) = read_len_prefixed_str(&mut f) else {
-                        break;
-                    };
-                    entries.push(WalEntry {
-                        entry_type,
-                        timestamp,
-                        chunk,
-                        embedding,
-                        source_channel,
-                        session_id,
-                        tags,
-                        tombstone_index: None,
-                    });
-                }
-                WalEntryType::Tombstone => {
-                    let mut idx_buf = [0u8; 4];
-                    if f.read_exact(&mut idx_buf).is_err() {
-                        break;
-                    }
-                    let idx = u32::from_le_bytes(idx_buf) as usize;
-                    entries.push(WalEntry {
-                        entry_type,
-                        timestamp,
-                        chunk: String::new(),
-                        embedding: Vec::new(),
-                        source_channel: String::new(),
-                        session_id: String::new(),
-                        tags: String::new(),
-                        tombstone_index: Some(idx),
-                    });
-                }
-                WalEntryType::ActivationUpdate => {
-                    // Reserved for future use
-                }
-            }
-        }
-        Ok(entries)
+        Ok(parse_entries(&mut f, version)?.0)
     }
 
-    /// Truncate the WAL (after merge into .h5).
+    /// Truncate the WAL (after merge into .h5). Always recreates as the
+    /// current (v2) format, so a legacy v1 file naturally upgrades the next
+    /// time its entries are merged and the WAL is rotated.
     pub fn truncate(&mut self) -> Result<(), MemoryError> {
         // Close existing handle and recreate
         self.file = None;
@@ -284,6 +322,8 @@ impl WalFile {
         self.file = Some(f);
         self.entry_count = 0;
         self.pending_header_sync = 0;
+        self.version = WAL_VERSION;
+        self.chain_tip = initial_chain();
         Ok(())
     }
 
@@ -310,6 +350,141 @@ impl WalFile {
         self.pending_header_sync = 0;
         Ok(())
     }
+}
+
+/// Parse entries from a freshly-opened WAL file positioned right after the
+/// 9-byte header. Shared by [`WalFile::read_entries`] (discards the returned
+/// chain tip) and [`WalFile::open`] (needs the tip to resume appending onto
+/// an existing v2 file's chain).
+///
+/// Tolerates a partially written last entry (crash mid-write) exactly as
+/// before: any read failure while parsing an entry's fields — including, for
+/// v2, its trailing chain hash — stops the loop and returns what was
+/// successfully parsed so far, with no error. A entry whose fields (and, for
+/// v2, trailing hash) were read *in full* but whose chain hash doesn't match
+/// is a different case: those bytes are genuinely present and malformed, not
+/// missing, so it is reported as [`MemoryError::Integrity`] instead of being
+/// silently dropped like a truncation would be.
+fn parse_entries(
+    f: &mut File,
+    version: u8,
+) -> Result<(Vec<WalEntry>, [u8; CHAIN_HASH_SIZE]), MemoryError> {
+    let mut entries = Vec::new();
+    let mut chain_tip = initial_chain();
+
+    // A field read can fail two structurally different ways: an I/O error
+    // (`read_exact` ran out of bytes -- genuine crash-mid-write truncation,
+    // always tolerable), or a successful read whose bytes don't decode (only
+    // possible for `read_len_prefixed_str`'s UTF-8 check, since a genuine
+    // write always emits valid UTF-8 -- this means the bytes are fully
+    // present but corrupt/tampered, not missing). For v2, only the latter is
+    // reported as `Integrity`; v1 has no such promise and keeps the original
+    // fully-tolerant behavior for backward compatibility.
+    macro_rules! field {
+        ($result:expr, $entry_start:expr) => {
+            match $result {
+                Ok(v) => v,
+                Err(MemoryError::Io(_)) => break,
+                Err(e) if version == WAL_VERSION_V2 => {
+                    return Err(MemoryError::Integrity(format!(
+                        "WAL entry at offset {} is corrupt (not truncated -- the bytes were \
+                         fully present but failed to decode): {e}",
+                        $entry_start
+                    )));
+                }
+                Err(_) => break,
+            }
+        };
+    }
+
+    loop {
+        let entry_start = f.stream_position()?;
+
+        // Read entry type — EOF here is normal end-of-log, not an error.
+        let mut type_buf = [0u8; 1];
+        if f.read_exact(&mut type_buf).is_err() {
+            break;
+        }
+        let Some(entry_type) = WalEntryType::from_u8(type_buf[0]) else {
+            break;
+        };
+
+        let mut ts_buf = [0u8; 8];
+        if f.read_exact(&mut ts_buf).is_err() {
+            break;
+        }
+        let timestamp = f64::from_le_bytes(ts_buf);
+
+        let entry = match entry_type {
+            WalEntryType::Save => {
+                let chunk = field!(read_len_prefixed_str(f), entry_start);
+                let embedding = field!(read_embedding(f), entry_start);
+                let source_channel = field!(read_len_prefixed_str(f), entry_start);
+                let session_id = field!(read_len_prefixed_str(f), entry_start);
+                let tags = field!(read_len_prefixed_str(f), entry_start);
+                WalEntry {
+                    entry_type,
+                    timestamp,
+                    chunk,
+                    embedding,
+                    source_channel,
+                    session_id,
+                    tags,
+                    tombstone_index: None,
+                }
+            }
+            WalEntryType::Tombstone => {
+                let mut idx_buf = [0u8; 4];
+                if f.read_exact(&mut idx_buf).is_err() {
+                    break;
+                }
+                let idx = u32::from_le_bytes(idx_buf) as usize;
+                WalEntry {
+                    entry_type,
+                    timestamp,
+                    chunk: String::new(),
+                    embedding: Vec::new(),
+                    source_channel: String::new(),
+                    session_id: String::new(),
+                    tags: String::new(),
+                    tombstone_index: Some(idx),
+                }
+            }
+            WalEntryType::ActivationUpdate => {
+                // Reserved for future use; no additional fields, no cache effect.
+                continue;
+            }
+        };
+
+        if version == WAL_VERSION_V2 {
+            let entry_end = f.stream_position()?;
+            let entry_len = (entry_end - entry_start) as usize;
+            let mut trailer = [0u8; CHAIN_HASH_SIZE];
+            if f.read_exact(&mut trailer).is_err() {
+                // Fields were complete but the trailer wasn't -- crash mid-
+                // trailer-write. Same tolerance class as any other partial
+                // write: drop this entry, stop here, no error.
+                break;
+            }
+            let mut raw = vec![0u8; entry_len];
+            f.seek(SeekFrom::Start(entry_start))?;
+            f.read_exact(&mut raw)?;
+            f.seek(SeekFrom::Start(entry_end + CHAIN_HASH_SIZE as u64))?;
+
+            let expected = chain_next(&chain_tip, &raw);
+            if expected != trailer {
+                return Err(MemoryError::Integrity(format!(
+                    "WAL entry at offset {entry_start} failed chain-hash verification -- \
+                     the .h5.wal sidecar was tampered with or corrupted"
+                )));
+            }
+            chain_tip = expected;
+        }
+
+        entries.push(entry);
+    }
+
+    Ok((entries, chain_tip))
 }
 
 /// Replay WAL entries into a MemoryCache.
@@ -766,5 +941,174 @@ mod tests {
         let wal_path = h5_path.with_extension("h5.wal");
         assert!(!wal_path.exists(), "no .wal file when WAL disabled");
         assert_eq!(mem.wal_pending_count(), 0);
+    }
+
+    // --- P2.4 red-team follow-up: WAL chain-hash integrity (v2) ---
+
+    #[test]
+    fn test_wal_v2_new_files_are_chain_hashed() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("test.h5.wal");
+        {
+            let mut wal = WalFile::open(&wal_path).unwrap();
+            wal.append_save(&make_wal_entry("a", &[1.0])).unwrap();
+            wal.append_save(&make_wal_entry("b", &[2.0])).unwrap();
+        }
+        let bytes = std::fs::read(&wal_path).unwrap();
+        assert_eq!(bytes[4], WAL_VERSION_V2, "new WAL files must be v2");
+
+        // Honest round-trip still verifies and returns both entries.
+        let entries = WalFile::read_entries(&wal_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].chunk, "a");
+        assert_eq!(entries[1].chunk, "b");
+    }
+
+    #[test]
+    fn test_wal_v2_detects_tampered_entry() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("tampered.h5.wal");
+        {
+            let mut wal = WalFile::open(&wal_path).unwrap();
+            wal.append_save(&make_wal_entry("first", &[1.0, 2.0]))
+                .unwrap();
+            wal.append_save(&make_wal_entry("second", &[3.0, 4.0]))
+                .unwrap();
+        }
+
+        // Raw storage-level tamper: flip a byte inside the first entry's
+        // chunk text (well past the 9-byte header), leaving its trailing
+        // chain hash untouched -- exactly the T1a-style move, against the WAL
+        // instead of the .h5.
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        let needle = b"first";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("chunk text present");
+        bytes[pos] ^= 0xFF;
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        let result = WalFile::read_entries(&wal_path);
+        assert!(
+            matches!(result, Err(MemoryError::Integrity(_))),
+            "tampered entry must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_wal_v2_forged_entry_without_chain_is_not_replayed() {
+        // The exact attack scenario from the P2.4 red-team sweep: an attacker
+        // with write access to the sidecar appends a well-formed Save entry
+        // (correct type byte, timestamp, length-prefixed fields) hoping it
+        // gets replayed as a genuine memory. Without also computing the
+        // correct chain hash (which requires reading and re-hashing every
+        // prior entry), the forged entry must never reach the returned
+        // entries -- whether that surfaces as an explicit rejection or a
+        // silent drop, the forged content must not be replayed into the cache.
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("forged.h5.wal");
+        {
+            let mut wal = WalFile::open(&wal_path).unwrap();
+            wal.append_save(&make_wal_entry("genuine", &[1.0])).unwrap();
+        }
+
+        // Manually append a well-formed Save entry's wire bytes with NO
+        // trailing chain hash -- the attacker doesn't know the chaining
+        // scheme exists, so they reproduce only the pre-existing (v1) format.
+        let forged = make_wal_entry("forged-memory", &[9.9]);
+        let mut buf = Vec::new();
+        buf.push(WalEntryType::Save as u8);
+        buf.extend_from_slice(&forged.timestamp.to_le_bytes());
+        serialize_str(&mut buf, &forged.chunk);
+        buf.extend_from_slice(&(forged.embedding.len() as u32).to_le_bytes());
+        for &v in &forged.embedding {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        serialize_str(&mut buf, &forged.source_channel);
+        serialize_str(&mut buf, &forged.session_id);
+        serialize_str(&mut buf, &forged.tags);
+        {
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            f.write_all(&buf).unwrap();
+        }
+
+        let entries = WalFile::read_entries(&wal_path).unwrap();
+        assert!(
+            entries.iter().all(|e| e.chunk != "forged-memory"),
+            "forged entry without a valid chain hash must never be replayed"
+        );
+        assert_eq!(entries.len(), 1, "only the genuine entry survives");
+        assert_eq!(entries[0].chunk, "genuine");
+    }
+
+    #[test]
+    fn test_wal_v2_reopen_continues_chain() {
+        // open() on an existing v2 file must recover the chain tip so further
+        // appends verify correctly, and so a later tamper is still detected.
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("reopen.h5.wal");
+        {
+            let mut wal = WalFile::open(&wal_path).unwrap();
+            wal.append_save(&make_wal_entry("first-entry-payload", &[1.0]))
+                .unwrap();
+        }
+        {
+            let mut wal = WalFile::open(&wal_path).unwrap();
+            wal.append_save(&make_wal_entry("second-entry-payload", &[2.0]))
+                .unwrap();
+        }
+
+        let entries = WalFile::read_entries(&wal_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].chunk, "first-entry-payload");
+        assert_eq!(entries[1].chunk, "second-entry-payload");
+
+        // Tamper the second entry after both appends; chain verification
+        // must still catch it even though it was written across two opens.
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        let needle = b"second-entry-payload";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("chunk text present");
+        bytes[pos] ^= 0xFF;
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        assert!(matches!(
+            WalFile::read_entries(&wal_path),
+            Err(MemoryError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn test_wal_v1_legacy_file_still_reads_unauthenticated() {
+        // A pre-existing v1 WAL (no chain hash) must still be readable for
+        // backward compatibility -- old sidecars aren't rejected outright.
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("legacy.h5.wal");
+        {
+            let mut f = File::create(&wal_path).unwrap();
+            f.write_all(&WAL_MAGIC).unwrap();
+            f.write_all(&[WAL_VERSION_V1]).unwrap();
+            f.write_all(&0u32.to_le_bytes()).unwrap();
+            let mut buf = Vec::new();
+            let e = make_wal_entry("legacy-entry", &[1.0, 2.0]);
+            buf.push(WalEntryType::Save as u8);
+            buf.extend_from_slice(&e.timestamp.to_le_bytes());
+            serialize_str(&mut buf, &e.chunk);
+            buf.extend_from_slice(&(e.embedding.len() as u32).to_le_bytes());
+            for &v in &e.embedding {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            serialize_str(&mut buf, &e.source_channel);
+            serialize_str(&mut buf, &e.session_id);
+            serialize_str(&mut buf, &e.tags);
+            f.write_all(&buf).unwrap();
+        }
+
+        let entries = WalFile::read_entries(&wal_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chunk, "legacy-entry");
     }
 }

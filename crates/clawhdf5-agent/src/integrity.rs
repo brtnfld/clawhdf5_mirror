@@ -16,17 +16,22 @@
 //! **Coverage.** The root spans every field that survives the write→read
 //! round-trip across all three persisted groups:
 //! - `/memory`: chunks, embeddings, source channels, timestamps, session ids,
-//!   tags, tombstones.
+//!   tags, tombstones, norms, activation weights.
 //! - `/sessions`: id, start/end index, channel, timestamp, summary.
 //! - `/knowledge_graph`: entity (id, name, type, embedding index), relation
 //!   (src, tgt, type, weight, ts), and aliases (string, entity id).
 //!
-//! Fields the loader reconstructs as defaults rather than reading back (entity
-//! `properties`/`embedding`/`created_at`/`updated_at`, relation `metadata`) and
-//! fields recomputed on read (`norms`, `activation_weights`) are deliberately
-//! excluded — hashing them would make an honest round-trip fail, since the
-//! bytes on read differ from the bytes on write. Each leaf carries a section
-//! tag byte so content can't be moved between sections undetected.
+//! `norms` and `activation_weights` are loaded verbatim from disk when
+//! present (not recomputed — `norms` only falls back to recomputation when
+//! its stored length doesn't match the entry count; `activation_weights` only
+//! falls back to a default when absent or mismatched), and both feed recall
+//! scoring directly, so they're covered like any other loaded field. Only
+//! fields the loader reconstructs as fixed defaults regardless of what's on
+//! disk (entity `properties`/`embedding`/`created_at`/`updated_at`, relation
+//! `metadata`) are excluded — hashing those would make an honest round-trip
+//! fail, since the bytes on read are never what was on write. Each leaf
+//! carries a section tag byte so content can't be moved between sections
+//! undetected.
 //!
 //! **Threat model.** This is *unsigned* integrity: it detects tampering or
 //! corruption of an existing file, not an attacker who rebuilds the whole file
@@ -105,6 +110,15 @@ fn all_leaves(
         );
         push_len_prefixed(&mut buf, memory.tags.get(i).map_or(b"".as_slice(), |s| s.as_bytes()));
         buf.push(memory.tombstones.get(i).copied().unwrap_or(0));
+        buf.extend_from_slice(&memory.norms.get(i).copied().unwrap_or(0.0).to_le_bytes());
+        buf.extend_from_slice(
+            &memory
+                .activation_weights
+                .get(i)
+                .copied()
+                .unwrap_or(1.0)
+                .to_le_bytes(),
+        );
         leaves.push(buf);
     }
 
@@ -284,6 +298,8 @@ mod tests {
         m.session_ids = vec!["s1".into(), "s2".into()];
         m.tags = vec!["a".into(), "b".into()];
         m.tombstones = vec![0, 0];
+        m.norms = vec![0.374, 2.598];
+        m.activation_weights = vec![1.0, 0.42];
 
         let mut s = SessionCache::new();
         s.entries.push(SessionEntry {
@@ -332,6 +348,32 @@ mod tests {
         let (mut m2, s2, k2) = sample();
         m2.chunks[1] = "second memory (forged)".into();
         verify_content(&m2, &s2, &k2, Some(&hex), false).expect_err("memory tamper detected");
+    }
+
+    #[test]
+    fn tampered_norm_is_detected() {
+        // P2.4 red-team follow-up: norms are loaded verbatim from disk (only
+        // recomputed when the stored dataset's length doesn't match the entry
+        // count), not "recomputed on read" as this module previously claimed
+        // -- so a tampered norm on an honest-length dataset must be caught.
+        let (m, s, k) = sample();
+        let hex = content_root_hex(&m, &s, &k).unwrap();
+        let (mut m2, s2, k2) = sample();
+        m2.norms[0] = 999.0;
+        verify_content(&m2, &s2, &k2, Some(&hex), false).expect_err("norm tamper detected");
+    }
+
+    #[test]
+    fn tampered_activation_weight_is_detected() {
+        // activation_weights feed recall scoring directly and are loaded
+        // verbatim when present and correctly sized -- covered like any other
+        // persisted field.
+        let (m, s, k) = sample();
+        let hex = content_root_hex(&m, &s, &k).unwrap();
+        let (mut m2, s2, k2) = sample();
+        m2.activation_weights[1] = 100.0;
+        verify_content(&m2, &s2, &k2, Some(&hex), false)
+            .expect_err("activation_weight tamper detected");
     }
 
     #[test]

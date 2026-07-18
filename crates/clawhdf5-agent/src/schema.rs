@@ -445,7 +445,7 @@ fn load_memory_group(
 
     // Read norms if present, otherwise compute from embeddings
     let norms = match read_f32_dataset(&group, "norms") {
-        Ok(n) if n.len() == n.len() => n,
+        Ok(v) if v.len() == n => v,
         _ => {
             // Compute norms from flat embeddings
             flat_embeddings
