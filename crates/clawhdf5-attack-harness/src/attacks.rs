@@ -7,7 +7,7 @@
 //!
 //! Attacks are split into two groups:
 //!
-//! - **Dataset attacks** (T1a, T1c, T1b, T2a, T2b, T6a, subset-a/b/c) run
+//! - **Dataset attacks** (T1a, T1c, T1b, T2a, T2b, T6a, subset-a/b/c/d) run
 //!   against the [`HarnessDataset`] — either the real GOES-18 file's actual
 //!   on-disk HDF5 chunks, or the synthetic fallback — because they only need
 //!   "a chunked Merkle-protected byte blob" and get more authentic coverage
@@ -16,13 +16,14 @@
 //!   T1c (a valid-after-pipeline compressed-stream substitution) and T2b
 //!   (a burst error) are the harder, directed-adversary variants
 //!   §`sec:adversarial` explicitly calls for.
-//! - **Mechanism attacks** (T1d, T3, T4a, T4b, T5, T6b, T7, T8) target a
-//!   specific primitive (the companion-integrity self-check, the provenance
-//!   journal, the version counter, the AEAD leaf formula, the null-sentinel
-//!   padding) that isn't meaningfully expressed in terms of "a chunk in the
-//!   dataset," so each builds its own minimal fixture. T1d is the directed
-//!   companion-forgery variant of T1b, reported undetected-by-design for
-//!   unsigned data (same root cause as T6b).
+//! - **Mechanism attacks** (T1d, T1e, T3, T4a, T4b, T5, T6b, T7, T8) target a
+//!   specific primitive (the companion-integrity self-check, the leaf/internal
+//!   hash domain separation, the provenance journal, the version counter, the
+//!   AEAD leaf formula, the null-sentinel padding) that isn't meaningfully
+//!   expressed in terms of "a chunk in the dataset," so each builds its own
+//!   minimal fixture. T1d is the directed companion-forgery variant of T1b,
+//!   reported undetected-by-design for unsigned data (same root cause as T6b);
+//!   T1e is the second-preimage / node-as-leaf domain-separation regression.
 
 use std::time::Instant;
 
@@ -289,6 +290,50 @@ pub fn t1d_directed_companion_forgery() -> AttackResult {
                  clawhdf5_sign::canonical_payload (P2.1, merged) folds companion_hash into the \
                  signed payload; that binding isn't wired into clawhdf5-format's Merkle \
                  verification flow yet (per Sec. merkle-storage, threat T6).",
+            )
+        } else {
+            None
+        },
+    }
+}
+
+/// T1e — Merkle second-preimage / node-as-leaf confusion. An attacker tries to
+/// collapse a multi-chunk dataset into a single crafted chunk whose *leaf* hash
+/// equals an *internal* node, so a shorter forged tree reproduces the honest
+/// root. This works only if leaf and internal hashes share a hash domain.
+/// clawhdf5 domain-separates them (`0x00` leaf prefix, `0x01` internal prefix),
+/// so `H_leaf(child0 || child1) != H_internal(child0, child1)` and the collapse
+/// fails. Regression lock-in for that domain separation (a defense a crypto
+/// reviewer always checks, previously exercised by no attack).
+pub fn t1e_second_preimage_node_as_leaf() -> AttackResult {
+    let alg = HashAlg::Blake3;
+    let leaf0 = alg.hash_leaf(b"chunk-0");
+    let leaf1 = alg.hash_leaf(b"chunk-1");
+    let internal = alg.hash_pair(&leaf0, &leaf1);
+
+    let start_time = Instant::now();
+    // Craft a single chunk X = child0 || child1 and hope that hashing X as a
+    // leaf reproduces the internal node (it would, without domain separation).
+    let mut forged_chunk = Vec::with_capacity(64);
+    forged_chunk.extend_from_slice(&leaf0);
+    forged_chunk.extend_from_slice(&leaf1);
+    let forged_leaf = alg.hash_leaf(&forged_chunk);
+    let collapsed = forged_leaf == internal;
+    let latency = start_time.elapsed();
+
+    AttackResult {
+        threat_class: "T1",
+        attack_id: "T1e",
+        dataset: "n/a",
+        // Domain separation must make the collapse impossible.
+        detected: !collapsed,
+        verifier_fn: "HashAlg::hash_leaf / hash_pair (domain separation)",
+        latency,
+        root_cause: if collapsed {
+            Some(
+                "LEAF/INTERNAL DOMAIN SEPARATION BROKEN: hash_leaf(child0||child1) equals \
+                 hash_pair(child0, child1), so a multi-chunk tree can be collapsed to a single \
+                 forged chunk with the same root. This must never happen.",
             )
         } else {
             None
@@ -576,6 +621,57 @@ pub fn subset_c_wrong_coverage(ds: &HarnessDataset) -> AttackResult {
         dataset: ds.label,
         detected: matches!(result, Err(MerkleError::SelectionMismatch)),
         verifier_fn: "verify_subset",
+        latency,
+        root_cause: None,
+    }
+}
+
+/// Subset-(d) — malformed proof, mismatched array lengths: a crafted
+/// `SubsetProof` whose `leaf_hashes` is shorter than its `chunk_indices`
+/// (and the delivered chunk set). Without an up-front length check,
+/// `verify_subset`'s per-chunk loop would index `leaf_hashes[i]` out of bounds
+/// and panic — a denial-of-service on the verifier from attacker-controlled
+/// wire data. `verify_subset` must reject the length mismatch cleanly instead.
+/// Regression lock-in for that guard.
+pub fn subset_d_malformed_proof_lengths(ds: &HarnessDataset) -> AttackResult {
+    let (tree, _, _) = build_merkle_state(ds);
+    let grid = whole_dataset_grid(ds);
+    let sel = range_1d(0..ds.chunk_count() as u64);
+    let mut proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor).unwrap();
+
+    // Attacker truncates leaf_hashes so the proof's parallel arrays disagree in
+    // length. Deliver a full chunk set (matching chunk_indices) so the ONLY
+    // inconsistency is the short leaf_hashes vector.
+    let delivered: Vec<ChunkData<'_>> = proof
+        .chunk_indices
+        .iter()
+        .map(|&idx| ChunkData {
+            index: idx,
+            data: ds.chunk(&ds.bytes, idx),
+        })
+        .collect();
+    proof.leaf_hashes.pop();
+
+    let start_time = Instant::now();
+    let result = verify_subset(
+        tree.root(),
+        HashAlg::Blake3,
+        &delivered,
+        &proof,
+        &grid,
+        &grid.grid_hash,
+        &sel,
+        LeafOrder::RowMajor,
+    );
+    let latency = start_time.elapsed();
+
+    AttackResult {
+        threat_class: "subset",
+        attack_id: "subset-d",
+        dataset: ds.label,
+        // Clean rejection (no panic) via the length guard.
+        detected: matches!(result, Err(MerkleError::CompanionTampered)),
+        verifier_fn: "verify_subset (length guard)",
         latency,
         root_cause: None,
     }
