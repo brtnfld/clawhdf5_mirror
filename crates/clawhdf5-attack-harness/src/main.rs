@@ -30,7 +30,8 @@
 //! latency_ms, root_cause`. The mechanism attacks (T1d, T1e, T1f, T3, T4a, T4b,
 //! T5, T6b, T6c, T7, T8) target a specific primitive rather than "a chunk in a
 //! dataset" (see `attacks.rs`'s module doc) and so run once, independent of
-//! dataset, reported with `dataset = n/a`.
+//! dataset, reported with `dataset = n/a`. T2c is a dataset attack (needs a
+//! real chunked byte blob) and runs per-dataset like T1a/T2a/T2b.
 
 mod attacks;
 mod fixture;
@@ -184,6 +185,7 @@ fn run_dataset_attacks(ds: &HarnessDataset) -> Vec<AttackResult> {
         attacks::t1b_companion_node_tamper(ds),
         attacks::t2a_single_bit_corruption(ds),
         attacks::t2b_burst_error_corruption(ds),
+        attacks::t2c_directed_leaf_patch_forgery(ds),
         attacks::t6a_root_attribute_stripped(ds),
         attacks::subset_a_omitted_chunk(ds),
         attacks::subset_b_substituted_chunk(ds),

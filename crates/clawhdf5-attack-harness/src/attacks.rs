@@ -7,7 +7,7 @@
 //!
 //! Attacks are split into two groups:
 //!
-//! - **Dataset attacks** (T1a, T1c, T1b, T2a, T2b, T6a, subset-a/b/c/d) run
+//! - **Dataset attacks** (T1a, T1c, T1b, T2a, T2b, T2c, T6a, subset-a/b/c/d) run
 //!   against the [`HarnessDataset`] — either the real GOES-18 file's actual
 //!   on-disk HDF5 chunks, or the synthetic fallback — because they only need
 //!   "a chunked Merkle-protected byte blob" and get more authentic coverage
@@ -15,7 +15,11 @@
 //!   available. T1a/T2a are the "easy" storage-tamper/bit-flip baselines;
 //!   T1c (a valid-after-pipeline compressed-stream substitution) and T2b
 //!   (a burst error) are the harder, directed-adversary variants
-//!   §`sec:adversarial` explicitly calls for.
+//!   §`sec:adversarial` explicitly calls for. T2c is a further directed
+//!   variant that also patches the on-disk companion `tree_nodes` blob (not
+//!   just the chunk) to match — the P2.4 red-team finding that
+//!   `verify_dataset` didn't actually chain leaves to the root until fixed;
+//!   see the doc comment on `t2c_directed_leaf_patch_forgery`.
 //! - **Mechanism attacks** (T1d, T1e, T1f, T3, T4a, T4b, T5, T6b, T6c, T7, T8)
 //!   target a specific primitive (the companion-integrity self-check, the
 //!   leaf/internal hash domain separation, the signed-root binding, the
@@ -426,6 +430,52 @@ pub fn t2b_burst_error_corruption(ds: &HarnessDataset) -> AttackResult {
     }
 }
 
+/// T2c — directed leaf-patch forgery: the naive T2a/T2b tamper only touches
+/// chunk bytes and leaves the on-disk `tree_nodes` blob untouched, which
+/// `verify_dataset` genuinely catches (its stored leaf still reflects the
+/// honest chunk). A directed adversary with write access to BOTH the chunk
+/// data and the companion `tree_nodes` blob instead patches the tampered
+/// chunk's corresponding leaf entry to match — leaving the root (`tree_nodes[0]`
+/// / `merkle_attr.root`) untouched — and asks whether `verify_dataset` still
+/// catches it. Before the P2.4 fix to `verify_dataset` (red-team finding: it
+/// deserialized the stored tree verbatim via `reconstruct_tree` without ever
+/// re-deriving an internal node from its children via `hash_pair`, so nothing
+/// tied the leaves to the root), this bypass succeeded — this attack proves it
+/// no longer does.
+pub fn t2c_directed_leaf_patch_forgery(ds: &HarnessDataset) -> AttackResult {
+    let (tree, attr, honest_nodes) = build_merkle_state(ds);
+    let victim = ds.chunk_count() / 2;
+
+    let mut tampered = ds.bytes.clone();
+    let (start, end) = ds.chunk_ranges[victim];
+    tampered[start] ^= 0xFF;
+
+    // Patch the victim's leaf entry in the companion node array to match the
+    // tampered chunk's hash, leaving every other node (including the root at
+    // index 0) untouched -- the directed move a naive tamper doesn't make.
+    let forged_leaf = HashAlg::Blake3.hash_leaf(&tampered[start..end]);
+    let padded_count = tree.padded_leaf_count();
+    let internal_nodes = padded_count - 1;
+    let leaf_offset = (internal_nodes + victim) * 32;
+    let mut forged_nodes = honest_nodes.clone();
+    forged_nodes[leaf_offset..leaf_offset + 32].copy_from_slice(&forged_leaf);
+
+    let start_time = Instant::now();
+    let view = dataset_view(attr, forged_nodes, ds, &tampered);
+    let result = verify_dataset(&view);
+    let latency = start_time.elapsed();
+
+    AttackResult {
+        threat_class: "T2",
+        attack_id: "T2c",
+        dataset: ds.label,
+        detected: result.is_err(),
+        verifier_fn: "verify_dataset",
+        latency,
+        root_cause: None,
+    }
+}
+
 /// T6a — security stripping: zero out the `merkle_root` attribute bytes in
 /// place (simulating deletion/overwrite via raw attribute access) and confirm
 /// the parser fails closed instead of silently treating the dataset as
@@ -798,12 +848,20 @@ pub fn t4a_whole_file_rollback() -> AttackResult {
 /// version-counter binding into the leaf hash (`compute_leaf_hash`), not the
 /// dataset-level counter.
 ///
-/// **Caveat (disclosed):** `compute_leaf_hash`'s version-bound formula is not
-/// yet wired into `clawhdf5-format`'s public `verify_chunk`/`verify_dataset`
-/// (see the `TODO(P2.4)` on `compute_leaf_hash` in
-/// `clawhdf5-filters/src/filter_pipeline.rs`), so this attack is exercised at
-/// the leaf-hash-formula level — the same recomputation a real verifier would
-/// perform — rather than through a `verify_*` wrapper that doesn't exist yet.
+/// **Documented limitation (harness-honesty red-team finding).** An earlier
+/// version of this attack asserted only `rolled_back_leaf != committed_leaf` —
+/// true for essentially any two distinct `(ciphertext, version)` inputs to any
+/// working hash function, regardless of whether any real detection mechanism
+/// exists. That assertion is a tautology, not a test of the system: it would
+/// pass identically even if `compute_leaf_hash` were never consulted by
+/// anything. The underlying fact is real and stays disclosed here —
+/// `compute_leaf_hash`'s version-bound formula is not yet wired into
+/// `clawhdf5-format`'s public `verify_chunk`/`verify_dataset` (see the
+/// `TODO(P2.4)` on `compute_leaf_hash` in
+/// `clawhdf5-filters/src/filter_pipeline.rs`) — but since no `verify_*` API
+/// actually checks this binding, a selective per-chunk rollback is genuinely
+/// undetected by anything in this workspace today, and this is now reported
+/// as such rather than credited via a check that can't fail.
 pub fn t4b_selective_chunk_rollback() -> AttackResult {
     let dek = clawhdf5_filters::mock_dek();
 
@@ -814,15 +872,17 @@ pub fn t4b_selective_chunk_rollback() -> AttackResult {
     let new_ciphertext = encrypt_chunk(&dek, 2, 2, new_plaintext).unwrap();
 
     // The committed tree's leaf binds (chunk_idx, ciphertext, version) for
-    // the CURRENT (version-2) state.
-    let committed_leaf = compute_leaf_hash(2, &new_ciphertext, 2);
+    // the CURRENT (version-2) state. Kept only so the CSV/log can show what a
+    // real verifier's committed value would have been; it is NOT compared
+    // against anything a caller would treat as a pass/fail signal below.
+    let _committed_leaf = compute_leaf_hash(2, &new_ciphertext, 2);
 
     let start_time = Instant::now();
     // Raw storage-level attack: roll chunk 2's on-disk ciphertext back to its
     // version-1 bytes, together with its version counter (both mutually
     // consistent, decrypt fine under the version-1 nonce — this isn't
     // garbage data, it's a stale-but-valid prior state).
-    let rolled_back_leaf = compute_leaf_hash(2, &old_ciphertext, 1);
+    let _rolled_back_leaf = compute_leaf_hash(2, &old_ciphertext, 1);
     let latency = start_time.elapsed();
 
     // Sanity: the rolled-back ciphertext really does decrypt under its own
@@ -832,14 +892,26 @@ pub fn t4b_selective_chunk_rollback() -> AttackResult {
         old_plaintext
     );
 
+    // No verify_* API in this workspace checks compute_leaf_hash's
+    // version binding today (see the doc comment above), so there is no real
+    // mechanism to route this attack through: genuinely undetected.
     AttackResult {
         threat_class: "T4",
         attack_id: "T4b",
         dataset: "n/a",
-        detected: rolled_back_leaf != committed_leaf,
-        verifier_fn: "compute_leaf_hash (leaf-hash recomputation)",
+        detected: false,
+        verifier_fn: "n/a (compute_leaf_hash not wired into any verify_* API)",
         latency,
-        root_cause: None,
+        root_cause: Some(
+            "compute_leaf_hash's version-bound formula (binding chunk_idx, ciphertext, and \
+             version into the leaf hash) is not consulted by clawhdf5-format's public \
+             verify_chunk/verify_dataset -- see the TODO(P2.4) on compute_leaf_hash in \
+             clawhdf5-filters/src/filter_pipeline.rs. A selective per-chunk rollback (restoring \
+             one chunk's ciphertext and version counter together to a prior, individually-valid \
+             state) is therefore genuinely undetected by any real verifier in this workspace \
+             today; a prior version of this attack incorrectly reported detected=yes based on a \
+             tautological hash-inequality check that didn't exercise any real mechanism.",
+        ),
     }
 }
 

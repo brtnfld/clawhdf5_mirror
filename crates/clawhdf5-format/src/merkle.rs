@@ -2510,13 +2510,21 @@ pub fn verify_chunk_with_pending<P: PendingChunks + ?Sized>(
 /// # Errors
 ///
 /// - [`MerkleError::HashMismatch`] if any chunk fails (includes `chunk_idx` of first failure)
+/// - [`MerkleError::CompanionTampered`] if every supplied chunk's leaf hash matches its stored
+///   leaf, but the leaves don't actually hash up to the attribute's root (P2.4 fix below —
+///   this is what catches a forged internal tree that a per-leaf scan alone cannot)
 /// - [`MerkleError::MissingChunkGridMetadata`] if Merkle metadata is absent
 pub fn verify_dataset(d: &Dataset<'_>) -> Result<bool, MerkleError> {
     if d.chunks.is_empty() {
         return Err(MerkleError::MissingChunkGridMetadata);
     }
 
-    // 1. Reconstruct stored tree once (used for both root and leaf comparison)
+    // 1. Reconstruct stored tree once (used for both root and leaf comparison).
+    // NOTE: `reconstruct_tree` only deserializes the flat `tree_nodes` byte
+    // array — it never re-derives an internal node from its children via
+    // `hash_pair`, so nothing below may treat `stored_tree`'s node VALUES
+    // (as opposed to its leaf_count/padded shape, which is just sizing
+    // metadata) as trustworthy on their own.
     let stored_tree = d.reconstruct_tree()?;
 
     // 2. Validate chunk count vs tree leaf count
@@ -2526,10 +2534,14 @@ pub fn verify_dataset(d: &Dataset<'_>) -> Result<bool, MerkleError> {
         return Err(MerkleError::MissingChunkGridMetadata);
     }
 
-    // 3. Compare each chunk's computed hash against stored leaf hash
-    // This finds mismatches without rebuilding from chunks.
+    // 3. Compare each chunk's computed hash against stored leaf hash. This is
+    // a diagnostic pass only (identifies the specific tampered chunk_idx for
+    // the common case: chunk bytes tampered, tree_nodes untouched) — it is
+    // NOT the security boundary, since a directed attacker who also patches
+    // the corresponding stored leaf entry would make this pass trivially.
     // For non-power-of-two chunk counts, trailing tree leaves contain the
     // null sentinel hash (H(0x02 || "null")), which won't match any real chunk.
+    let mut live_leaves = Vec::with_capacity(stored_tree.leaf_count());
     for (idx, chunk) in d.chunks.iter().enumerate() {
         let computed_hash = d.merkle_attr.algorithm.hash_leaf(chunk);
         if let Some(stored_hash) = stored_tree.leaf_hash(idx)
@@ -2537,14 +2549,37 @@ pub fn verify_dataset(d: &Dataset<'_>) -> Result<bool, MerkleError> {
         {
             return Err(MerkleError::HashMismatch { chunk_idx: idx });
         }
+        live_leaves.push(computed_hash);
     }
 
-    // 4. All leaf hashes match - verify root integrity
-    // (protects against internal node corruption in stored tree)
-    if constant_time_eq(stored_tree.root(), &d.merkle_attr.root) {
+    // 4. P2.4 fix (red-team finding): step 3 alone can be defeated by an
+    // attacker who patches BOTH a chunk's bytes and the corresponding leaf
+    // entry inside the on-disk `tree_nodes` blob, leaving `tree_nodes[0]`
+    // (the root) and `merkle_attr.root` untouched — step 3 then finds no
+    // discrepancy (the forged leaf matches the forged chunk), and comparing
+    // `stored_tree.root()` to `merkle_attr.root` only checks that two values
+    // read from that SAME untrusted blob agree with each other; it proves
+    // nothing about whether the leaves actually hash up to that root.
+    //
+    // Close this by rebuilding the tree FROM SCRATCH: pad the live,
+    // already-leaf-verified chunk hashes with the same null-sentinel scheme
+    // the write side uses (`MerkleTree::from_leaf_hashes`), chain them all the
+    // way to the root via genuine `hash_pair` calls, and compare THAT
+    // independently re-derived root against the attribute. This is what this
+    // function's doc comment has always claimed to do, and it no longer
+    // trusts `tree_nodes`' internal structure for anything.
+    let null_sentinel = d.merkle_attr.algorithm.null_sentinel();
+    for _ in d.chunks.len()..stored_tree.leaf_count() {
+        live_leaves.push(null_sentinel);
+    }
+    let rebuilt = MerkleTree::from_leaf_hashes(&live_leaves, d.merkle_attr.algorithm);
+
+    if constant_time_eq(rebuilt.root(), &d.merkle_attr.root) {
         Ok(true)
     } else {
-        // Stored tree root doesn't match attribute - tree data corrupted
+        // The live leaves genuinely don't hash up to the attribute's root —
+        // a forged/corrupted internal tree that step 3 alone couldn't localize
+        // to a specific chunk (every per-chunk leaf comparison passed).
         Err(MerkleError::CompanionTampered)
     }
 }
@@ -5012,5 +5047,93 @@ mod signed_root_tests {
             verify_signed_root(&view, VERSION + 1, TS, &verifier),
             Err(MerkleError::SignatureInvalid)
         ));
+    }
+}
+
+#[cfg(test)]
+mod directed_dataset_forgery_tests {
+    //! P2.4 red-team finding: `verify_dataset`'s doc comment claims it
+    //! "rebuilds the entire Merkle tree from scratch, and compares the
+    //! computed root to the stored root" -- the pre-fix implementation
+    //! instead deserialized the stored `tree_nodes` blob verbatim
+    //! (`reconstruct_tree` never re-derives an internal node from its
+    //! children via `hash_pair`) and only checked that a supplied chunk's
+    //! live leaf hash matched the SAME untrusted blob's leaf entry, plus that
+    //! two values read from that same blob (`tree_nodes[0]` and
+    //! `merkle_attr.root`) agreed with each other. Neither check actually
+    //! verified leaves hash up to the root.
+    //!
+    //! This directly enabled a "patch the leaf to match the tampered chunk,
+    //! leave the root untouched" bypass -- confirmed reachable through the
+    //! signed-dataset recovery gate (`merkle_recovery::verify_restored_dataset`,
+    //! which calls only `verify_dataset`, never `verify_root`/
+    //! `verify_signed_root`) when the companion nodes are read straight off
+    //! disk rather than rebuilt fresh (exactly clawhdf5-secure-demo's
+    //! `stage6_recovery` path).
+    use super::*;
+
+    fn build_honest(chunks: &[&[u8]]) -> (MerkleAttr, Vec<u8>) {
+        let tree = MerkleTree::from_chunks(chunks, HashAlg::Blake3);
+        let mut nodes = Vec::with_capacity(tree.nodes().len() * HASH_SIZE);
+        for n in tree.nodes() {
+            nodes.extend_from_slice(n);
+        }
+        let companion_hash = compute_sha256(&nodes);
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash);
+        (attr, nodes)
+    }
+
+    #[test]
+    fn directed_leaf_patch_with_untouched_root_is_now_detected() {
+        let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
+        let (attr, honest_nodes) = build_honest(&chunks);
+
+        // Sanity: the honest state verifies cleanly first.
+        let honest_view =
+            Dataset::from_owned(attr.clone(), honest_nodes.clone(), chunks.clone());
+        assert!(matches!(verify_dataset(&honest_view), Ok(true)));
+
+        // Directed attack: tamper chunk 1's bytes, AND patch tree_nodes'
+        // corresponding leaf entry to match the tampered chunk's hash --
+        // leaving tree_nodes[0] (the root) and merkle_attr.root untouched.
+        let victim = 1usize;
+        let mut tampered_chunk_owned = chunks[victim].to_vec();
+        tampered_chunk_owned[0] ^= 0xFF;
+        let mut tampered_chunks: Vec<&[u8]> = chunks.clone();
+        tampered_chunks[victim] = &tampered_chunk_owned;
+
+        let forged_leaf = HashAlg::Blake3.hash_leaf(&tampered_chunk_owned);
+        // Leaf layout: [root, internal.., leaves..] with 4 leaves -> 3
+        // internal nodes (indices 0..2), leaves at indices 3..6.
+        let internal_nodes = 3usize;
+        let mut forged_nodes = honest_nodes.clone();
+        let leaf_offset = (internal_nodes + victim) * HASH_SIZE;
+        forged_nodes[leaf_offset..leaf_offset + HASH_SIZE].copy_from_slice(&forged_leaf);
+
+        let forged_view = Dataset::from_owned(attr, forged_nodes, tampered_chunks);
+        let result = verify_dataset(&forged_view);
+
+        // Before the fix this returned Ok(true): the patched leaf matched the
+        // tampered chunk, and tree_nodes[0]/merkle_attr.root were untouched,
+        // so both of the old checks passed. The fix must catch it via the
+        // rebuilt-from-scratch root, which the forger cannot reproduce
+        // without breaking the hash function.
+        assert!(
+            result.is_err(),
+            "directed leaf-patch forgery must be detected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn honest_dataset_with_non_power_of_two_chunk_count_still_verifies() {
+        // Regression guard for the fix's null-sentinel repadding: an honest,
+        // untampered, non-power-of-two chunk count must still verify cleanly
+        // (this is the common case the original step-3 comment already called
+        // out -- make sure the fix's rebuild-from-live-leaves path doesn't
+        // break it).
+        let chunks: Vec<&[u8]> = vec![b"c0", b"c1", b"c2"]; // pads to 4
+        let (attr, nodes) = build_honest(&chunks);
+        let view = Dataset::from_owned(attr, nodes, chunks);
+        assert!(matches!(verify_dataset(&view), Ok(true)));
     }
 }
