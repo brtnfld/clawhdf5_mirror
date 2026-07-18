@@ -16,14 +16,16 @@
 //!   T1c (a valid-after-pipeline compressed-stream substitution) and T2b
 //!   (a burst error) are the harder, directed-adversary variants
 //!   §`sec:adversarial` explicitly calls for.
-//! - **Mechanism attacks** (T1d, T1e, T3, T4a, T4b, T5, T6b, T7, T8) target a
-//!   specific primitive (the companion-integrity self-check, the leaf/internal
-//!   hash domain separation, the provenance journal, the version counter, the
-//!   AEAD leaf formula, the null-sentinel padding) that isn't meaningfully
-//!   expressed in terms of "a chunk in the dataset," so each builds its own
-//!   minimal fixture. T1d is the directed companion-forgery variant of T1b,
-//!   reported undetected-by-design for unsigned data (same root cause as T6b);
-//!   T1e is the second-preimage / node-as-leaf domain-separation regression.
+//! - **Mechanism attacks** (T1d, T1e, T1f, T3, T4a, T4b, T5, T6b, T6c, T7, T8)
+//!   target a specific primitive (the companion-integrity self-check, the
+//!   leaf/internal hash domain separation, the signed-root binding, the
+//!   provenance journal, the version counter, the AEAD leaf formula, the
+//!   null-sentinel padding) that isn't meaningfully expressed in terms of "a
+//!   chunk in the dataset," so each builds its own minimal fixture. T1d/T6b are
+//!   the UNSIGNED directed forgery/downgrade attacks (undetected by design);
+//!   T1f/T6c are their SIGNED counterparts, detected via
+//!   `clawhdf5-format::verify_signed_root` (P2.4). T1e is the second-preimage /
+//!   node-as-leaf domain-separation regression.
 
 use std::time::Instant;
 
@@ -31,8 +33,8 @@ use sha2::{Digest, Sha256};
 
 use clawhdf5_filters::{compute_leaf_hash, encrypt_chunk};
 use clawhdf5_format::merkle::{
-    Dataset, HashAlg, MerkleAttr, MerkleError, MerkleTree, VersionObservationStore, verify_chunk,
-    verify_dataset, verify_root,
+    Dataset, HashAlg, MerkleAttr, MerkleError, MerkleTree, SignedRootVerifier,
+    VersionObservationStore, verify_chunk, verify_dataset, verify_root, verify_signed_root,
 };
 use clawhdf5_format::merkle_journal::{ProvenanceJournal, ProvenanceRecord};
 use clawhdf5_format::merkle_recovery::{
@@ -239,15 +241,15 @@ pub fn t1b_companion_node_tamper(ds: &HarnessDataset) -> AttackResult {
 /// `H(0x03 || root || alg_id)` integrity hash). None of that is bound to an
 /// unforgeable value, so an attacker with storage access who rebuilds the
 /// companion array and its hash together defeats it — the exact same root
-/// cause as T6b (algorithm downgrade). A **signed** dataset is protected:
-/// `clawhdf5_sign::canonical_payload` (P2.1, merged) already folds the
-/// `companion_hash` into the signed payload, so this rebuild would fail the
-/// signature check. That binding isn't wired into `clawhdf5-format`'s Merkle
-/// verification flow yet, so it can't be exercised end-to-end here — hence this
-/// is reported undetected rather than silently omitted. (Note this is the
-/// *format-primitive* limitation; the P2.4 Finding-1 agent wiring rehashes
-/// content from disk and never trusts stored companion nodes, so it is not
-/// affected.)
+/// cause as T6b (algorithm downgrade). A **signed** dataset is protected, and
+/// this attack is detected against it: `clawhdf5_sign::canonical_payload` folds
+/// the `companion_hash` into the signed payload, and `clawhdf5-format`'s
+/// `verify_signed_root` (P2.4) now checks that binding — see [`t1f_signed_companion_forgery`],
+/// the signed counterpart, which reports detected. This T1d stays undetected
+/// only because it exercises the UNSIGNED path (`verify_root` alone). (Note this
+/// is the *format-primitive* limitation; the P2.4 Finding-1 agent wiring
+/// rehashes content from disk and never trusts stored companion nodes, so it is
+/// not affected.)
 pub fn t1d_directed_companion_forgery() -> AttackResult {
     // Minimal own fixture (mechanism attack): a small unsigned chunk set.
     let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
@@ -286,10 +288,11 @@ pub fn t1d_directed_companion_forgery() -> AttackResult {
                  self-consistency (companion_hash == SHA-256(nodes)) and the attribute's own \
                  H(0x03 || root || alg_id) integrity hash, neither bound to an unforgeable \
                  value -- a full attacker rebuild of the companion array and its hash \
-                 reproduces both. Same root cause as T6b. A SIGNED dataset would be protected: \
-                 clawhdf5_sign::canonical_payload (P2.1, merged) folds companion_hash into the \
-                 signed payload; that binding isn't wired into clawhdf5-format's Merkle \
-                 verification flow yet (per Sec. merkle-storage, threat T6).",
+                 reproduces both. Same root cause as T6b. This is the UNSIGNED path (verify_root \
+                 alone). A SIGNED dataset IS protected and this attack is detected against it: \
+                 clawhdf5_sign::canonical_payload folds companion_hash into the signed payload, \
+                 and clawhdf5-format::verify_signed_root now checks that binding -- see T1f, the \
+                 signed counterpart of this attack, which reports detected=yes.",
             )
         } else {
             None
@@ -914,14 +917,15 @@ pub fn t5_post_quantum_forgery() -> AttackResult {
 /// the root attribute, companion nodes, and integrity hash to match —
 /// entirely self-consistent, with no forged bytes anywhere.
 ///
-/// **Documented limitation.** Nothing in this workspace binds the *original*
-/// algorithm choice into an unforgeable payload for unsigned data: the
-/// in-band `integrity` hash only proves internal self-consistency of
-/// whatever `(root, alg_id)` pair is currently on disk, and a full attacker
-/// rebuild trivially reproduces it. `resolve_response`'s fail-closed rule
-/// only helps *signed* datasets (P2.1). This is genuinely undetected for
-/// unsigned data with today's code, so it's reported as such rather than
-/// silently omitted.
+/// **Documented limitation (unsigned only).** Nothing binds the *original*
+/// algorithm choice into an unforgeable payload for unsigned data: the in-band
+/// `integrity` hash only proves internal self-consistency of whatever
+/// `(root, alg_id)` pair is on disk, and a full attacker rebuild reproduces it.
+/// A *signed* dataset IS protected, and this attack is detected against it —
+/// see [`t6c_signed_algorithm_downgrade`], which routes the same rebuild
+/// through `clawhdf5-format`'s `verify_signed_root` (P2.4) and is rejected on
+/// the `alg`-bound signature. This T6b stays undetected only for the unsigned
+/// path, so it's reported as such rather than silently omitted.
 pub fn t6b_algorithm_downgrade() -> AttackResult {
     let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
     let honest_tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
@@ -970,15 +974,151 @@ pub fn t6b_algorithm_downgrade() -> AttackResult {
             Some(
                 "By design for an UNSIGNED dataset: no signature is in force, so the in-band \
                  integrity hash only proves self-consistency, which a full attacker rebuild \
-                 trivially reproduces -- expected, not a gap. A SIGNED dataset would be \
-                 protected: clawhdf5_sign::canonical_payload (P2.1, merged) already binds \
-                 alg_id into the signed payload. That binding isn't wired into \
-                 clawhdf5-format's own Merkle verification flow, so this can't yet be \
-                 exercised end-to-end for a signed dataset (per Sec. merkle-storage, threat T6).",
+                 trivially reproduces -- expected, not a gap. This is the UNSIGNED path. A SIGNED \
+                 dataset IS protected and this attack is detected against it: \
+                 clawhdf5_sign::canonical_payload binds alg_id into the signed payload, and \
+                 clawhdf5-format::verify_signed_root now checks that binding -- see T6c, the \
+                 signed counterpart of this attack, which reports detected=yes.",
             )
         } else {
             None
         },
+    }
+}
+
+/// Injectable [`SignedRootVerifier`] backed by the real P2.1 hybrid signer
+/// (Ed25519 + ML-DSA-65). Holds one genuine signature and its public keys, and
+/// reports a root as authentic only if that signature validates over the
+/// canonical payload binding `(root, companion_hash, alg, version, timestamp)`.
+/// This is the injection point that wires `clawhdf5-sign` into
+/// `clawhdf5-format`'s `verify_signed_root` without a dependency cycle.
+struct HybridRootVerifier {
+    sig: clawhdf5_sign::HybridSignature,
+    ed_pub: clawhdf5_sign::VerifyingKey,
+    ml_pub: clawhdf5_sign::mldsa::MlDsaVerifyingKey,
+}
+
+impl SignedRootVerifier for HybridRootVerifier {
+    fn verify_signed_root(
+        &self,
+        root: &[u8; 32],
+        companion_hash: &[u8; 32],
+        alg: HashAlg,
+        version: u64,
+        timestamp: u64,
+    ) -> bool {
+        // clawhdf5-sign re-exports clawhdf5-format's HashAlg, so `alg` feeds
+        // canonical_payload directly — the payload binds every field.
+        let payload =
+            clawhdf5_sign::canonical_payload(root, companion_hash, version, timestamp, alg);
+        clawhdf5_sign::verify_sig(&payload, &self.sig, &self.ed_pub, &self.ml_pub).is_ok()
+    }
+}
+
+/// Sign the honest `(root, companion_hash, alg, version, timestamp)` with fresh
+/// hybrid keys and return a verifier bound to that signature. Shared by the
+/// signed-dataset attacks (T6c, T1f).
+fn sign_honest_root(attr: &MerkleAttr, version: u64, timestamp: u64) -> HybridRootVerifier {
+    use clawhdf5_sign::{SigningKey, canonical_payload, mldsa::MlDsaSigningKey, sign_root};
+    let ed_key = SigningKey::generate();
+    let ml_key = MlDsaSigningKey::generate();
+    let payload = canonical_payload(
+        &attr.root,
+        &attr.companion_hash,
+        version,
+        timestamp,
+        attr.algorithm,
+    );
+    let sig = sign_root(&payload, &ed_key, &ml_key).expect("honest signing succeeds");
+    HybridRootVerifier {
+        sig,
+        ed_pub: ed_key.verifying_key(),
+        ml_pub: ml_key.verifying_key(),
+    }
+}
+
+/// T6c — algorithm downgrade against a **signed** dataset: the signed
+/// counterpart to T6b, showing the gap T6b documents is closed once a
+/// signature is in force. A legitimate signer signs the honest BLAKE3 root;
+/// the attacker rebuilds a fully self-consistent tree under the weaker SHA-256,
+/// which passes `verify_root`'s self-consistency check — but cannot produce a
+/// signature over the downgraded payload. `verify_signed_root` binds `alg` into
+/// the checked payload, so the carried-over signature fails and it is detected.
+pub fn t6c_signed_algorithm_downgrade() -> AttackResult {
+    let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
+    let honest_tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
+    let mut honest_nodes = Vec::new();
+    for n in honest_tree.nodes() {
+        honest_nodes.extend_from_slice(n);
+    }
+    let honest_attr =
+        MerkleAttr::from_tree_with_companion(&honest_tree, companion_hash(&honest_nodes));
+
+    let version = 1u64;
+    let timestamp = 1_700_000_000u64;
+    let verifier = sign_honest_root(&honest_attr, version, timestamp);
+
+    let start_time = Instant::now();
+    // Attacker rebuilds the tree under SHA-256 (self-consistent, no forged bytes).
+    let downgraded_tree = MerkleTree::from_chunks(&chunks, HashAlg::Sha256);
+    let mut down_nodes = Vec::new();
+    for n in downgraded_tree.nodes() {
+        down_nodes.extend_from_slice(n);
+    }
+    let downgraded_attr =
+        MerkleAttr::from_tree_with_companion(&downgraded_tree, companion_hash(&down_nodes));
+    let view = Dataset::from_owned(downgraded_attr, down_nodes, chunks.clone());
+    let result = verify_signed_root(&view, version, timestamp, &verifier);
+    let latency = start_time.elapsed();
+
+    AttackResult {
+        threat_class: "T6",
+        attack_id: "T6c",
+        dataset: "n/a",
+        detected: matches!(result, Err(MerkleError::SignatureInvalid)),
+        verifier_fn: "verify_signed_root",
+        latency,
+        root_cause: None,
+    }
+}
+
+/// T1f — directed companion forgery against a **signed** dataset: the signed
+/// counterpart to T1d. The attacker flips a companion node and recomputes the
+/// companion hash so the attribute is self-consistent (defeats bare
+/// `verify_root`), but `verify_signed_root` binds `companion_hash` into the
+/// signed payload, so the honest signature no longer validates — detected.
+pub fn t1f_signed_companion_forgery() -> AttackResult {
+    let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
+    let honest_tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
+    let mut honest_nodes = Vec::new();
+    for n in honest_tree.nodes() {
+        honest_nodes.extend_from_slice(n);
+    }
+    let honest_attr =
+        MerkleAttr::from_tree_with_companion(&honest_tree, companion_hash(&honest_nodes));
+
+    let version = 1u64;
+    let timestamp = 1_700_000_000u64;
+    let verifier = sign_honest_root(&honest_attr, version, timestamp);
+
+    let start_time = Instant::now();
+    // Directed forgery: flip a companion node AND recompute the companion hash.
+    let mut tampered_nodes = honest_nodes.clone();
+    tampered_nodes[0] ^= 0xFF;
+    let forged_attr =
+        MerkleAttr::from_tree_with_companion(&honest_tree, companion_hash(&tampered_nodes));
+    let view = Dataset::from_owned(forged_attr, tampered_nodes, chunks.clone());
+    let result = verify_signed_root(&view, version, timestamp, &verifier);
+    let latency = start_time.elapsed();
+
+    AttackResult {
+        threat_class: "T1",
+        attack_id: "T1f",
+        dataset: "n/a",
+        detected: matches!(result, Err(MerkleError::SignatureInvalid)),
+        verifier_fn: "verify_signed_root",
+        latency,
+        root_cause: None,
     }
 }
 

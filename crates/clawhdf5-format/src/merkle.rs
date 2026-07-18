@@ -2330,6 +2330,72 @@ pub fn verify_root(d: &Dataset<'_>) -> Result<bool, MerkleError> {
     }
 }
 
+/// Verifier for a hybrid signature over the canonical root payload.
+///
+/// `clawhdf5-format` deliberately does not depend on `clawhdf5-sign` in
+/// production (that would be circular — `clawhdf5-sign` depends on this
+/// crate). Signature verification is therefore *injected*: a higher layer that
+/// can see both crates implements this trait using
+/// `clawhdf5_sign::canonical_payload` + `clawhdf5_sign::verify_sig`, capturing
+/// the signature and public keys it verifies against.
+///
+/// The implementation MUST return `true` only if it holds a signature that is
+/// valid, under trusted public keys, over the canonical payload binding
+/// **all** of `(root, companion_hash, alg, version, timestamp)` — i.e. exactly
+/// the tuple `verify_signed_root` passes in. Binding every field is what makes
+/// [`verify_signed_root`] catch attacks that mere self-consistency cannot:
+/// an algorithm downgrade (T6b) changes `alg`, a companion-tree forgery (T1d)
+/// changes `companion_hash`, and a rollback changes `version` — each produces a
+/// different payload the held signature cannot cover.
+pub trait SignedRootVerifier {
+    /// Return `true` iff a trusted signature validates over the canonical
+    /// payload binding these fields.
+    fn verify_signed_root(
+        &self,
+        root: &[u8; HASH_SIZE],
+        companion_hash: &[u8; HASH_SIZE],
+        alg: HashAlg,
+        version: u64,
+        timestamp: u64,
+    ) -> bool;
+}
+
+/// Verify a **signed** dataset's root (P2.4: the signature-bound counterpart to
+/// [`verify_root`]).
+///
+/// 1. Runs [`verify_root`]'s self-consistency check (companion integrity, or
+///    the attribute's own integrity hash).
+/// 2. Asks the injected `verifier` to confirm a trusted signature binds the
+///    on-disk `(root, companion_hash, alg, version, timestamp)`. If it does
+///    not, returns [`MerkleError::SignatureInvalid`].
+///
+/// For a signed dataset this closes the gaps [`verify_root`] alone cannot: an
+/// attacker with full storage access can rebuild a self-consistent tree under
+/// a weaker algorithm or with forged companion nodes, but cannot produce a
+/// signature over the altered payload without the private key.
+pub fn verify_signed_root<V: SignedRootVerifier + ?Sized>(
+    d: &Dataset<'_>,
+    version: u64,
+    timestamp: u64,
+    verifier: &V,
+) -> Result<bool, MerkleError> {
+    // Self-consistency first (cheap, and rejects obviously-broken state before
+    // the more expensive signature check).
+    verify_root(d)?;
+
+    if verifier.verify_signed_root(
+        &d.merkle_attr.root,
+        &d.merkle_attr.companion_hash,
+        d.merkle_attr.algorithm,
+        version,
+        timestamp,
+    ) {
+        Ok(true)
+    } else {
+        Err(MerkleError::SignatureInvalid)
+    }
+}
+
 /// Verify a single chunk against its Merkle proof (O(log N) check).
 ///
 /// Re-hashes the live chunk at index `idx`, reads the O(log N) sibling hashes
@@ -4804,5 +4870,147 @@ mod tests {
             Err(MerkleError::NoncePending)
         ));
         assert!(verify_chunk_with_pending(&dataset, 4, pending).is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod signed_root_tests {
+    //! End-to-end tests for `verify_signed_root` against the real P2.1 hybrid
+    //! signer (Ed25519 + ML-DSA-65), proving a signature over the canonical
+    //! payload closes the self-consistency gaps `verify_root` alone leaves open
+    //! (algorithm downgrade / companion forgery on unsigned data).
+    use super::*;
+    use clawhdf5_sign::{
+        HashAlg as SignAlg, HybridSignature, SigningKey, VerifyingKey, canonical_payload,
+        mldsa::{MlDsaSigningKey, MlDsaVerifyingKey},
+        sign_root, verify_sig,
+    };
+    use sha2::{Digest, Sha256};
+
+    // In a lib-test that dev-depends on clawhdf5-sign (which depends back on
+    // clawhdf5-format), the crate-under-test and the copy clawhdf5-sign links
+    // are two distinct instances, so `super::HashAlg` and `clawhdf5_sign`'s
+    // re-exported `HashAlg` are different types. Map by algorithm id to bridge
+    // them for the canonical-payload call (the harness, a separate crate, has a
+    // single instance and needs no such mapping).
+    fn to_sign_alg(a: HashAlg) -> SignAlg {
+        match a {
+            HashAlg::Sha256 => SignAlg::Sha256,
+            HashAlg::Blake3 => SignAlg::Blake3,
+            HashAlg::K12 => SignAlg::K12,
+        }
+    }
+
+    struct RealVerifier {
+        sig: HybridSignature,
+        ed_pub: VerifyingKey,
+        ml_pub: MlDsaVerifyingKey,
+    }
+    impl SignedRootVerifier for RealVerifier {
+        fn verify_signed_root(
+            &self,
+            root: &[u8; HASH_SIZE],
+            companion_hash: &[u8; HASH_SIZE],
+            alg: HashAlg,
+            version: u64,
+            timestamp: u64,
+        ) -> bool {
+            let payload = canonical_payload(root, companion_hash, version, timestamp, to_sign_alg(alg));
+            verify_sig(&payload, &self.sig, &self.ed_pub, &self.ml_pub).is_ok()
+        }
+    }
+
+    fn companion_of(nodes: &[u8]) -> [u8; HASH_SIZE] {
+        Sha256::digest(nodes).into()
+    }
+
+    fn nodes_bytes(tree: &MerkleTree) -> Vec<u8> {
+        let mut v = Vec::new();
+        for n in tree.nodes() {
+            v.extend_from_slice(n);
+        }
+        v
+    }
+
+    const VERSION: u64 = 1;
+    const TS: u64 = 1_700_000_000;
+
+    fn honest_state() -> (MerkleAttr, Vec<u8>, Vec<&'static [u8]>, RealVerifier) {
+        let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
+        let tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
+        let nodes = nodes_bytes(&tree);
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_of(&nodes));
+
+        let ed = SigningKey::generate();
+        let ml = MlDsaSigningKey::generate();
+        let payload = canonical_payload(
+            &attr.root,
+            &attr.companion_hash,
+            VERSION,
+            TS,
+            to_sign_alg(attr.algorithm),
+        );
+        let sig = sign_root(&payload, &ed, &ml).unwrap();
+        let verifier = RealVerifier {
+            sig,
+            ed_pub: ed.verifying_key(),
+            ml_pub: ml.verifying_key(),
+        };
+        (attr, nodes, chunks, verifier)
+    }
+
+    #[test]
+    fn honest_signed_root_verifies() {
+        let (attr, nodes, chunks, verifier) = honest_state();
+        let view = Dataset::from_owned(attr, nodes, chunks);
+        assert!(matches!(
+            verify_signed_root(&view, VERSION, TS, &verifier),
+            Ok(true)
+        ));
+    }
+
+    #[test]
+    fn signed_algorithm_downgrade_is_rejected() {
+        let (_, _, chunks, verifier) = honest_state();
+        // Attacker rebuilds a self-consistent tree under the weaker SHA-256.
+        let tree = MerkleTree::from_chunks(&chunks, HashAlg::Sha256);
+        let nodes = nodes_bytes(&tree);
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_of(&nodes));
+        let view = Dataset::from_owned(attr, nodes, chunks);
+        assert!(matches!(
+            verify_signed_root(&view, VERSION, TS, &verifier),
+            Err(MerkleError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn signed_companion_forgery_is_rejected() {
+        let (attr, mut nodes, chunks, verifier) = honest_state();
+        // Directed forgery: flip a companion node and recompute the companion
+        // hash so the attribute is self-consistent (defeats verify_root alone).
+        nodes[0] ^= 0xFF;
+        let forged = MerkleAttr {
+            companion_hash: companion_of(&nodes),
+            ..attr
+        };
+        let view = Dataset::from_owned(forged, nodes, chunks);
+        // Self-consistent, so verify_root passes; the signature binding fails.
+        assert!(matches!(verify_root(&view), Ok(true)));
+        assert!(matches!(
+            verify_signed_root(&view, VERSION, TS, &verifier),
+            Err(MerkleError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn rollback_version_is_rejected() {
+        // A signature bound to VERSION must not validate when replayed at a
+        // different version — the version-counter binding in the payload.
+        let (attr, nodes, chunks, verifier) = honest_state();
+        let view = Dataset::from_owned(attr, nodes, chunks);
+        assert!(matches!(
+            verify_signed_root(&view, VERSION + 1, TS, &verifier),
+            Err(MerkleError::SignatureInvalid)
+        ));
     }
 }

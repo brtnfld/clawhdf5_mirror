@@ -27,10 +27,10 @@
 //!
 //! Writes `attack-results/matrix.csv` (relative to the crate root), the P2.4
 //! artifact: `threat_class, attack_id, dataset, detected, verifier_fn,
-//! latency_ms, root_cause`. The mechanism attacks (T1d, T1e, T3, T4a, T4b, T5,
-//! T6b, T7, T8) target a specific primitive rather than "a chunk in a dataset"
-//! (see `attacks.rs`'s module doc) and so run once, independent of dataset,
-//! reported with `dataset = n/a`.
+//! latency_ms, root_cause`. The mechanism attacks (T1d, T1e, T1f, T3, T4a, T4b,
+//! T5, T6b, T6c, T7, T8) target a specific primitive rather than "a chunk in a
+//! dataset" (see `attacks.rs`'s module doc) and so run once, independent of
+//! dataset, reported with `dataset = n/a`.
 
 mod attacks;
 mod fixture;
@@ -210,11 +210,13 @@ fn main() {
     // dataset -- see the module doc above).
     results.push(attacks::t1d_directed_companion_forgery());
     results.push(attacks::t1e_second_preimage_node_as_leaf());
+    results.push(attacks::t1f_signed_companion_forgery());
     results.push(attacks::t3_provenance_forgery());
     results.push(attacks::t4a_whole_file_rollback());
     results.push(attacks::t4b_selective_chunk_rollback());
     results.push(attacks::t5_post_quantum_forgery());
     results.push(attacks::t6b_algorithm_downgrade());
+    results.push(attacks::t6c_signed_algorithm_downgrade());
     results.push(attacks::t7_verification_dos());
     results.push(attacks::t8_structural_leakage());
 
