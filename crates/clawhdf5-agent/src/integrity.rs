@@ -8,27 +8,42 @@
 //! verified one, so a tampered on-disk memory file was accepted unconditionally.
 //!
 //! This module closes that gap. On write we compute a Merkle root over the
-//! logical memory content and store the packed [`MerkleAttr`] as a hex-encoded
-//! `_merkle_root` attribute in `/meta`. On read we re-hash the content loaded
-//! from disk and compare. A mismatch (or a corrupted attribute) is a
-//! fail-closed [`MemoryError::Integrity`].
+//! logical persisted content and store the packed [`MerkleAttr`] as a
+//! hex-encoded `_merkle_root` attribute in `/meta`. On read we re-hash the
+//! content loaded from disk and compare. A mismatch (or a corrupted attribute)
+//! is a fail-closed [`MemoryError::Integrity`].
 //!
-//! **Scope.** The root covers the round-trip-stable memory fields (`chunks`,
-//! `embeddings`, `source_channels`, `timestamps`, `session_ids`, `tags`,
-//! `tombstones`) — the payload an attacker would tamper to alter what the agent
-//! recalls. Derived fields recomputed on read (`norms`, `activation_weights`)
-//! are deliberately excluded so an honest round-trip never spuriously fails.
-//! This is unsigned integrity: it detects tampering/corruption of an existing
-//! file, not an attacker who rebuilds the whole file (root included) from
-//! scratch — that requires the P2.1 hybrid signature, still unwired here.
-//! Files with no `_merkle_root` attribute (older writers, or `integrity`
-//! disabled) load unverified for backward compatibility.
+//! **Coverage.** The root spans every field that survives the write→read
+//! round-trip across all three persisted groups:
+//! - `/memory`: chunks, embeddings, source channels, timestamps, session ids,
+//!   tags, tombstones.
+//! - `/sessions`: id, start/end index, channel, timestamp, summary.
+//! - `/knowledge_graph`: entity (id, name, type, embedding index), relation
+//!   (src, tgt, type, weight, ts), and aliases (string, entity id).
+//!
+//! Fields the loader reconstructs as defaults rather than reading back (entity
+//! `properties`/`embedding`/`created_at`/`updated_at`, relation `metadata`) and
+//! fields recomputed on read (`norms`, `activation_weights`) are deliberately
+//! excluded — hashing them would make an honest round-trip fail, since the
+//! bytes on read differ from the bytes on write. Each leaf carries a section
+//! tag byte so content can't be moved between sections undetected.
+//!
+//! **Threat model.** This is *unsigned* integrity: it detects tampering or
+//! corruption of an existing file, not an attacker who rebuilds the whole file
+//! (root included) from scratch — that requires the P2.1 hybrid signature,
+//! still unwired here. Two policies are offered for the missing-attribute case:
+//! [`verify_content`] fails *open* when there is no `_merkle_root` (older
+//! writers, or `integrity` disabled), for backward compatibility; strict
+//! callers (see `schema::validate_and_load_strict`) reject a file that carries
+//! no root, closing the strip-to-downgrade attack.
 
 use clawhdf5_format::merkle::{Dataset, HashAlg, MerkleAttr, MerkleError, MerkleTree, verify_dataset};
 use sha2::{Digest, Sha256};
 
 use crate::MemoryError;
 use crate::cache::MemoryCache;
+use crate::knowledge::KnowledgeCache;
+use crate::session::SessionCache;
 
 /// The `/meta` attribute name holding the hex-encoded packed [`MerkleAttr`].
 pub const MERKLE_ROOT_ATTR: &str = "_merkle_root";
@@ -36,6 +51,14 @@ pub const MERKLE_ROOT_ATTR: &str = "_merkle_root";
 /// Hash algorithm for the content Merkle tree. Blake3 matches the harness and
 /// the rest of the P2.x Merkle work.
 const ALG: HashAlg = HashAlg::Blake3;
+
+// Per-section leaf tags: content can never be reinterpreted across sections
+// because the first byte of every leaf commits to which section it belongs to.
+const TAG_MEMORY: u8 = b'M';
+const TAG_SESSION: u8 = b'S';
+const TAG_ENTITY: u8 = b'E';
+const TAG_RELATION: u8 = b'R';
+const TAG_ALIAS: u8 = b'A';
 
 /// SHA-256 over the packed companion-node array, matching the harness's
 /// `companion_hash` helper so the stored attribute is a genuine
@@ -51,52 +74,97 @@ fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
-/// Canonical per-entry leaf bytes. One leaf per memory entry, so the tree maps
-/// onto the natural "chunk = one memory record" boundary and supports
-/// per-entry verification later. Length-prefixing every variable field makes
-/// the encoding unambiguous (no field boundary can be shifted without changing
-/// the bytes). Returns `None` when there is nothing to protect (empty store).
-fn content_leaves(cache: &MemoryCache) -> Option<Vec<Vec<u8>>> {
-    let n = cache.chunks.len();
-    if n == 0 {
-        return None;
-    }
-    // Every parallel field must line up with `chunks`; if a caller ever hands
-    // us a ragged cache, refuse rather than hash a misaligned view.
-    if cache.embeddings.len() != n
-        || cache.source_channels.len() != n
-        || cache.timestamps.len() != n
-        || cache.session_ids.len() != n
-        || cache.tags.len() != n
-        || cache.tombstones.len() != n
-    {
-        return None;
-    }
+/// Canonical leaf bytes for every persisted record across the three groups, in
+/// a fixed order (memory, sessions, entities, relations, aliases). Each leaf is
+/// self-delimiting (length-prefixed variable fields) and section-tagged.
+/// Returns `None` when there is nothing to protect (all sections empty).
+fn all_leaves(
+    memory: &MemoryCache,
+    sessions: &SessionCache,
+    knowledge: &KnowledgeCache,
+) -> Option<Vec<Vec<u8>>> {
+    let mut leaves: Vec<Vec<u8>> = Vec::new();
 
-    let mut leaves = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut buf = Vec::new();
-        push_len_prefixed(&mut buf, cache.chunks[i].as_bytes());
-        // Embedding: raw f32 little-endian, length-prefixed by element count so
-        // dimension changes are part of the hash.
-        buf.extend_from_slice(&(cache.embeddings[i].len() as u64).to_le_bytes());
-        for &v in &cache.embeddings[i] {
+    // --- /memory ---
+    for i in 0..memory.chunks.len() {
+        let mut buf = vec![TAG_MEMORY];
+        push_len_prefixed(&mut buf, memory.chunks[i].as_bytes());
+        let emb = memory.embeddings.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        buf.extend_from_slice(&(emb.len() as u64).to_le_bytes());
+        for &v in emb {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        push_len_prefixed(&mut buf, cache.source_channels[i].as_bytes());
-        buf.extend_from_slice(&cache.timestamps[i].to_le_bytes());
-        push_len_prefixed(&mut buf, cache.session_ids[i].as_bytes());
-        push_len_prefixed(&mut buf, cache.tags[i].as_bytes());
-        buf.push(cache.tombstones[i]);
+        push_len_prefixed(
+            &mut buf,
+            memory.source_channels.get(i).map_or(b"".as_slice(), |s| s.as_bytes()),
+        );
+        buf.extend_from_slice(&memory.timestamps.get(i).copied().unwrap_or(0.0).to_le_bytes());
+        push_len_prefixed(
+            &mut buf,
+            memory.session_ids.get(i).map_or(b"".as_slice(), |s| s.as_bytes()),
+        );
+        push_len_prefixed(&mut buf, memory.tags.get(i).map_or(b"".as_slice(), |s| s.as_bytes()));
+        buf.push(memory.tombstones.get(i).copied().unwrap_or(0));
         leaves.push(buf);
     }
-    Some(leaves)
+
+    // --- /sessions ---
+    for (i, e) in sessions.entries.iter().enumerate() {
+        let mut buf = vec![TAG_SESSION];
+        push_len_prefixed(&mut buf, e.id.as_bytes());
+        buf.extend_from_slice(&e.start_idx.to_le_bytes());
+        buf.extend_from_slice(&e.end_idx.to_le_bytes());
+        push_len_prefixed(&mut buf, e.channel.as_bytes());
+        buf.extend_from_slice(&e.ts.to_le_bytes());
+        push_len_prefixed(
+            &mut buf,
+            sessions.summaries.get(i).map_or(b"".as_slice(), |s| s.as_bytes()),
+        );
+        leaves.push(buf);
+    }
+
+    // --- /knowledge_graph: entities ---
+    for ent in &knowledge.entities {
+        let mut buf = vec![TAG_ENTITY];
+        buf.extend_from_slice(&ent.id.to_le_bytes());
+        push_len_prefixed(&mut buf, ent.name.as_bytes());
+        push_len_prefixed(&mut buf, ent.entity_type.as_bytes());
+        buf.extend_from_slice(&ent.embedding_idx.to_le_bytes());
+        leaves.push(buf);
+    }
+
+    // --- /knowledge_graph: relations ---
+    for rel in &knowledge.relations {
+        let mut buf = vec![TAG_RELATION];
+        buf.extend_from_slice(&rel.src.to_le_bytes());
+        buf.extend_from_slice(&rel.tgt.to_le_bytes());
+        push_len_prefixed(&mut buf, rel.relation.as_bytes());
+        buf.extend_from_slice(&rel.weight.to_le_bytes());
+        buf.extend_from_slice(&rel.ts.to_le_bytes());
+        leaves.push(buf);
+    }
+
+    // --- /knowledge_graph: aliases ---
+    for i in 0..knowledge.alias_strings.len() {
+        let mut buf = vec![TAG_ALIAS];
+        push_len_prefixed(&mut buf, knowledge.alias_strings[i].as_bytes());
+        buf.extend_from_slice(
+            &knowledge.alias_entity_ids.get(i).copied().unwrap_or(0).to_le_bytes(),
+        );
+        leaves.push(buf);
+    }
+
+    if leaves.is_empty() { None } else { Some(leaves) }
 }
 
-/// Build the Merkle tree + packed companion attribute over a cache's content.
-/// Returns `None` for an empty/ragged cache (no attribute is written then).
-fn build_attr(cache: &MemoryCache) -> Option<(MerkleAttr, MerkleTree)> {
-    let leaves = content_leaves(cache)?;
+/// Build the Merkle tree + packed companion attribute over all persisted
+/// content. Returns `None` for an empty store (no attribute is written then).
+fn build_attr(
+    memory: &MemoryCache,
+    sessions: &SessionCache,
+    knowledge: &KnowledgeCache,
+) -> Option<(MerkleAttr, MerkleTree, Vec<Vec<u8>>)> {
+    let leaves = all_leaves(memory, sessions, knowledge)?;
     let refs: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
     let tree = MerkleTree::from_chunks(&refs, ALG);
     let mut nodes = Vec::with_capacity(tree.nodes().len() * 32);
@@ -104,24 +172,45 @@ fn build_attr(cache: &MemoryCache) -> Option<(MerkleAttr, MerkleTree)> {
         nodes.extend_from_slice(node);
     }
     let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash(&nodes));
-    Some((attr, tree))
+    Some((attr, tree, leaves))
 }
 
 /// Compute the `_merkle_root` attribute value (hex-encoded packed
-/// [`MerkleAttr`]) for a cache's current content, or `None` when there's
+/// [`MerkleAttr`]) for the current persisted content, or `None` when there's
 /// nothing to protect.
-pub fn content_root_hex(cache: &MemoryCache) -> Option<String> {
-    let (attr, _) = build_attr(cache)?;
+pub fn content_root_hex(
+    memory: &MemoryCache,
+    sessions: &SessionCache,
+    knowledge: &KnowledgeCache,
+) -> Option<String> {
+    let (attr, _, _) = build_attr(memory, sessions, knowledge)?;
     Some(hex_encode(&attr.pack()))
 }
 
-/// Re-hash `cache` (freshly loaded from disk) and verify it against the stored
-/// hex-encoded `_merkle_root` attribute.
+/// Re-hash the content freshly loaded from disk and verify it against the
+/// stored `_merkle_root` attribute.
 ///
-/// Fail-closed: any decode failure, corrupted attribute, or root mismatch is a
-/// [`MemoryError::Integrity`]. Verifies via `verify_dataset` (a full O(N)
-/// rehash), the same path the harness's T2 attacks exercise.
-pub fn verify_content(cache: &MemoryCache, stored_hex: &str) -> Result<(), MemoryError> {
+/// `stored_hex` is `None` when the file carries no `_merkle_root`. When
+/// `strict` is false (default), that is accepted (older writers / feature off).
+/// When `strict` is true, a missing attribute is itself rejected, closing the
+/// strip-to-downgrade attack. A present-but-mismatched or corrupt attribute is
+/// always rejected.
+pub fn verify_content(
+    memory: &MemoryCache,
+    sessions: &SessionCache,
+    knowledge: &KnowledgeCache,
+    stored_hex: Option<&str>,
+    strict: bool,
+) -> Result<(), MemoryError> {
+    let Some(stored_hex) = stored_hex else {
+        if strict {
+            return Err(MemoryError::Integrity(format!(
+                "strict mode: file has no {MERKLE_ROOT_ATTR} attribute (unprotected or stripped)"
+            )));
+        }
+        return Ok(());
+    };
+
     let packed = hex_decode(stored_hex)
         .ok_or_else(|| MemoryError::Integrity(format!("{MERKLE_ROOT_ATTR} is not valid hex")))?;
     // Unpack self-checks the attribute's own integrity hash, catching a zeroed
@@ -129,21 +218,18 @@ pub fn verify_content(cache: &MemoryCache, stored_hex: &str) -> Result<(), Memor
     let attr = MerkleAttr::unpack(&packed)
         .map_err(|e| MemoryError::Integrity(format!("{MERKLE_ROOT_ATTR} is corrupt: {e:?}")))?;
 
-    let Some((_, tree)) = build_attr(cache) else {
-        // Attribute present but the loaded content is empty/ragged: the file
-        // claimed protected content that isn't there.
+    let Some((_, tree, leaves)) = build_attr(memory, sessions, knowledge) else {
+        // Attribute present but the loaded content is empty: the file claimed
+        // protected content that isn't there.
         return Err(MemoryError::Integrity(
-            "content is empty or ragged but a _merkle_root attribute is present".into(),
+            "content is empty but a _merkle_root attribute is present".into(),
         ));
     };
 
-    // Rebuild the companion node array from the freshly-hashed content and
-    // verify the full dataset against the stored attribute.
     let mut nodes = Vec::with_capacity(tree.nodes().len() * 32);
     for node in tree.nodes() {
         nodes.extend_from_slice(node);
     }
-    let leaves = content_leaves(cache).unwrap_or_default();
     let leaf_refs: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
     let view = Dataset::from_owned(attr, nodes, leaf_refs);
     match verify_dataset(&view) {
@@ -152,7 +238,7 @@ pub fn verify_content(cache: &MemoryCache, stored_hex: &str) -> Result<(), Memor
             "content Merkle verification returned false".into(),
         )),
         Err(MerkleError::HashMismatch { chunk_idx }) => Err(MemoryError::Integrity(format!(
-            "content tampering detected: memory entry {chunk_idx} does not match its stored Merkle leaf"
+            "content tampering detected: persisted record {chunk_idx} does not match its stored Merkle leaf"
         ))),
         Err(e) => Err(MemoryError::Integrity(format!(
             "content Merkle verification failed: {e:?}"
@@ -186,58 +272,107 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge::{Entity, Relation};
+    use crate::session::SessionEntry;
 
-    fn sample_cache() -> MemoryCache {
-        let mut c = MemoryCache::new(3);
-        c.chunks = vec!["first memory".into(), "second memory".into()];
-        c.embeddings = vec![vec![0.1, 0.2, 0.3], vec![-1.0, 0.5, 2.5]];
-        c.source_channels = vec!["slack".into(), "email".into()];
-        c.timestamps = vec![100.0, 200.0];
-        c.session_ids = vec!["s1".into(), "s2".into()];
-        c.tags = vec!["a".into(), "b".into()];
-        c.tombstones = vec![0, 0];
-        c
+    fn sample() -> (MemoryCache, SessionCache, KnowledgeCache) {
+        let mut m = MemoryCache::new(3);
+        m.chunks = vec!["first memory".into(), "second memory".into()];
+        m.embeddings = vec![vec![0.1, 0.2, 0.3], vec![-1.0, 0.5, 2.5]];
+        m.source_channels = vec!["slack".into(), "email".into()];
+        m.timestamps = vec![100.0, 200.0];
+        m.session_ids = vec!["s1".into(), "s2".into()];
+        m.tags = vec!["a".into(), "b".into()];
+        m.tombstones = vec![0, 0];
+
+        let mut s = SessionCache::new();
+        s.entries.push(SessionEntry {
+            id: "sess-1".into(),
+            start_idx: 0,
+            end_idx: 2,
+            channel: "slack".into(),
+            ts: 100.0,
+        });
+        s.summaries.push("a chat about hashing".into());
+
+        let mut k = KnowledgeCache::new();
+        k.entities.push(Entity {
+            id: 7,
+            name: "Merkle".into(),
+            entity_type: "concept".into(),
+            embedding_idx: -1,
+            ..Default::default()
+        });
+        k.relations.push(Relation {
+            src: 7,
+            tgt: 8,
+            relation: "relates_to".into(),
+            weight: 0.9,
+            ts: 100.0,
+            ..Default::default()
+        });
+        k.alias_strings = vec!["merkle-tree".into()];
+        k.alias_entity_ids = vec![7];
+        (m, s, k)
     }
 
     #[test]
     fn honest_roundtrip_verifies() {
-        let c = sample_cache();
-        let hex = content_root_hex(&c).expect("non-empty cache produces a root");
-        // A cache reconstructed with identical content must verify.
-        let c2 = sample_cache();
-        verify_content(&c2, &hex).expect("honest round-trip must verify");
+        let (m, s, k) = sample();
+        let hex = content_root_hex(&m, &s, &k).expect("non-empty store produces a root");
+        let (m2, s2, k2) = sample();
+        verify_content(&m2, &s2, &k2, Some(&hex), false).expect("honest round-trip must verify");
+        verify_content(&m2, &s2, &k2, Some(&hex), true).expect("strict honest round-trip verifies");
     }
 
     #[test]
-    fn tampered_chunk_is_detected() {
-        let c = sample_cache();
-        let hex = content_root_hex(&c).unwrap();
-        let mut tampered = sample_cache();
-        tampered.chunks[1] = "second memory (forged)".into();
-        let err = verify_content(&tampered, &hex).expect_err("tamper must be detected");
-        matches!(err, MemoryError::Integrity(_));
+    fn tampered_memory_is_detected() {
+        let (m, s, k) = sample();
+        let hex = content_root_hex(&m, &s, &k).unwrap();
+        let (mut m2, s2, k2) = sample();
+        m2.chunks[1] = "second memory (forged)".into();
+        verify_content(&m2, &s2, &k2, Some(&hex), false).expect_err("memory tamper detected");
     }
 
     #[test]
-    fn tampered_embedding_is_detected() {
-        let c = sample_cache();
-        let hex = content_root_hex(&c).unwrap();
-        let mut tampered = sample_cache();
-        tampered.embeddings[0][0] = 9.9;
-        verify_content(&tampered, &hex).expect_err("embedding tamper must be detected");
+    fn tampered_session_summary_is_detected() {
+        let (m, s, k) = sample();
+        let hex = content_root_hex(&m, &s, &k).unwrap();
+        let (m2, mut s2, k2) = sample();
+        s2.summaries[0] = "a chat about NOTHING".into();
+        verify_content(&m2, &s2, &k2, Some(&hex), false).expect_err("session tamper detected");
+    }
+
+    #[test]
+    fn tampered_knowledge_relation_is_detected() {
+        let (m, s, k) = sample();
+        let hex = content_root_hex(&m, &s, &k).unwrap();
+        let (m2, s2, mut k2) = sample();
+        k2.relations[0].tgt = 999; // re-point an edge
+        verify_content(&m2, &s2, &k2, Some(&hex), false).expect_err("knowledge tamper detected");
+    }
+
+    #[test]
+    fn strict_mode_rejects_missing_attribute() {
+        let (m, s, k) = sample();
+        // Non-strict accepts a missing attribute (legacy); strict rejects it.
+        verify_content(&m, &s, &k, None, false).expect("non-strict tolerates missing attr");
+        verify_content(&m, &s, &k, None, true).expect_err("strict rejects missing attr");
     }
 
     #[test]
     fn corrupt_attribute_is_detected() {
-        let c = sample_cache();
-        verify_content(&c, "not-hex!!").expect_err("bad hex must fail closed");
+        let (m, s, k) = sample();
+        verify_content(&m, &s, &k, Some("not-hex!!"), false).expect_err("bad hex fails closed");
         let zeroed = "00".repeat(129);
-        verify_content(&c, &zeroed).expect_err("zeroed attribute must fail closed");
+        verify_content(&m, &s, &k, Some(&zeroed), false).expect_err("zeroed attr fails closed");
     }
 
     #[test]
-    fn empty_cache_has_no_root() {
-        let c = MemoryCache::new(3);
-        assert!(content_root_hex(&c).is_none());
+    fn empty_store_has_no_root() {
+        let m = MemoryCache::new(3);
+        let s = SessionCache::new();
+        let k = KnowledgeCache::new();
+        assert!(content_root_hex(&m, &s, &k).is_none());
     }
 }

@@ -42,6 +42,22 @@ pub fn write_to_disk(
 pub fn read_from_disk(
     path: &Path,
 ) -> Result<(MemoryConfig, MemoryCache, SessionCache, KnowledgeCache), MemoryError> {
+    read_from_disk_inner(path, false)
+}
+
+/// Like [`read_from_disk`], but fail-closed when the file carries no content
+/// Merkle root (P2.4 Finding 1 strict mode). Rejects a file whose
+/// `_merkle_root` attribute was stripped to force an unverified load.
+pub fn read_from_disk_strict(
+    path: &Path,
+) -> Result<(MemoryConfig, MemoryCache, SessionCache, KnowledgeCache), MemoryError> {
+    read_from_disk_inner(path, true)
+}
+
+fn read_from_disk_inner(
+    path: &Path,
+    strict: bool,
+) -> Result<(MemoryConfig, MemoryCache, SessionCache, KnowledgeCache), MemoryError> {
     let mmap = clawhdf5_io::MmapReader::open(path).map_err(MemoryError::Io)?;
 
     // Advise the OS we'll need the whole file for parsing
@@ -51,7 +67,11 @@ pub fn read_from_disk(
     let file = clawhdf5::File::from_bytes(mmap.as_bytes().to_vec())
         .map_err(|e| MemoryError::Hdf5(format!("cannot open {}: {e}", path.display())))?;
 
-    let (mut config, cache, sessions, knowledge) = schema::validate_and_load(&file)?;
+    let (mut config, cache, sessions, knowledge) = if strict {
+        schema::validate_and_load_strict(&file)?
+    } else {
+        schema::validate_and_load(&file)?
+    };
     config.path = path.to_path_buf();
 
     Ok((config, cache, sessions, knowledge))

@@ -94,3 +94,37 @@ fn tampered_content_fails_closed_on_reopen() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn strict_open_rejects_stripped_root() {
+    let path = unique_path("stripped");
+    seed(&path);
+
+    // Strip the `_merkle_root` attribute value in place: overwrite the hex
+    // string bytes with '0's (same length, so the file stays structurally
+    // valid) — an attacker downgrading to force an unverified load. The zeroed
+    // hex still decodes but the packed attribute's own integrity self-check
+    // fails, and a wholesale-absent attribute is caught by strict mode.
+    let mut bytes = std::fs::read(&path).expect("read raw");
+    // Find the stored hex value: it follows the attribute name. Rather than
+    // parse HDF5, just corrupt the first long hex run after the attr name.
+    let name = b"_merkle_root";
+    let name_pos = bytes
+        .windows(name.len())
+        .position(|w| w == name)
+        .expect("_merkle_root present");
+    // Zero a span well past the name to hit the value payload.
+    for b in bytes.iter_mut().skip(name_pos + name.len()).take(64) {
+        if b.is_ascii_hexdigit() {
+            *b = b'0';
+        }
+    }
+    std::fs::write(&path, &bytes).expect("write");
+
+    // Strict open must reject; the corrupted/zeroed root can't verify.
+    assert!(
+        matches!(HDF5Memory::open_strict(&path), Err(MemoryError::Integrity(_))),
+        "strict open must reject a downgraded/stripped root"
+    );
+    let _ = std::fs::remove_file(&path);
+}

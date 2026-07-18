@@ -282,8 +282,28 @@ impl HDF5Memory {
     }
 
     /// Open an existing HDF5 memory file.
+    ///
+    /// Non-strict: a file with no content Merkle root loads unverified (older
+    /// writers / `integrity` disabled). Use [`HDF5Memory::open_strict`] to
+    /// require integrity protection.
     pub fn open(path: &Path) -> Result<Self> {
-        let (config, mut cache, sessions, knowledge) = storage::read_from_disk(path)?;
+        Self::open_inner(path, false)
+    }
+
+    /// Open an existing HDF5 memory file, requiring a valid content Merkle root
+    /// (P2.4 Finding 1). Fails with [`MemoryError::Integrity`] if the file
+    /// carries no `_merkle_root` (unprotected or stripped) or fails
+    /// verification. Use for stores that must always be integrity-protected.
+    pub fn open_strict(path: &Path) -> Result<Self> {
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: &Path, strict: bool) -> Result<Self> {
+        let (config, mut cache, sessions, knowledge) = if strict {
+            storage::read_from_disk_strict(path)?
+        } else {
+            storage::read_from_disk(path)?
+        };
 
         // Replay WAL if present
         let wal_path = path.with_extension("h5.wal");

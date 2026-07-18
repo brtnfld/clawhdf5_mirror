@@ -38,11 +38,11 @@ pub fn build_hdf5_file(
         "edgehdf5_version",
         AttrValue::String(ZEROCLAW_VERSION.into()),
     );
-    // P2.4 Finding 1: commit a Merkle root over the memory content so read-side
-    // tampering is caught end-to-end. Empty stores carry no root (nothing to
-    // protect); see `integrity` module for scope.
+    // P2.4 Finding 1: commit a Merkle root over ALL persisted content (memory,
+    // sessions, knowledge graph) so read-side tampering is caught end-to-end.
+    // Empty stores carry no root (nothing to protect); see `integrity` module.
     #[cfg(feature = "integrity")]
-    if let Some(root_hex) = crate::integrity::content_root_hex(cache) {
+    if let Some(root_hex) = crate::integrity::content_root_hex(cache, sessions, knowledge) {
         meta.set_attr(
             crate::integrity::MERKLE_ROOT_ATTR,
             AttrValue::String(root_hex),
@@ -319,9 +319,33 @@ fn write_string_dataset(
 }
 
 /// Validate an HDF5 file has the correct schema and load all data.
+///
+/// Non-strict: a file with no `_merkle_root` attribute (older writers, or the
+/// `integrity` feature disabled) loads unverified for backward compatibility.
+/// Use [`validate_and_load_strict`] to reject such files.
 pub fn validate_and_load(
     file: &clawhdf5::File,
 ) -> Result<(MemoryConfig, MemoryCache, SessionCache, KnowledgeCache), MemoryError> {
+    validate_and_load_impl(file, false)
+}
+
+/// Like [`validate_and_load`], but fail-closed when the file carries no
+/// content Merkle root (P2.4 Finding 1: closes the strip-to-downgrade attack
+/// where an adversary deletes `_merkle_root` to force an unverified load).
+pub fn validate_and_load_strict(
+    file: &clawhdf5::File,
+) -> Result<(MemoryConfig, MemoryCache, SessionCache, KnowledgeCache), MemoryError> {
+    validate_and_load_impl(file, true)
+}
+
+fn validate_and_load_impl(
+    file: &clawhdf5::File,
+    strict: bool,
+) -> Result<(MemoryConfig, MemoryCache, SessionCache, KnowledgeCache), MemoryError> {
+    // `strict` only affects the integrity path; keep the binding used even when
+    // the feature is compiled out.
+    #[cfg(not(feature = "integrity"))]
+    let _ = strict;
     // Read /meta group attributes
     let meta = file
         .group("meta")
@@ -368,19 +392,29 @@ pub fn validate_and_load(
     // Load /memory group
     let memory_cache = load_memory_group(file, embedding_dim)?;
 
-    // P2.4 Finding 1: if the file carries a content Merkle root, re-hash the
-    // loaded content and verify it (fail-closed on mismatch). Files without the
-    // attribute — older writers, or `integrity` disabled — load unverified.
-    #[cfg(feature = "integrity")]
-    if let Some(AttrValue::String(root_hex)) = attrs.get(crate::integrity::MERKLE_ROOT_ATTR) {
-        crate::integrity::verify_content(&memory_cache, root_hex)?;
-    }
-
     // Load /sessions group
     let session_cache = load_sessions_group(file)?;
 
     // Load /knowledge_graph group
     let knowledge_cache = load_knowledge_group(file)?;
+
+    // P2.4 Finding 1: verify the content Merkle root over ALL loaded groups
+    // (fail-closed on mismatch; `strict` also rejects a missing root). Done
+    // after every group is loaded so the root covers the full persisted state.
+    #[cfg(feature = "integrity")]
+    {
+        let stored = match attrs.get(crate::integrity::MERKLE_ROOT_ATTR) {
+            Some(AttrValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        crate::integrity::verify_content(
+            &memory_cache,
+            &session_cache,
+            &knowledge_cache,
+            stored,
+            strict,
+        )?;
+    }
 
     Ok((config, memory_cache, session_cache, knowledge_cache))
 }
