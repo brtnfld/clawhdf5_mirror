@@ -2420,7 +2420,9 @@ pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
     // 2. Get chunk data
     let chunk_data = d.chunks[idx];
 
-    // 3. Reconstruct tree
+    // 3. Reconstruct tree. Its node VALUES are untrusted on-disk data (see the
+    // P2.4 fix note below); only its shape (leaf_count, and the sibling path
+    // used for hash chaining) is used.
     let tree = d.reconstruct_tree()?;
 
     // 4. Validate chunk count vs tree leaf count
@@ -2428,8 +2430,26 @@ pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
         return Err(MerkleError::MissingChunkGridMetadata);
     }
 
-    // 5. Verify chunk against tree (uses constant-time comparison internally)
-    if tree.verify_chunk(idx, chunk_data) {
+    // 5. P2.4 fix (red-team finding, same root cause as `verify_dataset`'s
+    // fix above): the old code called `MerkleTree::verify_chunk`, which only
+    // compared the live chunk's hash against the STORED leaf at that index —
+    // both values read from the same untrusted `tree_nodes` blob, with no
+    // sibling ever read and the root never touched. An attacker who patches a
+    // chunk AND its corresponding stored leaf entry, leaving the root
+    // untouched, defeated that check completely, even though this function's
+    // own doc comment claims it "walks the proof path to the root."
+    //
+    // Fix: build the O(log N) inclusion proof from the tree's stored sibling
+    // hashes and walk it via genuine `hash_pair` chaining
+    // (`MerkleProof::compute_root`) all the way up, then compare that
+    // independently re-derived root against the TRUSTED `d.merkle_attr.root`
+    // (not `tree.root()`, which is just `tree_nodes[0]` read verbatim from the
+    // same untrusted blob the old code already trusted too much).
+    let proof = tree
+        .proof(idx)
+        .ok_or(MerkleError::HyperslabOutOfBounds { idx })?;
+    let computed_root = proof.compute_root(chunk_data);
+    if constant_time_eq(&computed_root, &d.merkle_attr.root) {
         Ok(true)
     } else {
         Err(MerkleError::HashMismatch { chunk_idx: idx })
@@ -5135,5 +5155,38 @@ mod directed_dataset_forgery_tests {
         let (attr, nodes) = build_honest(&chunks);
         let view = Dataset::from_owned(attr, nodes, chunks);
         assert!(matches!(verify_dataset(&view), Ok(true)));
+    }
+
+    #[test]
+    fn directed_leaf_patch_defeats_old_verify_chunk_too() {
+        // Same red-team finding, same fix pattern, but for the O(log N)
+        // per-chunk verifier: the old `verify_chunk` called
+        // `MerkleTree::verify_chunk`, which only compared the live chunk's
+        // hash against the STORED leaf at that index -- never reading a
+        // sibling or touching the root. A directed attacker who patches the
+        // chunk AND its stored leaf, leaving the root untouched, defeated it
+        // completely. The fix (walking the real inclusion proof via
+        // `MerkleProof::compute_root` up to `merkle_attr.root`) must catch it.
+        let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
+        let (attr, honest_nodes) = build_honest(&chunks);
+
+        let victim = 1usize;
+        let mut tampered_owned = chunks[victim].to_vec();
+        tampered_owned[0] ^= 0xFF;
+        let mut tampered_chunks: Vec<&[u8]> = chunks.clone();
+        tampered_chunks[victim] = &tampered_owned;
+
+        let forged_leaf = HashAlg::Blake3.hash_leaf(&tampered_owned);
+        let internal_nodes = 3usize; // 4 leaves -> 3 internal nodes
+        let mut forged_nodes = honest_nodes.clone();
+        let off = (internal_nodes + victim) * HASH_SIZE;
+        forged_nodes[off..off + HASH_SIZE].copy_from_slice(&forged_leaf);
+
+        let view = Dataset::from_owned(attr, forged_nodes, tampered_chunks);
+        let result = verify_chunk(&view, victim);
+        assert!(
+            result.is_err(),
+            "directed leaf-patch forgery must be detected by verify_chunk too, got {result:?}"
+        );
     }
 }
