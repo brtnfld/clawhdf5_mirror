@@ -768,6 +768,22 @@ impl SignatureVerifier for KnownGoodSignatures {
 /// `sec:threat`'s own T4 is **rollback** (substituting an entire prior,
 /// internally-consistent file state) -- a different attack, implemented
 /// below as `t4a_whole_file_rollback` / `t4b_selective_chunk_rollback`.
+///
+/// **Scope disclosure (harness-honesty red-team finding).** `detected: true`
+/// here demonstrates that `select_restore_record`'s version-gate control flow
+/// correctly rejects a record when its injected [`SignatureVerifier`] returns
+/// `false` -- that function genuinely is wired into production code
+/// (`clawhdf5-agent::storage::restore_to_version` takes a generic
+/// `V: SignatureVerifier`). It does **not** demonstrate that a real forged or
+/// replayed signature is caught in any shipped deployment: `KnownGoodSignatures`
+/// below is a hardcoded-bytestring mock, and a workspace-wide search finds no
+/// production `SignatureVerifier` implementation backed by real cryptography
+/// anywhere -- every real-crypto implementer (`RealHybridVerifier` in
+/// `clawhdf5-format`'s own tests, `RealVerifier` in `clawhdf5-secure-demo`) is
+/// test-only or lives in a separate standalone demo binary, and
+/// `clawhdf5-agent` (the crate that actually persists ClawHDF5 files) has no
+/// dependency on `clawhdf5-sign` at all, so `restore_to_version` has no
+/// reachable caller supplying a real verifier today.
 pub fn t3_provenance_forgery() -> AttackResult {
     let mut genuine = std::collections::BTreeMap::new();
     genuine.insert(1u64, b"genuine-sig-v1".to_vec());
@@ -923,10 +939,24 @@ pub fn t4b_selective_chunk_rollback() -> AttackResult {
 /// reject the forgery on the ML-DSA-65 mismatch alone.
 ///
 /// Uses the real `clawhdf5-sign` crate (Ed25519 + ML-DSA-65 hybrid signing,
-/// P2.1) directly -- that crate is merged into this workspace, just not yet
-/// wired into `clawhdf5-format`'s Merkle verification flow (no `MerkleAttr`/
-/// `Dataset` caller uses it), so this attack exercises `verify_sig` standalone
-/// rather than through an integrated file-level API.
+/// P2.1) directly against `verify_sig` standalone rather than through an
+/// integrated file-level API.
+///
+/// **Scope disclosure (harness-honesty red-team finding), shared by this
+/// attack and its signed-dataset siblings T1f/T6c.** `clawhdf5-format` does
+/// have a real integration point now -- `verify_signed_root` (P2.4), backed
+/// by the injectable `SignedRootVerifier` trait -- and T1f/T6c route through
+/// it with genuine Ed25519+ML-DSA-65 crypto, not a mock. But no production
+/// *dataset writer* in this workspace ever produces a signature or implements
+/// `SignedRootVerifier`: `clawhdf5-agent` (the crate that actually persists
+/// ClawHDF5 files for ZeroClaw) has no dependency on `clawhdf5-sign` at all,
+/// and its own integrity check (`integrity::verify_content`) calls only the
+/// unsigned `verify_dataset`. So every real, currently-produced ClawHDF5 file
+/// is unsigned and can only ever land on the T1d/T6b side of the fence
+/// (undetected by design) -- T5/T1f/T6c prove the signed mechanism itself is
+/// cryptographically sound, not that any real deployment benefits from it
+/// today. Treat green here as "available in the library," not "protecting
+/// production files."
 pub fn t5_post_quantum_forgery() -> AttackResult {
     use clawhdf5_sign::mldsa::MlDsaSigningKey;
     use clawhdf5_sign::{
@@ -1116,6 +1146,10 @@ fn sign_honest_root(attr: &MerkleAttr, version: u64, timestamp: u64) -> HybridRo
 /// which passes `verify_root`'s self-consistency check — but cannot produce a
 /// signature over the downgraded payload. `verify_signed_root` binds `alg` into
 /// the checked payload, so the carried-over signature fails and it is detected.
+///
+/// See [`t5_post_quantum_forgery`]'s scope disclosure: this is real crypto,
+/// but no production dataset writer in this workspace ever signs a file, so
+/// no real ClawHDF5 file can currently land on this (protected) side.
 pub fn t6c_signed_algorithm_downgrade() -> AttackResult {
     let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
     let honest_tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
@@ -1159,6 +1193,10 @@ pub fn t6c_signed_algorithm_downgrade() -> AttackResult {
 /// companion hash so the attribute is self-consistent (defeats bare
 /// `verify_root`), but `verify_signed_root` binds `companion_hash` into the
 /// signed payload, so the honest signature no longer validates — detected.
+///
+/// See [`t5_post_quantum_forgery`]'s scope disclosure: this is real crypto,
+/// but no production dataset writer in this workspace ever signs a file, so
+/// no real ClawHDF5 file can currently land on this (protected) side.
 pub fn t1f_signed_companion_forgery() -> AttackResult {
     let chunks: Vec<&[u8]> = vec![b"chunk-a", b"chunk-b", b"chunk-c", b"chunk-d"];
     let honest_tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
