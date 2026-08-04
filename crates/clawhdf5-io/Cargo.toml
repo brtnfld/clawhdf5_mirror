@@ -18,6 +18,8 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 mpi = { version = "0.8", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -29,3 +31,14 @@ mmap = ["memmap2", "libc"]
 async = ["tokio"]
 hsds = ["reqwest", "serde", "serde_json", "async"]
 mpi-io = ["mpi"]
+# P2.5 (S2-D2-Yr2 §7, Cloud / WAN evaluation): companion-dataset proof
+# retrieval over S3 range-GETs. Requires real AWS credentials/bucket to
+# exercise beyond the in-memory unit tests — see examples/cloud_eval.rs.
+# clawhdf5-format/merkle is needed by this module's own tests, which build a
+# real companion dataset in memory to exercise the byte-offset parsing
+# without any network access (see src/s3.rs's test module).
+s3 = ["aws-config", "aws-sdk-s3", "async", "clawhdf5-format/merkle"]
+
+[[example]]
+name = "cloud_eval"
+required-features = ["s3"]

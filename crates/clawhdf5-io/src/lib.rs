@@ -305,6 +305,9 @@ pub mod mmap;
 #[cfg(feature = "mmap")]
 pub use mmap::{MmapReadWrite, MmapReader};
 
+#[cfg(feature = "s3")]
+pub mod s3;
+
 pub mod mpi_vol;
 pub use mpi_vol::MpiVol;
 pub mod prefetch;
