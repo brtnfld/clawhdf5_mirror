@@ -175,13 +175,14 @@ fn require_nonempty(ds: &HarnessDataset) {
     }
 }
 
-/// Run the dataset-driven attacks (T1a, T1c, T1b, T2a, T2b, T6a,
-/// subset-a/b/c) against one dataset, producing one CSV row per attack for
+/// Run the dataset-driven attacks (T1a, T1c, T1g, T1b, T2a, T2b, T2c, T6a,
+/// subset-a/b/c/d) against one dataset, producing one CSV row per attack for
 /// that dataset.
 fn run_dataset_attacks(ds: &HarnessDataset) -> Vec<AttackResult> {
     vec![
         attacks::t1a_chunk_data_tamper(ds),
         attacks::t1c_compressed_payload_tamper(ds),
+        attacks::t1g_coordinated_leaf_forgery_via_verify_chunk(ds),
         attacks::t1b_companion_node_tamper(ds),
         attacks::t2a_single_bit_corruption(ds),
         attacks::t2b_burst_error_corruption(ds),

@@ -234,6 +234,82 @@ pub fn t1b_companion_node_tamper(ds: &HarnessDataset) -> AttackResult {
     }
 }
 
+/// T1g — coordinated leaf forgery via `verify_chunk`: the `verify_chunk`
+/// counterpart to [`t2c_directed_leaf_patch_forgery`], which exercises the
+/// identical coordinated-tamper pattern against `verify_dataset`. An attacker
+/// with write access to *both* chunk data and the companion node array
+/// patches a chunk's bytes and splices a matching, freshly-computed leaf hash
+/// into the companion array at that chunk's own level-order index (leaving
+/// ancestor nodes and the root untouched), then recomputes `companion_hash`
+/// so the whole state is internally self-consistent. `verify_chunk` must
+/// detect this by actually walking the O(log N) proof path to the root, not
+/// merely comparing the live chunk's hash against its own (also
+/// attacker-controlled) stored leaf entry — the same class of bug
+/// `verify_dataset` had before the P2.4 fix `t2c` proves is closed. Distinct
+/// from `t1a`/`t1c` (chunk data tampered alone, companion honest) and `t1b`
+/// (companion tampered alone, chunk data honest): this is the coordinated,
+/// two-sided pattern neither of those exercises for `verify_chunk`
+/// specifically.
+pub fn t1g_coordinated_leaf_forgery_via_verify_chunk(ds: &HarnessDataset) -> AttackResult {
+    let (tree, _attr, nodes) = build_merkle_state(ds);
+    let victim = ds.chunk_count() / 2;
+
+    // Forge new chunk content...
+    let mut tampered_bytes = ds.bytes.clone();
+    let (start, end) = ds.chunk_ranges[victim];
+    for b in &mut tampered_bytes[start..end] {
+        *b ^= 0xFF;
+    }
+    let forged_chunk = tampered_bytes[start..end].to_vec();
+
+    // ...and splice a matching leaf hash into the companion array at the
+    // victim's own level-order node index (root at index 0, leaves start at
+    // `padded_leaf_count - 1`) -- everything a raw-storage attacker with
+    // write access to the companion dataset can actually do without
+    // breaking preimage resistance to forge a *consistent* new root.
+    let alg = HashAlg::Blake3;
+    let forged_leaf_hash = alg.hash_leaf(&forged_chunk);
+    let padded_leaf_count = tree.padded_leaf_count() as u64;
+    let internal_nodes = padded_leaf_count - 1;
+    let leaf_node_index = (internal_nodes + victim as u64) as usize;
+
+    let mut tampered_nodes = nodes.clone();
+    let byte_off = leaf_node_index * 32;
+    tampered_nodes[byte_off..byte_off + 32].copy_from_slice(&forged_leaf_hash);
+    let forged_companion_hash = companion_hash(&tampered_nodes);
+    // Root and algorithm are deliberately UNCHANGED from the honest tree --
+    // only `companion_hash` is updated to match the tampered array.
+    let forged_attr = MerkleAttr::from_tree_with_companion(&tree, forged_companion_hash);
+
+    let start_time = Instant::now();
+    let view = dataset_view(forged_attr, tampered_nodes, ds, &tampered_bytes);
+    let result = verify_chunk(&view, victim);
+    let latency = start_time.elapsed();
+
+    let bypass_succeeded = matches!(result, Ok(true));
+    AttackResult {
+        threat_class: "T1",
+        attack_id: "T1g",
+        dataset: ds.label,
+        detected: !bypass_succeeded,
+        verifier_fn: "verify_chunk",
+        latency,
+        root_cause: if bypass_succeeded {
+            Some(
+                "verify_chunk compares a chunk's live hash only against its OWN stored leaf \
+                 entry, never re-deriving ancestor nodes up to the root -- an attacker with \
+                 write access to both chunk data and the companion array can patch a chunk and \
+                 splice a matching leaf hash, leaving ancestors/root untouched, and pass. \
+                 Neither t1a/t1c (data-only) nor t1b (companion-only) exercises this \
+                 coordinated two-sided pattern for verify_chunk specifically (t2c already \
+                 proves verify_dataset is fixed against the identical pattern).",
+            )
+        } else {
+            None
+        },
+    }
+}
+
 /// T1d — directed companion forgery on an **unsigned** dataset: the same
 /// companion-node tamper as T1b, but the adversary also recomputes the stored
 /// `companion_hash` over the tampered nodes, producing a fully self-consistent

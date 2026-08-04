@@ -196,8 +196,19 @@ pub fn load_real_dataset(
                     // at the end with a checked conversion -- the naive
                     // "narrow the product, then multiply" order used in
                     // `goes18_chunk_test.rs` silently truncates for a chunk
-                    // over 4 GiB.
-                    let elements: u64 = spatial_dims.iter().map(|&d| u64::from(d)).product();
+                    // over 4 GiB. `spatial_dims` comes straight from the
+                    // file's DataLayout message (attacker-controlled for
+                    // --file/--eqsim-file runs), so the product itself must
+                    // be checked too: plain `Iterator::product()` is
+                    // unchecked arithmetic that wraps silently in `--release`
+                    // builds (this crate's own documented invocation, and
+                    // this workspace has no `[profile.release]` override to
+                    // turn overflow-checks back on) rather than reporting
+                    // the hostile dimensions as an error.
+                    let elements: u64 = spatial_dims
+                        .iter()
+                        .try_fold(1u64, |acc, &d| acc.checked_mul(u64::from(d)))
+                        .ok_or("chunk element count overflows u64")?;
                     let total_bytes = elements
                         .checked_mul(elem_size as u64)
                         .ok_or("single chunk size overflows u64")?;
