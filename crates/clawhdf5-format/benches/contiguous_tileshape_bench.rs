@@ -647,10 +647,32 @@ fn main() -> std::io::Result<()> {
         let dir = PathBuf::from(get("--dir", "."));
         let sc = get("--storage-class", "unknown");
         let path = dir.join("clawbench-contiguous-1000cubed.f32");
+        if !path.exists() {
+            eprintln!("generating 4 GB dataset at {}...", path.display());
+            generate_dataset(&path)?;
+        }
         let n_trials: usize = get("--trials", "5").parse().unwrap_or(5);
         let total = DIMS.iter().product::<u64>() * u64::from(ELEM_SIZE);
         println!("approach,storage_class,trial,wall_ms,throughput_mbps");
         for t in 0..n_trials {
+            // Pure read, no hashing, same 64 MiB batch pattern: the ceiling
+            // any build can reach on this device and access pattern. Without
+            // this row, "62% of device bandwidth" cannot be separated from
+            // "the device does not deliver its benchmark figure here".
+            evict_cache(&path);
+            let mut f = File::open(&path)?;
+            let mut rbuf = vec![0u8; 64 << 20];
+            let t0 = Instant::now();
+            let mut got = 0u64;
+            loop {
+                let n = f.read(&mut rbuf)?;
+                if n == 0 { break; }
+                got += n as u64;
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(got, total);
+            println!("read_only,{sc},{t},{ms:.1},{:.1}", total as f64 / (ms / 1000.0) / 1.0e6);
+
             // flat BLAKE3 over the whole file
             evict_cache(&path);
             let mut f = File::open(&path)?;
@@ -666,12 +688,32 @@ fn main() -> std::io::Result<()> {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             println!("flat_hash,{sc},{t},{ms:.1},{:.1}", total as f64 / (ms / 1000.0) / 1.0e6);
 
-            // streaming Merkle build at the DAOS default shape
+            // streaming Merkle build at the DAOS default shape, via the
+            // bench's own interleaved-hasher helper (the pre-P2.9 path, kept
+            // so the improvement is measured against a real baseline).
             evict_cache(&path);
             let t0 = Instant::now();
             let _tree = build_tree_streaming(&path, &[1, 250, 1000])?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            println!("grid_tree,{sc},{t},{ms:.1},{:.1}", total as f64 / (ms / 1000.0) / 1.0e6);
+            println!("grid_tree_interleaved,{sc},{t},{ms:.1},{:.1}",
+                     total as f64 / (ms / 1000.0) / 1.0e6);
+
+            // The production streaming builder: one sequential pass, leaves
+            // hashed in parallel. This is what ships, so this is the number
+            // that matters.
+            evict_cache(&path);
+            let mut f = File::open(&path)?;
+            let t0 = Instant::now();
+            let (_tree, _grid) = clawhdf5_format::subset_proof::contiguous_tree_streaming(
+                &mut f,
+                &DIMS,
+                ELEM_SIZE,
+                clawhdf5_format::verification_grid::DEFAULT_TARGET_BYTES,
+                HashAlg::Blake3,
+            )?;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            println!("grid_tree_parallel,{sc},{t},{ms:.1},{:.1}",
+                     total as f64 / (ms / 1000.0) / 1.0e6);
         }
         return Ok(());
     }

@@ -9,8 +9,10 @@ conditions.
 P2.8a and P2.8b established that contiguous support *works*. This document
 reports what it *costs*, and which leaf construction should ship as the
 default. A negative result here is a real outcome, and there is one: the
-design's whole-dataset audit claim does not hold on fast storage, and two of
-the three Bao predictions are refuted.
+design's whole-dataset audit claim did not hold on fast storage, and two of
+the three Bao predictions are refuted. The audit defect has since been fixed
+(Finding 5): the streaming build is now 7.87× faster and within 1.36× of the
+pure-read ceiling.
 
 ---
 
@@ -34,6 +36,12 @@ catastrophic, not that it wins everywhere:
   sweep from 256 KiB to 4 MiB puts the `cube100` byte minimum exactly at
   1 MiB (Finding 6). The transferable rule is to match the device's readahead
   window, which is 1 MB on this host.
+
+The streaming builder (`contiguous_tree_streaming`) should be the API used
+for whole-dataset audits: it is bounded in memory, parallel, and within
+1.36× of the pure-read ceiling, where the original interleaved build was
+10.7× off it. `contiguous_tree_and_grid` remains correct but needs the whole
+dataset as one slice, so it does not scale to the sizes this work targets.
 
 The cubic shape should not be offered as an option. It is worst or
 near-worst on every selection and every device, and its 256 B runs put it
@@ -158,36 +166,67 @@ I/O-bound on HDD**, so its inflated NVMe baseline compresses the ratio. The
 binding resource differs by device for this cell alone; it is not evidence
 that the cubic shape degrades gracefully.
 
-## Finding 5 — the "tree is nearly free" claim holds only when I/O-bound
+## Finding 5 — the audit claim held only when I/O-bound; the build has since been fixed
 
-Whole-dataset audit, single-pass streaming Merkle build vs a flat BLAKE3
-hash over the same 4.0 GB, median of 5 trials, caches evicted:
+Whole-dataset audit, single-pass streaming Merkle build vs a flat BLAKE3 hash
+over the same 4.0 GB, caches evicted per trial.
+
+**As originally measured** (single-threaded build, interleaved per-leaf hashers):
 
 | storage | flat hash | grid tree | overhead |
 |---|---|---|---|
-| HDD | 22,774 ms (176 MB/s) | 22,759 ms (176 MB/s) | **−0.1%** |
-| NVMe | 619 ms (6,459 MB/s) | 3,352 ms (1,193 MB/s) | **+441%** |
+| HDD | 22,644 ms (177 MB/s) | 22,639 ms (177 MB/s) | **−0.0%** |
+| NVMe | 626 ms (6,384 MB/s) | 3,478 ms (1,150 MB/s) | **+456%** |
 
-**On HDD the design's claim is confirmed exactly**: both run at the measured
-sequential-read bandwidth (176 vs 174 MB/s), so the tree is free — the
-device is the bottleneck and hashing hides entirely behind it.
+On HDD the design's claim was confirmed exactly: both ran at the measured
+sequential-read bandwidth, so the tree was free — the device was the
+bottleneck and hashing hid entirely behind it. On NVMe it failed badly. Root
+cause: the build issued ~10^6 `Hasher::update` calls of 4000 B each across
+~4000 live hashers, below BLAKE3's efficient batch size and thrashing hasher
+state, while the flat hash fed 8 MiB at a time.
 
-**On NVMe the claim fails.** The device supplies 12.8 GB/s; the flat hash
-sustains 6.5 GB/s and the streaming tree build only 1.2 GB/s, so the tree
-costs 5.4× rather than being free. Root cause: the streaming build issues
-~1,000,000 `Hasher::update` calls of 4000 B each (one per row per leaf)
-against ~4000 live hashers, so it runs below BLAKE3's efficient batch size
-and thrashes on hasher state, while the flat hash feeds 8 MiB at a time and
-gets full SIMD throughput. The build is CPU-bound on NVMe and I/O-bound on
-HDD.
+**This has now been fixed** (P2.9). The structural observation is that a
+verification grid's leaves are each a *single contiguous byte run in
+increasing index order*, so the interleaved hashers were never necessary:
+`subset_proof::contiguous_tree_streaming` reads bounded batches sequentially,
+splits them into per-leaf slices by arithmetic, and hashes those slices in
+parallel — with a scoped producer thread overlapping the next batch's read
+against the current batch's hashing.
 
-This is a **negative result against the design's stated claim**, and it is
-actionable rather than fatal: the build is single-threaded here, and leaf
-hashing is embarrassingly parallel (`clawhdf5-format` already has a
-`parallel` feature using rayon). Parallelising leaf hashing across the 32
-available cores, and batching larger spans per `update`, are the obvious
-fixes. Neither was attempted here — the number reported is what the current
-implementation does.
+| stage | median | MB/s | vs pure-read floor |
+|---|---|---|---|
+| interleaved (original) | 3,478 ms | 1,150 | 10.7× |
+| parallel, serialised reads | 503 ms | 7,952 | 1.55× |
+| parallel + double-buffered reads | **442 ms** | **9,057** | **1.36×** |
+| *`read_only` control (no hashing)* | *325 ms* | *12,312* | *1.00×* |
+
+**Cumulative 7.87×**, of which parallel leaf hashing contributed 7.20× and
+overlapping the reads a further 1.08×. The build now runs within 1.36× of the
+hard ceiling for this device and access pattern.
+
+Two honesty notes on this table:
+
+- **The flat-hash row is not a like-for-like baseline.** `blake3`'s `rayon`
+  feature is not enabled, so the flat hash is single-threaded (626 ms) while
+  the fixed build uses 32 cores. The build now *appears* to beat it by 1.4×;
+  that comparison should not be quoted as a win, because a parallelised flat
+  hash would improve too. The sound claims are the before/after speedup (same
+  workload, same machine, only the builder changed) and the distance to the
+  `read_only` control.
+- **The residual 117 ms is not explained.** A prediction that overlapping
+  reads would reach the 325 ms floor was wrong: only ~74 ms of hash time hid
+  behind I/O and 117 ms stayed exposed. One hypothesis was *ruled out* by the
+  `read_only` control — the device genuinely delivers 12.3 GB/s on a
+  sustained 4 GB read, so the ceiling is real and not a bad denominator. The
+  remaining candidates, **not** distinguished by any measurement here, are
+  memory-bandwidth contention between the reader's page-cache copy and 32
+  concurrent hashing threads, and imperfect pipeline fill across the ~62
+  batches. Recorded rather than guessed, so a later reader can resume it.
+
+On HDD the fix changes nothing, exactly as the original explanation predicted:
+all three approaches land at 177 MB/s because the platters bind. That is the
+confirmation that "free relative to the flat hash" was a statement about the
+*device*, not about the construction.
 
 ## Finding 6 — 1 MiB is the right target, and the reason generalises
 
@@ -380,8 +419,9 @@ Stated rather than estimated, so no reader mistakes a gap for a result:
 - **CPU governor is `powersave`, not `performance`** — changing it needs
   root, unavailable here. This inflates variance on CPU-bound quantities
   (`verify_ms`, and Finding 5's NVMe numbers) but not on the block-layer
-  byte and I/O counters. Finding 5's NVMe overhead should be treated as an
-  upper bound on the gap for that reason.
+  byte and I/O counters. Finding 5's NVMe figures should be read with that
+  caveat, including its `read_only` control, which is affected equally and so
+  does not bias the ratio between them.
 - **Cache eviction uses `posix_fadvise(POSIX_FADV_DONTNEED)`**, not
   `/proc/sys/vm/drop_caches`, for the same reason. It is strictly more
   targeted — it evicts only this file's clean pages — and was validated on
@@ -428,7 +468,8 @@ subtraction shows.
   (4 shapes × 3 selections × 2 storage classes), median plus 95% bootstrap CI
   over 30 trials.
 - `crates/clawhdf5-format/benches/results/contiguous-audit-throughput.csv` —
-  raw per-trial audit timings, 5 trials × 2 approaches × 2 storage classes.
+  raw per-trial audit timings: NVMe 7 trials × 4 approaches (including the
+  `read_only` ceiling control), HDD 5 trials × 3.
 - `crates/clawhdf5-format/benches/results/contiguous-target-sweep.csv` —
   leaf-target sweep, 5 targets × 3 selections × 2 storage classes.
 - `crates/clawhdf5-format/benches/results/contiguous-baselines.csv` — the Bao
