@@ -1,0 +1,81 @@
+{
+  "description": "Contiguous-dataset verifiable subset extraction test vectors (P2.8b)",
+  "specification": "S2-D2-Yr2/Merkle-tree-HDF5.tex sec:contiguous-design",
+  "note": "Same schema as test-vectors/subset-vectors.json (P1.5); the proofs differ only in layout_class and the grid_hash it feeds, which is the P2.8b reuse claim.",
+  "target_bytes": 1024,
+  "grid": { "dims": [16, 16, 16], "chunk_shape": [1, 16, 16], "elem_size": 4, "layout_class": "contiguous", "leaf_order": "row_major" },
+  "root": "7ed277bea32ea5534c85dd4b0aca783a4ea1ed51561ba371d03bdd3da916d4d9",
+  "sub_cube": {
+    "chunk_indices": [4, 5, 6, 7],
+    "leaf_hashes": [
+      "6e61486ffb3b18cbb1ded556dc2b2df57c8b7a70849a590cc42548290199b5b1",
+      "6a6b05f0264ea9a7ff7b96e629e0483c5f61ae45c612d541e50e1dc3f35f54d5",
+      "4fadf2db256b5b2e7adf5f5afb7179e05fa09f915456e3bea0e26d12483a207c",
+      "834cf67cd6d126f1c40d3de7fb6fa5d0cffd0402952e709abb2e0a69e45cf35d"
+    ],
+    "proof_nodes": {
+      "2": "f377ab42424789a1336eefeb9c69521f6a83d75f422bdcbf9268bbf28e09aafe",
+      "3": "f9665f7f05069988713198ffebb41c727d603fab7bb8043d9ae3d81b4ee6f786",
+      "9": "a0b6a5927258af3b43ed47fdaca78e660a0b42e19c92be55263f341aad6c2a2e",
+      "10": "df30c796a4b4ecf008fdaa89c5bd9584d8e31f57d45cdb07f45453964efc3e00",
+      "19": "6e61486ffb3b18cbb1ded556dc2b2df57c8b7a70849a590cc42548290199b5b1",
+      "20": "6a6b05f0264ea9a7ff7b96e629e0483c5f61ae45c612d541e50e1dc3f35f54d5",
+      "21": "4fadf2db256b5b2e7adf5f5afb7179e05fa09f915456e3bea0e26d12483a207c",
+      "22": "834cf67cd6d126f1c40d3de7fb6fa5d0cffd0402952e709abb2e0a69e45cf35d"
+    },
+    "grid_params": {
+      "dims": [16, 16, 16],
+      "chunk_shape": [1, 16, 16],
+      "elem_size": 4,
+      "layout_class": "contiguous",
+      "grid_hash": "39d4fc9d7bef94c0c28ed91e27161c6fbec5640c25a4838ee9b03109e9b55d8c"
+    },
+    "coverage_cert": "5d339f3882f2b68503016f0e9cef103df011dd79437dea70d1d32a5bb182adc4",
+    "expected_root": "7ed277bea32ea5534c85dd4b0aca783a4ea1ed51561ba371d03bdd3da916d4d9",
+    "proof_size_bytes": 592
+  },
+  "plane": {
+    "chunk_indices": [3],
+    "leaf_hashes": [
+      "a514ac9b441fde358f7303c642f6f6ae3e32a04e8b05698f7ad74f477671a440"
+    ],
+    "proof_nodes": {
+      "2": "f377ab42424789a1336eefeb9c69521f6a83d75f422bdcbf9268bbf28e09aafe",
+      "4": "6c2371b95e56fa41ec885ccf372474fe675cf58bb2410909df8327d691642ae1",
+      "7": "cbda03a1fc0606849961dedbc1d3750a281a1add2e341622285694152d437f2b",
+      "17": "50106acff5375d953d9a813b9309a580c4d38708ec1c98c0a0cb8e97ff223b94"
+    },
+    "grid_params": {
+      "dims": [16, 16, 16],
+      "chunk_shape": [1, 16, 16],
+      "elem_size": 4,
+      "layout_class": "contiguous",
+      "grid_hash": "39d4fc9d7bef94c0c28ed91e27161c6fbec5640c25a4838ee9b03109e9b55d8c"
+    },
+    "coverage_cert": "cbc782b2d685ddbe97ba5eb3647a19df7fce8598f69e56ec963ae24a5bcb0ca2",
+    "expected_root": "7ed277bea32ea5534c85dd4b0aca783a4ea1ed51561ba371d03bdd3da916d4d9",
+    "proof_size_bytes": 312
+  },
+  "range_1d": {
+    "chunk_indices": [0],
+    "leaf_hashes": [
+      "259dcd5c6e6ab677944715ca031ef7b107e2f57e91c3e88039f301d064820e87"
+    ],
+    "proof_nodes": {
+      "2": "f377ab42424789a1336eefeb9c69521f6a83d75f422bdcbf9268bbf28e09aafe",
+      "4": "6c2371b95e56fa41ec885ccf372474fe675cf58bb2410909df8327d691642ae1",
+      "8": "d538912a83ad52b457af1387587da90bc8c593be0b6731203a954f057fdb4566",
+      "16": "dedae13f93dab9ec4c4faed2afca5b8de916870a23c8a3196c356d2c2e6b039a"
+    },
+    "grid_params": {
+      "dims": [16, 16, 16],
+      "chunk_shape": [1, 16, 16],
+      "elem_size": 4,
+      "layout_class": "contiguous",
+      "grid_hash": "39d4fc9d7bef94c0c28ed91e27161c6fbec5640c25a4838ee9b03109e9b55d8c"
+    },
+    "coverage_cert": "d7398d2768d534d7f659dd3cdf25357f27e8e7dc4b2f64006ca02e9b7f0f4953",
+    "expected_root": "7ed277bea32ea5534c85dd4b0aca783a4ea1ed51561ba371d03bdd3da916d4d9",
+    "proof_size_bytes": 312
+  }
+}

@@ -31,8 +31,8 @@ with an underscore prefix: `_merkle_root`,
 `/_merkle/{name}`. The Rust prototype does not follow this — `merkle.rs`
 uses unprefixed names throughout (`MERKLE_ATTR_NAME = "merkle_root"`,
 `MERKLE_GROUP_NAME = "merkle"`, `MERKLE_VERSION_ATTR_NAME = "merkle_version"`
-— `clawhdf5-format/src/merkle.rs:1206,1932,1483`, with an explicit code
-comment at `merkle.rs:1480-1482` noting the divergence from the paper's
+— `clawhdf5-format/src/merkle.rs:1261,2040,1551`, with an explicit code
+comment at `merkle.rs:1548-1550` noting the divergence from the paper's
 naming), and the existing internal `docs/mpi-protocol.md` design document
 also uses the unprefixed form (`/merkle/dataset_name`).
 
@@ -47,7 +47,7 @@ a redesign — everything below applies unchanged either way.
 ### 1.2 Root attribute: `merkle_root`
 
 A fixed-size attribute on the dataset, mirroring `MerkleAttr`
-(`clawhdf5-format/src/merkle.rs:1257-1393`), **129 bytes**:
+(`clawhdf5-format/src/merkle.rs:1312-1448`), **129 bytes**:
 
 | Offset | Size | Field | Encoding |
 |---|---|---|---|
@@ -55,12 +55,12 @@ A fixed-size attribute on the dataset, mirroring `MerkleAttr`
 | 32 | 1 | `algorithm` | `0x00`=SHA-256, `0x01`=BLAKE3, `0x02`=K12 |
 | 33 | 32 | `integrity` | `H(0x03 \|\| root \|\| algorithm)` — binds the attribute's own fields together |
 | 65 | 32 | `companion_hash` | SHA-256 of the flattened companion node array (all-zero if none) |
-| 97 | 32 | `grid_hash` | `H(dims \|\| chunk_shape)`, binding the chunk-grid parameters (all-zero = unbound) |
+| 97 | 32 | `grid_hash` | `H(0x04 \|\| layout_class \|\| elem_size \|\| dims \|\| chunk_shape)`, binding the grid parameters (all-zero = unbound) — see §1.6 |
 
 A reader recomputes `integrity` from the first 33 bytes on every read and
 rejects (`H5E_MERKLE_INVALID_ATTR`, §2.4) on mismatch, size mismatch, or an
 unrecognized algorithm byte — this is the C equivalent of `MerkleAttr::unpack`'s
-constant-time integrity recheck (`merkle.rs:1334-1393`).
+constant-time integrity recheck (`merkle.rs:1389-1448`).
 
 This attribute is intentionally small (129 bytes, well under HDF5's
 object-header attribute limits) so it imposes negligible per-dataset
@@ -72,12 +72,12 @@ Tree" calls out.
 
 For datasets with more than `INLINE_CHUNK_THRESHOLD` (256) chunks, the full
 tree is stored as a separate 1D dataset at `/merkle/{name}`, mirroring
-`write_merkle_companion` (`merkle.rs:2115-2149`):
+`write_merkle_companion` (`merkle.rs:2223-2257`):
 
 - **Layout**: flat array of 32-byte node hashes, level-order (root at index
-  0, children of node *i* at `2i+1`/`2i+2`) — `merkle.rs:571,578,667-668`.
+  0, children of node *i* at `2i+1`/`2i+2`) — `merkle.rs:626,633,722-723`.
   Total size = `(2·padded_leaf_count − 1) × 32` bytes.
-- **Storage class**: contiguous, not HDF5-chunked (`merkle.rs:2017-2018`,
+- **Storage class**: contiguous, not HDF5-chunked (`merkle.rs:2125-2126`,
   confirmed no `chunk_dims` set — `type_builders.rs:395`, `file_writer.rs:1014-1022`).
   A single node or a proof-path span is read via `H5Dread` with a
   hyperslab selection over this contiguous region — no full-tree load
@@ -120,7 +120,7 @@ on a change nothing in the prototype currently exercises.
 ### 1.4 Inline fallback: `merkle_nodes` attribute (N ≤ 256 chunks)
 
 For small datasets, the flattened node array is stored directly as a second
-attribute (`MERKLE_NODES_ATTR_NAME`, `merkle.rs:1929`) rather than a
+attribute (`MERKLE_NODES_ATTR_NAME`, `merkle.rs:2037`) rather than a
 separate dataset, avoiding companion-dataset overhead for cases where the
 whole tree is already small enough to be attribute-sized (≤256 leaves ⇒
 ≤511 nodes ⇒ ≤ 16,352 bytes). `H5Dverify_chunk`/`H5Dextract_subset` (§2.1, §2.2)
@@ -214,6 +214,76 @@ gap, not the attribute's existence:
   measurements exist; this spec does not have those numbers yet (see §5.2
   for the analogous honesty constraint on throughput numbers).
 
+### 1.6 Layout class and contiguous-dataset support (P2.8)
+
+HDF5's *default* dataset layout is contiguous, not chunked, so a mechanism
+covering only chunked datasets would not satisfy R13. P2.8 extends coverage
+to contiguous datasets by deriving a **verification grid** over the
+unmodified byte stream — a partition of the dataspace chosen so every leaf
+is a single contiguous byte run — without rewriting the file or changing
+its `H5D_CONTIGUOUS` layout message.
+
+The `grid_hash` preimage (§1.2) is:
+
+```
+grid_hash = H(0x04 || layout_class || elem_size || dims || chunk_shape)
+```
+
+with `layout_class` one byte (`0x00` = chunked, `0x01` = contiguous) and
+`elem_size` the file datatype size as a 4-byte little-endian integer. `0x04`
+continues the domain-separation prefix scheme (`0x00` leaf, `0x01` internal,
+`0x02` unallocated, `0x03` attribute integrity — note `0x03` was already
+spent on the `MerkleAttr` integrity hash, so the grid preimage continues at
+`0x04`). The prefix is applied to the *raw* hash rather than through the
+leaf-hashing helper: wrapping it as `H(0x00 || 0x04 || …)` would collide
+with the leaf hash of chunk data that merely begins with `0x04`. A C
+implementation must reproduce this preimage byte-for-byte, including the
+prefix and the little-endian integer encodings, or its `grid_hash` will not
+match one written by the Rust prototype.
+
+Three attacks are closed by what the preimage covers, each with a named
+regression test in `subset_proof.rs`:
+
+| Attack | Closed by |
+|---|---|
+| Cross-layout replay — a contiguous dataset's proof presented as a chunked one with the same extents | binding `layout_class` |
+| Reinterpretation — the same bytes re-presented under a different element width (f32 claimed as f64, halving the apparent extent) | binding `elem_size` |
+| Grid substitution — a verifier re-deriving the grid at a different target size than the prover used | the derived `chunk_shape` is itself in the preimage |
+
+**No API branches on layout class.** The verification grid makes a
+contiguous dataset indistinguishable from a chunked one to the proof
+system: `H5Dverify_chunk` and `H5Dextract_subset` (§2.1, §2.2) take the
+same arguments and return the same structures for both. The layout class
+reaches the verifier only through the `grid_hash` preimage, never as a code
+path. In the prototype this is enforced mechanically — a test greps
+`verify_subset`'s own source and fails if `LayoutClass` appears as control
+flow — and a C port should carry the same constraint, since it is what
+makes "contiguous reduces to chunked" structural rather than incidental.
+
+**Grid derivation is caller-parameterized, never environment-derived.** The
+target leaf size is an explicit parameter (`H5Pset_merkle_leaf_target` or
+equivalent; default 1 MiB). It must not be read from an environment
+variable: a verifier that re-derived the grid from its own configuration
+would accept whatever grid its environment happened to produce, defeating
+the point of binding the grid at all. Only the *derivation* is automatic;
+the derived grid must be stored and authenticated.
+
+**Rejected layouts.** These are hard errors (`H5E_MERKLE_UNSUPPORTED_LAYOUT`,
+§2.4), never warnings — emitting a proof over any of them would certify
+something other than the data:
+
+| Case | Why rejected |
+|---|---|
+| Compact, chunked, or virtual layout | Not a single byte range (chunked datasets already have a real grid) |
+| Unallocated contiguous storage | Storage is allocated as a unit but need not be *written*; under `H5D_FILL_TIME_NEVER` the unwritten remainder holds whatever the filesystem supplies, so semantically identical datasets can yield different roots |
+| External storage (`H5Pset_external`) | Raw data is split across external files, breaking the single-address assumption |
+| Variable-length and reference datatypes | The contiguous stream stores global-heap identifiers while payloads live outside the byte range — a proof over it would **certify pointers rather than values** |
+
+Full rationale, the derivation rule, and the known gaps (fill-policy binding
+and user-block offset are not yet in any hash) are recorded in
+`docs/contiguous-adapter.md`, which is the normative compatibility reference
+for this section.
+
 ---
 
 ## 2. Proposed Public C API
@@ -287,20 +357,25 @@ herr_t H5Dsubset_proof_close(H5D_subset_proof_t *proof);
 
 `space_id` is a dataspace with a hyperslab selection (`H5Sselect_hyperslab`),
 mirroring the `Selection`/`LeafOrder` inputs to `extract_subset`
-(`clawhdf5-format/src/subset_proof.rs:355-402`). `H5Dextract_subset` reads
+(`clawhdf5-format/src/subset_proof.rs:572-619`). `H5Dextract_subset` reads
 the requested chunks into `buf` and produces an opaque `H5D_subset_proof_t`
 carrying the same fields as Rust's `SubsetProof` (sorted chunk-index set,
 leaf hashes, deduplicated sibling nodes, grid params, coverage
 certificate). `H5Dsubset_proof_verify` is the C equivalent of
-`verify_subset` (`subset_proof.rs:504-...`): it independently recomputes
+`verify_subset` (`subset_proof.rs:721-...`): it independently recomputes
 the expected chunk-index set from the caller's *own* trusted
 `space_id`/grid knowledge — never from fields inside `proof` itself — and
 rejects (`*valid = FALSE`) on any mismatch (wrong region, omitted chunk,
 substituted chunk, or corrupted coverage certificate). This mirrors the
 trust-boundary design already documented on `verify_subset`
-(`subset_proof.rs:451-502`): the proof is untrusted wire data; only the
+(`subset_proof.rs:668-719`): the proof is untrusted wire data; only the
 caller's own `space_id` and the file's authenticated `grid_hash` (from
 `merkle_root`, §1.2) are trusted inputs.
+
+Both functions apply unchanged to **contiguous** datasets (§1.6): the
+verification grid supplies leaf granularity, and neither the arguments nor
+the proof structure differ by layout class. `H5Dextract_subset` returns
+`H5E_MERKLE_UNSUPPORTED_LAYOUT` for the layouts and datatypes §1.6 rejects.
 
 ### 2.3 `H5Fget_integrity_root`
 
@@ -352,7 +427,7 @@ compile-time constants other core code can `switch` on) than every
 existing `H5E_*` class in the library.
 
 New major error class `H5E_MERKLE`, minor codes mapped from
-`MerkleError` (`merkle.rs:74-148`):
+`MerkleError` (`merkle.rs:83-167`):
 
 | Rust `MerkleError` variant | Proposed `H5E` minor code | Fires when |
 |---|---|---|
@@ -369,7 +444,8 @@ New major error class `H5E_MERKLE`, minor codes mapped from
 | `JournalCorrupt` | `H5E_MERKLE_JOURNAL_CORRUPT` | provenance journal malformed/truncated |
 | `JournalUnsupportedVersion{found}` | `H5E_MERKLE_JOURNAL_VERSION` | journal format newer than this build understands |
 | `JournalNonMonotonic{appended,last}` | `H5E_MERKLE_JOURNAL_ORDER` | journal append version doesn't strictly increase (API misuse) |
-| `GridHashMismatch` | `H5E_MERKLE_GRID_MISMATCH` | declared chunk-grid shape doesn't match authenticated `grid_hash` |
+| `GridHashMismatch` | `H5E_MERKLE_GRID_MISMATCH` | declared grid parameters don't match authenticated `grid_hash` (shape, element size, or layout class) |
+| `UnsupportedLayout{reason}` | `H5E_MERKLE_UNSUPPORTED_LAYOUT` | layout/datatype outside contiguous-verification scope: non-contiguous, unallocated, external storage, or variable-length/reference datatype (§1.6) |
 
 `H5D_MERKLE_PENDING`/`NoncePending` deliberately does **not** map to a
 `FAIL` return from `H5Dverify_chunk` — an in-progress write is not a
@@ -649,7 +725,7 @@ The Rust prototype currently has **two different, unreconciled leaf-hash
 formulas** (flagged as a known gap by the code's own `TODO(P2.4)` comment,
 `clawhdf5-filters/src/filter_pipeline.rs:158-165`):
 
-- `clawhdf5-format`'s `HashAlg::hash_leaf` (`merkle.rs:475-542`): plain
+- `clawhdf5-format`'s `HashAlg::hash_leaf` (`merkle.rs:516-597`): plain
   `H(0x00 || chunk_data)`, no length prefix, no ciphertext/tag/version
   binding.
 - `clawhdf5-filters`'s `compute_leaf_hash` (`filter_pipeline.rs:142-201`):
@@ -756,11 +832,24 @@ called out inline at its point of relevance above, this is the summary:
    error in a *different* part of S2-D2-Yr2 itself (the P2.2 task
    paragraph in §7), not in this design or the code it describes.
 
+7. **Contiguous-dataset support (P2.8), with two pieces still unbuilt.**
+   The prototype implements grid derivation, `grid_hash` binding (§1.6),
+   the layout-class/element-size negative tests, and proof reuse over
+   contiguous datasets. Two gaps remain, both recorded in
+   `docs/contiguous-adapter.md` rather than silently deferred: the leaf
+   preimage does not yet bind the **fill value and fill-time policy** (the
+   adapter refuses unallocated storage outright instead, which is safe but
+   narrower than the eventual design), and the **user-block offset** is not
+   itself bound into any hash (addresses are read from the layout message,
+   so reads are correct today, but a shifted user block is not detected as
+   tampering). A C implementation should close both rather than porting the
+   current narrower behavior.
+
 None of these are reasons to delay this design document — P2.6's job is to
 specify the target C behavior precisely, including where that target is
-ahead of (items 3, 4) or corrects (item 2) the current Rust prototype.
+ahead of (items 3, 4, 7) or corrects (item 2) the current Rust prototype.
 Item 6 turned out not to be a prototype gap at all, on closer inspection —
-see its corrected entry above. Items 1, 3, 4, and the `version_wal.rs`
+see its corrected entry above. Items 1, 3, 4, 7, and the `version_wal.rs`
 durability caveat folded into item 3 should be filed as Rust-prototype
 follow-up work (cross-referenced from this document) so the C port and the
 Rust prototype converge on one design rather than the C port silently

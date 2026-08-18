@@ -171,6 +171,131 @@ pub fn contiguous_tree_and_grid(
     (tree, grid)
 }
 
+/// A contiguous dataset's raw-data location and extents, read directly from
+/// its (already-parsed) object header -- the Rust equivalent of
+/// `H5Dget_offset` (P2.8b).
+///
+/// Deliberately does not touch or copy the raw bytes: callers slice
+/// `file_bytes[data_addr as usize..(data_addr + nbytes) as usize]` themselves
+/// (the same way [`contiguous_tree_and_grid`]'s caller slices its `data`
+/// argument out of a file), keeping this function I/O-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContiguousLayout {
+    /// File offset of the raw data.
+    pub data_addr: u64,
+    /// Size of the raw data in bytes (`product(dims) * elem_size`).
+    pub nbytes: u64,
+    /// Dataset dimensions (element counts per axis), from the Dataspace message.
+    pub dims: Vec<u64>,
+    /// File datatype size in bytes, from the Datatype message.
+    pub elem_size: u32,
+}
+
+/// Why [`contiguous_layout`] rejected a dataset (P2.8b). Every variant is a
+/// hard-error rejection, not a warning: silently hashing, e.g., a variable-
+/// length dataset's global-heap identifiers as if they were the data would
+/// produce a proof that certifies pointers rather than values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedLayoutReason {
+    /// Layout is compact, chunked, or virtual -- not contiguous at all.
+    NotContiguous,
+    /// Contiguous layout with no allocated address (never written).
+    Unallocated,
+    /// External storage (`H5Pset_external`): the payload lives in another
+    /// file this parser does not resolve. Detected via the presence of the
+    /// raw External Data Files message (HDF5 message type `0x0007`), which
+    /// this parser recognizes only well enough to reject, not decode.
+    ExternalStorage,
+    /// Variable-length or reference datatype: this byte range holds global-
+    /// heap identifiers or object/region pointers, not the data itself.
+    IndirectDatatype,
+    /// A required message (Dataspace, Datatype, or DataLayout) is missing or
+    /// fails to parse.
+    MalformedHeader,
+}
+
+/// HDF5 message type `0x0007`, External Data Files -- not decoded by
+/// [`crate::message_type::MessageType`] (it parses as `Unknown(0x0007)`),
+/// but its mere presence is enough for [`contiguous_layout`] to reject the
+/// dataset rather than treat an unrelated local placeholder range as real data.
+const EXTERNAL_DATA_FILES_MSG_TYPE: u16 = 0x0007;
+
+/// Read a contiguous dataset's raw-data address and extents straight out of
+/// its object header messages, without modifying anything (P2.8b).
+///
+/// Rejects -- as [`MerkleError::UnsupportedLayout`], never silently -- every
+/// case the contiguous-verification design flags as out of scope: external
+/// storage, unallocated storage, and variable-length/reference datatypes.
+///
+/// # Errors
+///
+/// Returns [`MerkleError::UnsupportedLayout`] if the layout is not a real,
+/// allocated contiguous layout; if external storage is present; if the
+/// datatype is variable-length or a reference; or if the Dataspace,
+/// Datatype, or DataLayout messages are missing or fail to parse.
+pub fn contiguous_layout(
+    header: &crate::object_header::ObjectHeader,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<ContiguousLayout, MerkleError> {
+    use crate::data_layout::DataLayout;
+    use crate::dataspace::Dataspace;
+    use crate::datatype::Datatype;
+    use crate::message_type::MessageType;
+
+    let unsupported =
+        |reason| MerkleError::UnsupportedLayout { reason };
+
+    if header
+        .messages
+        .iter()
+        .any(|m| m.msg_type == MessageType::Unknown(EXTERNAL_DATA_FILES_MSG_TYPE))
+    {
+        return Err(unsupported(UnsupportedLayoutReason::ExternalStorage));
+    }
+
+    let find = |t: MessageType| header.messages.iter().find(|m| m.msg_type == t);
+
+    let ds_msg =
+        find(MessageType::Dataspace).ok_or_else(|| unsupported(UnsupportedLayoutReason::MalformedHeader))?;
+    let dataspace = Dataspace::parse(&ds_msg.data, length_size)
+        .map_err(|_| unsupported(UnsupportedLayoutReason::MalformedHeader))?;
+
+    let dt_msg =
+        find(MessageType::Datatype).ok_or_else(|| unsupported(UnsupportedLayoutReason::MalformedHeader))?;
+    let (datatype, _) = Datatype::parse(&dt_msg.data)
+        .map_err(|_| unsupported(UnsupportedLayoutReason::MalformedHeader))?;
+    if matches!(
+        datatype,
+        Datatype::VariableLength { .. } | Datatype::Reference { .. }
+    ) {
+        return Err(unsupported(UnsupportedLayoutReason::IndirectDatatype));
+    }
+
+    let dl_msg =
+        find(MessageType::DataLayout).ok_or_else(|| unsupported(UnsupportedLayoutReason::MalformedHeader))?;
+    let layout = DataLayout::parse(&dl_msg.data, offset_size, length_size)
+        .map_err(|_| unsupported(UnsupportedLayoutReason::MalformedHeader))?;
+
+    let (data_addr, nbytes) = match layout {
+        DataLayout::Contiguous {
+            address: Some(addr),
+            size,
+        } => (addr, size),
+        DataLayout::Contiguous { address: None, .. } => {
+            return Err(unsupported(UnsupportedLayoutReason::Unallocated));
+        }
+        _ => return Err(unsupported(UnsupportedLayoutReason::NotContiguous)),
+    };
+
+    Ok(ContiguousLayout {
+        data_addr,
+        nbytes,
+        dims: dataspace.dimensions,
+        elem_size: datatype.type_size(),
+    })
+}
+
 /// Leaf-linearization ordering used to map an N-dimensional chunk
 /// coordinate to a 1D Merkle-tree leaf index (RQ6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1366,5 +1491,595 @@ mod tests {
         );
 
         assert_ne!(contiguous_grid.grid_hash, chunked_grid.grid_hash);
+    }
+
+    /// P2.8b's load-bearing structural claim: the verifier must be
+    /// layout-blind. If `verify_subset` ever has to branch on `LayoutClass`,
+    /// the "contiguous reduces to chunked" design claim is false and the
+    /// format must be corrected before it freezes. `LayoutClass` may appear
+    /// only where the grid hash is computed (`compute_grid_hash` and the
+    /// struct field it reads), never as control flow in the verify path.
+    #[test]
+    fn test_verify_subset_never_branches_on_layout_class() {
+        let src = include_str!("subset_proof.rs");
+        let start = src
+            .find("pub fn verify_subset(")
+            .expect("verify_subset should exist");
+        // The verifier body ends at the start of the test module.
+        let end = src[start..]
+            .find("\n#[cfg(test)]")
+            .map(|off| start + off)
+            .expect("test module should follow verify_subset");
+        let body = &src[start..end];
+
+        for (i, line) in body.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("LayoutClass"),
+                "verify_subset branches on LayoutClass at body line {i}: {line}\n\
+                 The layout class must only ever reach the verifier through \
+                 compute_grid_hash's preimage, never as control flow."
+            );
+        }
+    }
+
+    /// The sharpest statement of the reuse claim: a contiguous dataset and a
+    /// chunked dataset holding the same bytes under the same grid produce
+    /// proofs that are byte-identical in every field EXCEPT `layout_class`
+    /// and the `grid_hash` it feeds. Same root, same leaf hashes, same
+    /// proof nodes, same indices.
+    #[test]
+    fn test_contiguous_and_chunked_proofs_are_identical_except_grid_hash() {
+        let dims = vec![100u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..100u32).flat_map(|v| v.to_le_bytes()).collect();
+        let target_bytes = 64;
+
+        let (contiguous_tree, contiguous_grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, target_bytes, HashAlg::Blake3);
+
+        // The "h5repack'ed chunked copy": same bytes, tiled the same way,
+        // but presented as a real chunk grid.
+        let chunk_shape = contiguous_grid.chunk_shape.clone();
+        let n_leaves = dims[0].div_ceil(chunk_shape[0]);
+        let leaves: Vec<&[u8]> = (0..n_leaves)
+            .map(|idx| {
+                let r = verification_grid::leaf_byte_range(&chunk_shape, &dims, elem_size, idx);
+                &data[r.start as usize..r.end as usize]
+            })
+            .collect();
+        let chunked_tree = MerkleTree::from_chunks(&leaves, HashAlg::Blake3);
+        let chunked_grid = ChunkGridParams::new(
+            dims.clone(),
+            chunk_shape,
+            elem_size,
+            LayoutClass::Chunked,
+            HashAlg::Blake3,
+        );
+
+        assert_eq!(contiguous_tree.root(), chunked_tree.root());
+
+        let sel = Selection::slice(&[10..40]);
+        let c_proof = extract_subset(&contiguous_tree, &contiguous_grid, &sel, LeafOrder::RowMajor)
+            .unwrap();
+        let k_proof =
+            extract_subset(&chunked_tree, &chunked_grid, &sel, LeafOrder::RowMajor).unwrap();
+
+        assert_eq!(c_proof.chunk_indices, k_proof.chunk_indices);
+        assert_eq!(c_proof.leaf_hashes, k_proof.leaf_hashes);
+        assert_eq!(c_proof.proof_nodes, k_proof.proof_nodes);
+        assert_eq!(c_proof.grid_params.dims, k_proof.grid_params.dims);
+        assert_eq!(c_proof.grid_params.chunk_shape, k_proof.grid_params.chunk_shape);
+        assert_eq!(c_proof.grid_params.elem_size, k_proof.grid_params.elem_size);
+
+        // ...differing ONLY in layout_class and the grid_hash it feeds (and
+        // hence the coverage cert that binds the grid hash).
+        assert_ne!(c_proof.grid_params.layout_class, k_proof.grid_params.layout_class);
+        assert_ne!(c_proof.grid_params.grid_hash, k_proof.grid_params.grid_hash);
+
+        // The SubsetProof struct itself is unchanged from P1.5: no
+        // byte-range variant, no new field. Both proofs verify through the
+        // identical, unmodified P1.5 entry point.
+        for (tree, grid, proof) in [
+            (&contiguous_tree, &contiguous_grid, &c_proof),
+            (&chunked_tree, &chunked_grid, &k_proof),
+        ] {
+            let delivered: Vec<ChunkData<'_>> = proof
+                .chunk_indices
+                .iter()
+                .map(|&idx| {
+                    let r = verification_grid::leaf_byte_range(
+                        &grid.chunk_shape,
+                        &dims,
+                        elem_size,
+                        idx as u64,
+                    );
+                    ChunkData {
+                        index: idx,
+                        data: &data[r.start as usize..r.end as usize],
+                    }
+                })
+                .collect();
+            assert!(
+                verify_subset(
+                    tree.root(),
+                    HashAlg::Blake3,
+                    &delivered,
+                    proof,
+                    grid,
+                    &grid.grid_hash,
+                    &sel,
+                    LeafOrder::RowMajor,
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    /// P2.8b negative test 1: a verifier that re-derives the grid at a
+    /// different target than the prover used must be rejected on the grid
+    /// hash -- not succeed, and not fail with a confusing hash mismatch
+    /// deeper in the proof path.
+    #[test]
+    fn test_grid_substitution_at_a_different_target_is_rejected() {
+        let dims = vec![100u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..100u32).flat_map(|v| v.to_le_bytes()).collect();
+
+        let (tree, prover_grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, 64, HashAlg::Blake3);
+        let (_, verifier_grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, 256, HashAlg::Blake3);
+        assert_ne!(prover_grid.chunk_shape, verifier_grid.chunk_shape);
+
+        let sel = Selection::slice(&[10..40]);
+        let proof = extract_subset(&tree, &prover_grid, &sel, LeafOrder::RowMajor).unwrap();
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| {
+                let r = verification_grid::leaf_byte_range(
+                    &prover_grid.chunk_shape,
+                    &dims,
+                    elem_size,
+                    idx as u64,
+                );
+                ChunkData {
+                    index: idx,
+                    data: &data[r.start as usize..r.end as usize],
+                }
+            })
+            .collect();
+
+        // The trusted grid hash is the prover's (it's what the file binds),
+        // but the verifier re-derived a different grid from its own config.
+        let err = verify_subset(
+            tree.root(),
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &verifier_grid,
+            &prover_grid.grid_hash,
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MerkleError::GridHashMismatch),
+            "expected GridHashMismatch, got {err:?}"
+        );
+    }
+
+    /// P2.8b negative test 2: a contiguous proof presented with
+    /// `layout_class` flipped to `Chunked` (identical dims and shape) must
+    /// fail on the grid hash. This is what stops a cross-layout replay.
+    #[test]
+    fn test_layout_class_flip_is_rejected_on_grid_hash() {
+        let dims = vec![100u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..100u32).flat_map(|v| v.to_le_bytes()).collect();
+
+        let (tree, grid) = contiguous_tree_and_grid(&data, &dims, elem_size, 64, HashAlg::Blake3);
+        let sel = Selection::slice(&[10..40]);
+        let proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor).unwrap();
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| {
+                let r = verification_grid::leaf_byte_range(
+                    &grid.chunk_shape,
+                    &dims,
+                    elem_size,
+                    idx as u64,
+                );
+                ChunkData {
+                    index: idx,
+                    data: &data[r.start as usize..r.end as usize],
+                }
+            })
+            .collect();
+
+        // Same dims, same chunk_shape, same elem_size -- only the layout
+        // class differs.
+        let mut flipped = grid.clone();
+        flipped.layout_class = LayoutClass::Chunked;
+        flipped.grid_hash = compute_grid_hash(
+            &flipped.dims,
+            &flipped.chunk_shape,
+            flipped.elem_size,
+            LayoutClass::Chunked,
+            HashAlg::Blake3,
+        );
+
+        let err = verify_subset(
+            tree.root(),
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &flipped,
+            &grid.grid_hash, // trusted hash still says Contiguous
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MerkleError::GridHashMismatch),
+            "expected GridHashMismatch, got {err:?}"
+        );
+    }
+
+    /// P2.8b negative test 3: the reinterpretation attack -- the same bytes
+    /// re-presented under a different element width (f32 claimed as f64),
+    /// which halves the apparent extent -- must fail on the grid hash.
+    #[test]
+    fn test_elem_size_reinterpretation_is_rejected_on_grid_hash() {
+        let dims = vec![100u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..100u32).flat_map(|v| v.to_le_bytes()).collect();
+
+        let (tree, grid) = contiguous_tree_and_grid(&data, &dims, elem_size, 64, HashAlg::Blake3);
+        let sel = Selection::slice(&[10..40]);
+        let proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor).unwrap();
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| {
+                let r = verification_grid::leaf_byte_range(
+                    &grid.chunk_shape,
+                    &dims,
+                    elem_size,
+                    idx as u64,
+                );
+                ChunkData {
+                    index: idx,
+                    data: &data[r.start as usize..r.end as usize],
+                }
+            })
+            .collect();
+
+        // Same byte stream, claimed as f64 over half as many elements.
+        let reinterpreted = ChunkGridParams::new(
+            vec![50],
+            grid.chunk_shape.clone(),
+            8,
+            LayoutClass::Contiguous,
+            HashAlg::Blake3,
+        );
+
+        let err = verify_subset(
+            tree.root(),
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &reinterpreted,
+            &grid.grid_hash,
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MerkleError::GridHashMismatch),
+            "expected GridHashMismatch, got {err:?}"
+        );
+    }
+
+    /// P2.8b tamper localization: flipping one byte inside leaf `j` must be
+    /// reported as a mismatch localized to leaf `j`, and `leaf_byte_range`'s
+    /// reported range for that leaf must contain the flipped offset.
+    /// Localization granularity is the practical benefit over flat hashing,
+    /// so it's measured here rather than assumed.
+    #[test]
+    fn test_tamper_is_localized_to_the_correct_leaf() {
+        let dims = vec![100u64];
+        let elem_size = 4u32;
+        let mut data: Vec<u8> = (0..100u32).flat_map(|v| v.to_le_bytes()).collect();
+        let target_bytes = 64;
+
+        let (tree, grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, target_bytes, HashAlg::Blake3);
+
+        let tampered_leaf = 2u64;
+        let leaf_range =
+            verification_grid::leaf_byte_range(&grid.chunk_shape, &dims, elem_size, tampered_leaf);
+        let flip_offset = leaf_range.start + 5;
+        assert!(
+            leaf_range.contains(&flip_offset),
+            "the reported byte range for leaf {tampered_leaf} must contain the flipped offset"
+        );
+        data[flip_offset as usize] ^= 0xFF;
+
+        let sel = Selection::All;
+        let proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor).unwrap();
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| {
+                let r = verification_grid::leaf_byte_range(
+                    &grid.chunk_shape,
+                    &dims,
+                    elem_size,
+                    idx as u64,
+                );
+                ChunkData {
+                    index: idx,
+                    data: &data[r.start as usize..r.end as usize],
+                }
+            })
+            .collect();
+
+        let err = verify_subset(
+            tree.root(),
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &grid,
+            &grid.grid_hash,
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .unwrap_err();
+
+        match err {
+            MerkleError::HashMismatch { chunk_idx } => {
+                assert_eq!(
+                    chunk_idx as u64, tampered_leaf,
+                    "tamper should localize to leaf {tampered_leaf}, not {chunk_idx}"
+                );
+            }
+            other => panic!("expected HashMismatch localized to a leaf, got {other:?}"),
+        }
+    }
+
+    /// P2.8b byte-order hazard: leaf preimages must be computed over raw
+    /// *file* bytes in file byte order, never over converted in-memory
+    /// values, or a big-endian and a little-endian reader disagree on the
+    /// root of the same file.
+    ///
+    /// Simulated with a byte-swapping reader: the same logical f64 values
+    /// encoded big-endian are a *different byte stream* and must therefore
+    /// produce a different root -- and, critically, a reader that byte-swaps
+    /// the little-endian file into native values before hashing would
+    /// produce that same wrong root. Getting the same root from both
+    /// encodings would mean the implementation is hashing decoded values.
+    #[test]
+    fn test_root_is_over_raw_file_bytes_not_converted_values() {
+        let dims = vec![100u64];
+        let elem_size = 8u32;
+        let values: Vec<f64> = (0..100).map(f64::from).collect();
+
+        let le_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let be_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+
+        let (le_tree, _) =
+            contiguous_tree_and_grid(&le_bytes, &dims, elem_size, 64, HashAlg::Blake3);
+        let (be_tree, _) =
+            contiguous_tree_and_grid(&be_bytes, &dims, elem_size, 64, HashAlg::Blake3);
+
+        assert_ne!(
+            le_tree.root(),
+            be_tree.root(),
+            "the same logical values in different file byte orders are different \
+             byte streams and must hash differently -- an equal root here would \
+             mean leaves are computed over decoded values, not raw file bytes"
+        );
+
+        // The same raw bytes always give the same root regardless of what
+        // machine reads them: hashing depends only on the byte stream.
+        let (le_again, _) =
+            contiguous_tree_and_grid(&le_bytes, &dims, elem_size, 64, HashAlg::Blake3);
+        assert_eq!(le_tree.root(), le_again.root());
+    }
+
+    /// P2.8b step 1: `contiguous_layout` reads a real file's raw-data address
+    /// and extents out of the object header, and the bytes at that address
+    /// are the ones `contiguous_tree_and_grid` should be handed.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_contiguous_layout_reads_real_file_address_and_extents() {
+        use crate::file_writer::FileWriter;
+        use crate::group_v2::resolve_path_any;
+        use crate::object_header::ObjectHeader;
+        use crate::signature::find_signature;
+        use crate::superblock::Superblock;
+
+        let values: Vec<f64> = (0..1000).map(f64::from).collect();
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("readings");
+        ds.with_f64_data(&values);
+        let expected_bytes = ds.data.clone().unwrap();
+        let file_bytes = fw.finish().expect("file should build");
+
+        let sig = find_signature(&file_bytes).unwrap();
+        let sb = Superblock::parse(&file_bytes, sig).unwrap();
+        let addr = resolve_path_any(&file_bytes, &sb, "readings").unwrap();
+        let hdr =
+            ObjectHeader::parse(&file_bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+
+        let layout = contiguous_layout(&hdr, sb.offset_size, sb.length_size)
+            .expect("a plain f64 dataset should be supported");
+
+        assert_eq!(layout.dims, vec![1000]);
+        assert_eq!(layout.elem_size, 8);
+        assert_eq!(layout.nbytes, 8000);
+        let on_disk = &file_bytes
+            [layout.data_addr as usize..(layout.data_addr + layout.nbytes) as usize];
+        assert_eq!(on_disk, expected_bytes.as_slice());
+    }
+
+    /// P2.8b step 1: a chunked dataset is not a contiguous byte stream and
+    /// must be rejected rather than silently misread.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_contiguous_layout_rejects_chunked() {
+        use crate::file_writer::FileWriter;
+        use crate::group_v2::resolve_path_any;
+        use crate::object_header::ObjectHeader;
+        use crate::signature::find_signature;
+        use crate::superblock::Superblock;
+
+        let values: Vec<f64> = (0..1000).map(f64::from).collect();
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("readings");
+        ds.with_f64_data(&values);
+        ds.with_chunks(&[100]);
+        let file_bytes = fw.finish().expect("file should build");
+
+        let sig = find_signature(&file_bytes).unwrap();
+        let sb = Superblock::parse(&file_bytes, sig).unwrap();
+        let addr = resolve_path_any(&file_bytes, &sb, "readings").unwrap();
+        let hdr =
+            ObjectHeader::parse(&file_bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+
+        let err = contiguous_layout(&hdr, sb.offset_size, sb.length_size).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MerkleError::UnsupportedLayout {
+                    reason: UnsupportedLayoutReason::NotContiguous
+                }
+            ),
+            "expected NotContiguous, got {err:?}"
+        );
+    }
+
+    /// P2.8b step 1: the three hard-error rejections that have no
+    /// `FileWriter` path (this writer emits neither external storage,
+    /// unallocated contiguous storage, nor variable-length datatypes), so
+    /// the headers are assembled directly. Each is the "worst available
+    /// outcome" case: hashing the byte range anyway would certify heap
+    /// identifiers, another file's contents, or uninitialized bytes.
+    #[test]
+    fn test_contiguous_layout_rejects_external_unallocated_and_vlen() {
+        use crate::message_type::MessageType;
+        use crate::object_header::{HeaderMessage, ObjectHeader};
+
+        fn msg(msg_type: MessageType, data: Vec<u8>) -> HeaderMessage {
+            HeaderMessage {
+                msg_type,
+                size: data.len(),
+                flags: 0,
+                creation_order: None,
+                data,
+            }
+        }
+        fn header(messages: Vec<HeaderMessage>) -> ObjectHeader {
+            ObjectHeader {
+                version: 2,
+                messages,
+                reference_count: None,
+                flags: 0,
+                access_time: None,
+                modification_time: None,
+                change_time: None,
+                birth_time: None,
+            }
+        }
+
+        // Dataspace v1, rank 1, extent 100.
+        let mut dataspace = vec![1u8, 1, 0, 0, 0, 0, 0, 0];
+        dataspace.extend_from_slice(&100u64.to_le_bytes());
+        // Datatype: class 1 (float), 8 bytes -- a plain f64.
+        let f64_dt = {
+            let mut d = vec![0x11u8, 0x20, 0x1f, 0x00];
+            d.extend_from_slice(&8u32.to_le_bytes());
+            d.extend_from_slice(&[0x00, 0x00, 0x34, 0x00, 0x00, 0x40, 0x0d, 0xff]);
+            d.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            d
+        };
+        // DataLayout v3, contiguous (class 1), address + size.
+        let contiguous_layout_msg = |addr: [u8; 8]| {
+            let mut d = vec![3u8, 1];
+            d.extend_from_slice(&addr);
+            d.extend_from_slice(&800u64.to_le_bytes());
+            d
+        };
+
+        // (a) External storage: the External Data Files message is present.
+        let external = header(vec![
+            msg(MessageType::Dataspace, dataspace.clone()),
+            msg(MessageType::Datatype, f64_dt.clone()),
+            msg(MessageType::DataLayout, contiguous_layout_msg(1024u64.to_le_bytes())),
+            msg(MessageType::Unknown(0x0007), vec![0u8; 8]),
+        ]);
+        assert!(
+            matches!(
+                contiguous_layout(&external, 8, 8).unwrap_err(),
+                MerkleError::UnsupportedLayout {
+                    reason: UnsupportedLayoutReason::ExternalStorage
+                }
+            ),
+            "external storage must be a hard error"
+        );
+
+        // (b) Unallocated: the undefined-address sentinel (all 0xFF).
+        let unallocated = header(vec![
+            msg(MessageType::Dataspace, dataspace.clone()),
+            msg(MessageType::Datatype, f64_dt.clone()),
+            msg(MessageType::DataLayout, contiguous_layout_msg([0xFFu8; 8])),
+        ]);
+        assert!(
+            matches!(
+                contiguous_layout(&unallocated, 8, 8).unwrap_err(),
+                MerkleError::UnsupportedLayout {
+                    reason: UnsupportedLayoutReason::Unallocated
+                }
+            ),
+            "unallocated storage must be a hard error"
+        );
+
+        // (c) Variable-length: the byte range holds global-heap identifiers,
+        // so a proof over it would certify pointers, not data.
+        let vlen_dt = {
+            let mut d = vec![0x19u8, 0x00, 0x00, 0x00];
+            d.extend_from_slice(&16u32.to_le_bytes());
+            d.extend_from_slice(&f64_dt);
+            d
+        };
+        let vlen = header(vec![
+            msg(MessageType::Dataspace, dataspace.clone()),
+            msg(MessageType::Datatype, vlen_dt),
+            msg(MessageType::DataLayout, contiguous_layout_msg(1024u64.to_le_bytes())),
+        ]);
+        assert!(
+            matches!(
+                contiguous_layout(&vlen, 8, 8).unwrap_err(),
+                MerkleError::UnsupportedLayout {
+                    reason: UnsupportedLayoutReason::IndirectDatatype
+                }
+            ),
+            "variable-length datatypes must be a hard error"
+        );
+
+        // (d) Missing DataLayout message entirely.
+        let malformed = header(vec![
+            msg(MessageType::Dataspace, dataspace),
+            msg(MessageType::Datatype, f64_dt),
+        ]);
+        assert!(matches!(
+            contiguous_layout(&malformed, 8, 8).unwrap_err(),
+            MerkleError::UnsupportedLayout {
+                reason: UnsupportedLayoutReason::MalformedHeader
+            }
+        ));
     }
 }

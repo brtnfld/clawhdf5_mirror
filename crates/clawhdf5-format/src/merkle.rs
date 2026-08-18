@@ -154,6 +154,16 @@ pub enum MerkleError {
     /// attacker tampers with the declared shape/chunk grid while leaving
     /// chunk data and version counters untouched.
     GridHashMismatch,
+    /// A dataset's layout can't be used for contiguous verification-grid
+    /// support (P2.8b). Raised by
+    /// [`subset_proof::contiguous_layout`](crate::subset_proof::contiguous_layout)
+    /// as a hard error rather than a warning: silently hashing, e.g., a
+    /// variable-length dataset's global-heap identifiers would produce a
+    /// proof that certifies pointers rather than data.
+    UnsupportedLayout {
+        /// Why the layout was rejected.
+        reason: crate::subset_proof::UnsupportedLayoutReason,
+    },
 }
 
 /// Reasons why a merkle attribute is invalid.
@@ -276,6 +286,27 @@ impl core::fmt::Display for MerkleError {
                     "chunk-grid parameters do not match the authenticated grid hash"
                 )
             }
+            MerkleError::UnsupportedLayout { reason } => {
+                let msg = match reason {
+                    crate::subset_proof::UnsupportedLayoutReason::NotContiguous => {
+                        "layout is not contiguous (compact, chunked, or virtual)"
+                    }
+                    crate::subset_proof::UnsupportedLayoutReason::Unallocated => {
+                        "contiguous dataset has no allocated storage (never written)"
+                    }
+                    crate::subset_proof::UnsupportedLayoutReason::ExternalStorage => {
+                        "dataset uses external storage (H5Pset_external), unsupported"
+                    }
+                    crate::subset_proof::UnsupportedLayoutReason::IndirectDatatype => {
+                        "variable-length or reference datatype: byte range holds heap \
+                         identifiers, not data"
+                    }
+                    crate::subset_proof::UnsupportedLayoutReason::MalformedHeader => {
+                        "dataspace, datatype, or data layout message missing or unparseable"
+                    }
+                };
+                write!(f, "unsupported layout for contiguous verification: {}", msg)
+            }
         }
     }
 }
@@ -343,6 +374,7 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::JournalUnsupportedVersion { .. } => VerifyResponse::Halt,
         MerkleError::JournalNonMonotonic { .. } => VerifyResponse::Halt,
         MerkleError::GridHashMismatch => VerifyResponse::Halt,
+        MerkleError::UnsupportedLayout { .. } => VerifyResponse::Halt,
     }
 }
 
@@ -3929,6 +3961,144 @@ mod tests {
             attr.verify_grid(&dims, &grid.chunk_shape, elem_size, LayoutClass::Contiguous),
             GridVerifyResult::Valid
         );
+    }
+
+    /// P2.9: `contiguous_tree_and_grid` and `write_merkle_attr`'s
+    /// `LayoutClass::Contiguous` binding (P2.8b) proved correct in-memory,
+    /// but neither had ever been exercised against a real, finished HDF5
+    /// file -- the gap `write_merkle_attr`'s own doc comment flags ("whoever
+    /// builds `tree` ... must tile its raw bytes with that same target").
+    /// This writes a genuinely large (>1 MiB) contiguous dataset so
+    /// `verification_grid` actually splits it, finishes the file, re-parses
+    /// it from scratch (nothing held over from the write side), reads the
+    /// dataset's raw byte range straight out of `DataLayout::Contiguous`,
+    /// and proves + verifies a hyperslab that straddles a tile boundary --
+    /// entirely from on-disk bytes and the on-disk `merkle_root` attribute.
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_contiguous_dataset_subset_proof_survives_real_file_round_trip() {
+        use crate::attribute::{extract_attributes, find_attribute};
+        use crate::data_layout::DataLayout;
+        use crate::file_writer::FileWriter;
+        use crate::group_v2::resolve_path_any;
+        use crate::object_header::ObjectHeader;
+        use crate::selection::Selection;
+        use crate::signature::find_signature;
+        use crate::subset_proof::{ChunkData, LeafOrder, contiguous_tree_and_grid, extract_subset, verify_subset};
+        use crate::superblock::Superblock;
+        use crate::verification_grid::{self, DEFAULT_TARGET_BYTES};
+
+        // 300,000 f64 elements = 2.4 MB, comfortably past the 1 MiB*sqrt(2)
+        // split threshold so the verification grid actually tiles (3 leaves
+        // of 100,000 elements / ~800 KB each), not the single-leaf fallback.
+        let dims = vec![300_000u64];
+        let elem_size = 8u32;
+        let values: Vec<f64> = (0..300_000).map(f64::from).collect();
+
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("readings");
+        ds.with_f64_data(&values);
+        let data = ds.data.clone().expect("data set by with_f64_data");
+
+        let (tree, grid) = contiguous_tree_and_grid(
+            &data,
+            &dims,
+            elem_size,
+            DEFAULT_TARGET_BYTES,
+            HashAlg::Blake3,
+        );
+        assert_eq!(grid.layout_class, LayoutClass::Contiguous);
+        assert_eq!(grid.chunk_shape, vec![100_000u64], "sanity: should actually split into 3 leaves");
+
+        write_merkle_attr(ds, &tree).expect("write_merkle_attr should succeed");
+
+        let file_bytes = fw.finish().expect("file should build");
+
+        // Re-parse from scratch: nothing below this line is held over from
+        // the write side above.
+        let sig_offset = find_signature(&file_bytes).expect("signature not found");
+        let sb = Superblock::parse(&file_bytes, sig_offset).expect("superblock parse failed");
+        let ds_addr =
+            resolve_path_any(&file_bytes, &sb, "readings").expect("readings dataset not found");
+        let ds_hdr = ObjectHeader::parse(&file_bytes, ds_addr as usize, sb.offset_size, sb.length_size)
+            .expect("dataset header parse failed");
+
+        let attrs = extract_attributes(&ds_hdr, sb.length_size).expect("extract attrs failed");
+        let merkle_attr = find_attribute(&attrs, MERKLE_ATTR_NAME).expect("merkle_root attr not found");
+        let attr = MerkleAttr::unpack(&merkle_attr.raw_data).expect("attribute should unpack");
+        assert_eq!(attr.root, *tree.root());
+
+        // The grid_hash bound on disk must verify against the SAME grid a
+        // reader would independently derive -- proving write_merkle_attr's
+        // Contiguous derivation and contiguous_tree_and_grid's derivation
+        // really do agree, not just by construction in-memory.
+        let rederived_chunk_shape =
+            verification_grid::verification_grid(&dims, elem_size, DEFAULT_TARGET_BYTES)
+                .unwrap_or_else(|| dims.clone());
+        assert_eq!(
+            attr.verify_grid(&dims, &rederived_chunk_shape, elem_size, LayoutClass::Contiguous),
+            GridVerifyResult::Valid
+        );
+
+        // Read the raw dataset bytes straight out of the file's own
+        // DataLayout message -- not the in-memory `data` above.
+        let mut layout_msg = None;
+        for msg in &ds_hdr.messages {
+            if msg.msg_type == crate::message_type::MessageType::DataLayout {
+                layout_msg = Some(
+                    DataLayout::parse(&msg.data, sb.offset_size, sb.length_size)
+                        .expect("data layout parse failed"),
+                );
+            }
+        }
+        let DataLayout::Contiguous {
+            address: Some(address),
+            size,
+        } = layout_msg.expect("data layout message not found")
+        else {
+            panic!("expected a real Contiguous layout with an allocated address");
+        };
+        let on_disk_data = &file_bytes[address as usize..(address + size) as usize];
+        assert_eq!(on_disk_data.len(), data.len());
+        assert_eq!(on_disk_data, data.as_slice());
+
+        // Prove and verify a hyperslab straddling the boundary between leaf
+        // 0 (elements 0..100_000) and leaf 1 (elements 100_000..200_000),
+        // entirely from on-disk bytes and the on-disk-verified grid.
+        let sel = Selection::slice(&[99_998..100_002]);
+        let proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor)
+            .expect("extract_subset should succeed");
+        assert_eq!(proof.chunk_indices, vec![0, 1]);
+
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| {
+                let range = verification_grid::leaf_byte_range(
+                    &rederived_chunk_shape,
+                    &dims,
+                    elem_size,
+                    idx as u64,
+                );
+                ChunkData {
+                    index: idx,
+                    data: &on_disk_data[range.start as usize..range.end as usize],
+                }
+            })
+            .collect();
+
+        let ok = verify_subset(
+            &attr.root,
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &grid,
+            &attr.grid_hash,
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .expect("verify_subset should succeed");
+        assert!(ok);
     }
 
     #[test]
