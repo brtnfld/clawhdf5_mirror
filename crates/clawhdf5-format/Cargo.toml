@@ -89,6 +89,11 @@ harness = false
 required-features = ["merkle"]
 
 [[bench]]
+name = "contiguous_bao_baseline"
+harness = false
+required-features = ["merkle", "blake3"]
+
+[[bench]]
 name = "contiguous_tileshape_bench"
 harness = false
 required-features = ["merkle", "blake3"]

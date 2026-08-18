@@ -1,14 +1,16 @@
 # P2.8c — Contiguous Verification Grid: Measured Cost Model
 
-**Status:** Partial. The tile-shape cost model and whole-dataset audit
-throughput are measured on two storage classes. The Bao and `h5repack`
-baselines are **not** measured — see [Not measured](#not-measured). Nothing
-below is extrapolated to the missing conditions.
+**Status:** Partial. The tile-shape cost model, leaf-target sweep,
+whole-dataset audit throughput, and the Bao baseline are measured on two
+storage classes. The `h5repack` baseline is **not** measured — see
+[Not measured](#not-measured). Nothing below is extrapolated to the missing
+conditions.
 
 P2.8a and P2.8b established that contiguous support *works*. This document
 reports what it *costs*, and which leaf construction should ship as the
 default. A negative result here is a real outcome, and there is one: the
-design's whole-dataset audit claim does not hold on fast storage.
+design's whole-dataset audit claim does not hold on fast storage, and two of
+the three Bao predictions are refuted.
 
 ---
 
@@ -225,6 +227,100 @@ which is 1 MB here and is a tunable, not a law. "Use 1 MiB" is the right
 default *on this class of host*; "match the readahead window" is the rule
 that transfers.
 
+## Finding 7 — the Bao comparison: right about I/O, wrong about bytes and proofs
+
+Bao is BLAKE3's own Merkle tree exposed for verified streaming: fixed 1 KiB
+leaves over a flat byte stream. It is the strongest existing alternative to
+the verification grid — same problem, opposite granularity choice — so it is
+the fair baseline. Measured with the reference `bao` 0.13.1 crate in outboard
+mode (a 249 MB sidecar for the 4 GB dataset), against the DAOS grid at a
+1 MiB target, on NVMe:
+
+| | selection | grid | Bao | outcome | predicted |
+|---|---|---|---|---|---|
+| bytes | `cube10` | 10,039,296 | 2,584,576 | Bao wins **3.9×** | Bao wins 25× |
+| | `cube100` | 100,405,248 | 105,144,320 | Bao **loses** 1.05× | Bao wins 2.4× |
+| | `plane` | 5,013,504 | 5,799,936 | Bao loses 1.16× | — |
+| I/O ops | `cube10` | 10 | 100 | Bao loses **10×** | Bao loses 10× |
+| | `cube100` | 100 | 10,000 | Bao loses 100× | — |
+| | `plane` | 4 | 1 | Bao wins 4× | — |
+| proof (naive) | `cube10` | 2,352 | 141,856 | Bao loses **60×** | Bao loses 18× |
+| | `cube100` | 20,352 | 14,390,000 | Bao loses 707× | — |
+| | `plane` | 912 | 1,664,256 | Bao loses 1825× | — |
+| proof (dedup) | `cube10` | 2,352 | 16,416 | Bao loses 7× | — |
+| | `cube100` | 20,352 | 1,357,472 | Bao loses 67× | — |
+| | `plane` | 912 | 125,856 | Bao loses 138× | — |
+
+**The I/O-count prediction is exactly right** — 10× for the 10³ sub-cube, to
+the digit. The other two are not.
+
+*Measurement note.* `cube10` and `plane` naive proof sizes are a full census
+(100 and 1000 slice extractions). `cube100`'s is an **estimate**: 2,000 of
+its 10,000 ranges were extracted and scaled by the sampled mean. The ranges
+are structurally identical — same length, same tree depth, differing only in
+position — so the estimate is faithful, but it is an estimate and is marked
+as one rather than presented as a count. Deduplicated proof sizes are exact
+for all three: they are computed as the distinct witness set over every
+covered chunk, with no sampling.
+
+**The byte prediction is wrong, and Finding 2 explains why.** Bao was
+predicted to win 25× on bytes at `cube10`; it wins 3.9×. At `cube100` it was
+predicted to win 2.4×; it *loses* 1.05×. Root cause: the prediction assumes
+fetching a 1 KiB chunk costs 1 KiB. It does not. Bao touched 103 chunks for
+`cube10` — 105,472 B of ideal traffic — and actually transferred 2,584,576 B,
+a **24.5× over-read**, because every scattered 1 KiB chunk is billed against
+the same 1 MiB readahead window that Finding 2 identified. The finer the
+granularity, the worse that tax bites, so Bao suffers from it more than any
+grid shape does. The two findings are the same mechanism.
+
+**The proof-size prediction is wrong in the harsh direction**: 60× rather
+than 18× at `cube10` naive, and 707× at `cube100`. The design's claim that
+proof size "grows to exceed the delivered data" is **confirmed and then
+some** — at `cube100` the naive proof is 14.39 MB against 4.00 MB of
+delivered data, i.e. **3.6× the payload**. Deduplication helps a great deal
+(707× → 67×) but does not close the gap.
+
+**The decisive result is the `plane` control.** That selection is a single
+contiguous 4 MB byte range, so Bao's flat-stream model costs it nothing —
+it needs just 1 I/O against the grid's 4, its best showing anywhere. Yet its
+proof is still **138× larger than the grid's even fully deduplicated**
+(125,856 B vs 912 B). Since dimensional scatter is entirely absent from this
+case, **Bao's proof-size disadvantage is intrinsic to the 1 KiB leaf size,
+not an artefact of hyperslab geometry**. The 4 GB dataset is 4,194,304 Bao
+leaves against ~4,000 grid leaves — a 1000× leaf count, hence a 22-deep tree
+against 12 — and every covered chunk drags its own witness path. That is the
+structural argument for array-aware leaves, and it is not visible in the
+analytical treatment, which only ever compares scattered selections.
+
+**Bao's wall-clock advantage is an NVMe artefact, and it inverts on HDD.**
+Median read latency, grid (DAOS @ 1 MiB) vs Bao:
+
+| selection | grid NVMe | Bao NVMe | grid HDD | Bao HDD | HDD winner |
+|---|---|---|---|---|---|
+| `cube10` | 2.45 ms | **1.81 ms** | **20.5 ms** | 65.2 ms | grid by 3.2× |
+| `cube100` | 39.1 ms | **26.7 ms** | 1492 ms | **1222 ms** | Bao by 1.2× |
+| `plane` | **0.80 ms** | 1.02 ms | **9.1 ms** | 32.0 ms | grid by 3.5× |
+
+On NVMe Bao wins two of three; on HDD it loses two of three, and its one
+remaining win narrows to 1.2×. This is Finding 4's γ/β effect applied to the
+baseline comparison: Bao's 1 KiB chunks become scattered seeks on rotational
+media, and 100 scattered reads cost more than 10 contiguous ones however
+few bytes each carries. (The `cube10` and `plane` HDD rows sit in the
+drive-cache regime — see below — which if anything *flatters* the grid there;
+but Bao's `cube10` at 2.58 MB in 65.2 ms is 40 MB/s, far under sequential, so
+it is genuinely seek-bound and the direction is robust.)
+
+**Setup cost.** Building the outboard took **6.1 s on NVMe and 134.6 s on
+HDD** — a 22× spread, reported separately from steady-state verification and
+never summed into it. The 249 MB sidecar is 6.2% of the dataset, against the
+grid's ~128 KB of companion nodes for 4,000 leaves.
+
+So the honest summary is narrower than either side's prior: if verification
+is local, on flash, and proofs never travel, Bao is competitive and
+occasionally faster. The verification grid's case rests on proof size, I/O
+count, and rotational media — which is precisely the archival-storage regime
+that motivates contiguous support in the first place.
+
 ---
 
 ## Drive-cache limitation
@@ -275,10 +371,6 @@ Stated rather than estimated, so no reader mistakes a gap for a result:
   program and was not substituted silently. Consequently
   `contiguous-baselines.csv`, `setup_*` columns, and the per-storage-class
   `crossover_verifications` figure are **not produced**.
-- **Bao / BLAKE3 byte-range baseline.** Not implemented. The design's
-  specific predictions (Bao wins ~25× on bytes for the 10³ sub-cube, loses
-  ~10× on I/O count and ~18× on proof size, advantage collapsing to ~2.4×
-  at 100³) remain **unconfirmed and uncorrected**.
 - **`seq_write_mbps`** is absent from the CSV: nothing in the measured set
   writes, and it exists to parameterise the `h5repack` comparison that was
   not run.
@@ -337,6 +429,12 @@ subtraction shows.
   over 30 trials.
 - `crates/clawhdf5-format/benches/results/contiguous-audit-throughput.csv` —
   raw per-trial audit timings, 5 trials × 2 approaches × 2 storage classes.
+- `crates/clawhdf5-format/benches/results/contiguous-target-sweep.csv` —
+  leaf-target sweep, 5 targets × 3 selections × 2 storage classes.
+- `crates/clawhdf5-format/benches/results/contiguous-baselines.csv` — the Bao
+  baseline, 3 selections × 2 storage classes, with naive and deduplicated
+  proof sizes.
+- `crates/clawhdf5-format/benches/contiguous_bao_baseline.rs` — the Bao harness.
 - `crates/clawhdf5-format/benches/contiguous_tileshape_bench.rs` — the harness.
 - `crates/clawhdf5-format/benches/analyze_contiguous_tileshape.py` — the
   measured-vs-published comparison.
