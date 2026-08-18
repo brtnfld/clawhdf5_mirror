@@ -567,6 +567,78 @@ fn main() -> std::io::Result<()> {
             .cloned()
             .unwrap_or_else(|| d.to_string())
     };
+    if args.iter().any(|a| a == "--sweep") {
+        // Target sweep: does a target other than 1 MiB beat the default?
+        // Smaller targets amplify less but drop runs below the readahead
+        // window; larger targets amplify more. Measure where the optimum is
+        // instead of arguing from the model.
+        use clawhdf5_format::verification_grid::verification_grid;
+        let dir = PathBuf::from(get("--dir", "."));
+        let sc = get("--storage-class", "unknown");
+        let n_trials: usize = get("--trials", "30").parse().unwrap_or(30);
+        let path = dir.join("clawbench-contiguous-1000cubed.f32");
+        if !path.exists() {
+            eprintln!("generating 4 GB dataset at {}...", path.display());
+            generate_dataset(&path)?;
+        }
+        println!("target_kib,leaf_shape,leaf_bytes,run_len_bytes,storage_class,\
+                  selection,useful_bytes,bytes_transferred,io_ops,read_ms,\
+                  read_ci95_low,read_ci95_high,proof_size_bytes,trials");
+        for shift in [18u32, 19, 20, 21, 22] {
+            let target = 1u64 << shift;
+            let Some(g) = verification_grid(&DIMS, ELEM_SIZE, target) else { continue };
+            let shape = [g[0], g[1], g[2]];
+            let label = format!("{}x{}x{}", shape[0], shape[1], shape[2]);
+            eprintln!("target {}K -> {label}, building tree...", target / 1024);
+            let tree = build_tree_streaming(&path, &shape)?;
+            let grid = ChunkGridParams::new(DIMS.to_vec(), shape.to_vec(), ELEM_SIZE,
+                                            LayoutClass::Contiguous, HashAlg::Blake3);
+            for (sel_label, sel) in selections() {
+                let r = measure(&path, &sc, &shape, &label, sel_label, &sel,
+                                &tree, &grid, n_trials, 5)?;
+                println!("{},{},{},{},{},{},{},{:.0},{},{:.3},{:.3},{:.3},{},{}",
+                         target / 1024, r.leaf_shape, r.leaf_bytes, r.run_len_bytes,
+                         r.storage_class, r.selection, r.useful_bytes,
+                         r.bytes_transferred, r.io_ops, r.read_ms,
+                         r.read_ci.0, r.read_ci.1, r.proof_size_bytes, r.trials);
+            }
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--grids") {
+        // What grid does the DAOS rule derive at each target, and what does
+        // that imply for read amplification? Amplification is the ratio of
+        // bytes that must be read (whole leaves) to bytes actually wanted.
+        use clawhdf5_format::verification_grid::verification_grid;
+        println!("{:>10} {:>16} {:>12} {:>10} {:>12} {:>10} {:>10} {:>10}",
+                 "target", "derived grid", "leaf_bytes", "run_len", "n_leaves",
+                 "amp:c10", "amp:c100", "amp:plane");
+        for shift in 18..=26u32 {
+            let target = 1u64 << shift;
+            let Some(g) = verification_grid(&DIMS, ELEM_SIZE, target) else { continue };
+            let shape = [g[0], g[1], g[2]];
+            let nt = tiles_per_dim(&shape);
+            let runs = leaf_runs(&shape, nt[1] * nt[2]);
+            let leaf_bytes: u64 = runs.iter().map(|(_, l)| *l).sum();
+            let n_leaves = nt[0] * nt[1] * nt[2];
+            let mut amps = Vec::new();
+            for (_, sel) in selections() {
+                let touched = touched_leaves(&shape, &sel).len() as u64;
+                let useful = match &sel {
+                    Selection::Hyperslab { count, block, .. } =>
+                        count.iter().zip(block.iter()).map(|(c, b)| c * b).product::<u64>()
+                            * u64::from(ELEM_SIZE),
+                    _ => 1,
+                };
+                amps.push((touched * leaf_bytes) as f64 / useful as f64);
+            }
+            println!("{:>9}K {:>16} {:>12} {:>10} {:>12} {:>9.1}x {:>9.1}x {:>9.1}x",
+                     target / 1024,
+                     format!("{}x{}x{}", shape[0], shape[1], shape[2]),
+                     leaf_bytes, runs[0].1, n_leaves, amps[0], amps[1], amps[2]);
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--audit") {
         // Step 5: whole-dataset audit throughput. The design claims the
         // streaming tree construction runs at sequential-read bandwidth --

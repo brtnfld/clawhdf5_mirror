@@ -43,6 +43,10 @@ proptest = "1"
 # root, since the Statistical Protocol requires caches dropped for
 # I/O-sensitive runs and this machine has no passwordless sudo.
 libc = "0.2"
+# Dev-only: P2.8c step 3 compares the verification grid against the Bao
+# BLAKE3 verified-streaming baseline at its native 1 KiB granularity. Used
+# only by the contiguous_bao_baseline bench.
+bao = "0.13"
 
 [[bench]]
 name = "bench"

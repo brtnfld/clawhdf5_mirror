@@ -19,14 +19,19 @@ default.** The evidence is that it is the only shape that is never
 catastrophic, not that it wins everywhere:
 
 - It wins **decisively** where absolute cost is large: on HDD it reads a
-  compact 100³ sub-cube in 1.40 s against 2.52 s for `16×16×1000`, and a
-  plane in 9.6 ms against 451 ms — a 47× gap.
+  compact 100³ sub-cube in 1.40 s against 2.52 s for `16×16×1000`. On the
+  plane selection it reads 4.78 MiB against 62.79 MiB, a ~13× advantage once
+  normalised for the drive-cache artefact described below.
 - It **loses** only for the tiny 10³ sub-cube, 20.8 ms vs 4.7 ms on HDD.
   That is a 16 ms absolute difference on a selection that reads 4 KB of
   useful data; no workload notices it.
 - On NVMe the three non-cubic shapes are within 13% of each other, so the
   choice costs nothing there — the default is chosen by its HDD behavior
   because that is the only class where it matters.
+- The 1 MiB **target** is also a true optimum, not an inherited constant: a
+  sweep from 256 KiB to 4 MiB puts the `cube100` byte minimum exactly at
+  1 MiB (Finding 6). The transferable rule is to match the device's readahead
+  window, which is 1 MB on this host.
 
 The cubic shape should not be offered as an option. It is worst or
 near-worst on every selection and every device, and its 256 B runs put it
@@ -136,6 +141,13 @@ ordered by run length**, and the HDD/NVMe penalty climbs monotonically
 across the first three (34× → 45× → 60×) as runs shrink. The design predicts
 the ranking becomes device-sensitive as γ/β changes; it does.
 
+`cube100` is used for this table deliberately: it is the only selection whose
+HDD footprint (96–302 MiB) exceeds the drive's 128 MB onboard cache, so these
+latencies are genuinely platter-bound. See
+[Drive-cache limitation](#drive-cache-limitation) — the `cube10` and `plane`
+HDD latencies are *not* trustworthy in absolute terms, and an earlier draft of
+this document overstated the plane result because of it.
+
 **Anomaly, explained.** Cubic/plane shows an 11× HDD penalty — *lower* than
 every other cell, breaking the monotonic trend. Root cause: on NVMe it takes
 283.9 ms to issue 1,024,000 reads ≈ 277 ns per read, which is `pread`
@@ -174,6 +186,79 @@ hashing is embarrassingly parallel (`clawhdf5-format` already has a
 available cores, and batching larger spans per `update`, are the obvious
 fixes. Neither was attempted here — the number reported is what the current
 implementation does.
+
+## Finding 6 — 1 MiB is the right target, and the reason generalises
+
+The default target was never itself tested, so it was swept from 256 KiB to
+4 MiB (the DAOS rule re-derives a different grid at each), 30 trials,
+measured bytes:
+
+| target | derived grid | run len | `cube10` | `cube100` | `plane` | proof (c100) |
+|---|---|---|---|---|---|---|
+| 256 KiB | `1×63×1000` | 252 KB | 2.44 MiB | 173.84 MiB | 5.53 MiB | 48,352 B |
+| 512 KiB | `1×125×1000` | 500 KB | 4.81 MiB | 148.07 MiB | 4.53 MiB | 32,352 B |
+| **1 MiB** | `1×250×1000` | 1000 KB | 9.57 MiB | **95.75 MiB** | 4.78 MiB | 20,352 B |
+| 2 MiB | `1×500×1000` | 2000 KB | 29.60 MiB | 296.84 MiB | 5.53 MiB | 16,352 B |
+| 4 MiB | `1×1000×1000` | 4000 KB | 39.53 MiB | 382.53 MiB | 5.53 MiB | 12,352 B |
+
+**Going above 1 MiB never helps and usually hurts.** `cube100` costs 3.1×
+more bytes at 2 MiB and 4.0× more at 4 MiB; `cube10` degrades monotonically;
+`plane` is flat. Read amplification (whole leaves read per useful byte) rises
+without bound as leaves outgrow the selection — analytically 25× at 1 MiB,
+100× at 4 MiB, 119× at 64 MiB for `cube100`.
+
+**`cube100` has a true minimum exactly at 1 MiB**, and the mechanism is
+Finding 2. At a 1 MiB target the run length (1,000,000 B) essentially equals
+this host's readahead window (1,048,576 B), so measured bytes are 100.4 MB
+against 100 MB wanted — a 1.0× tax. At 256 KiB the amplification model
+predicts a *better* result (18.9× vs 25×), but the 252 KB runs fall under the
+readahead window and are taxed 2.4×, so it measures 1.8× **worse**. The
+readahead tax more than cancels the amplification advantage.
+
+Smaller targets do win for the tiny `cube10` selection (2.44 MiB at 256 KiB
+vs 9.57 MiB at 1 MiB), and larger targets do shrink proofs monotonically
+(48 KB → 12 KB for `cube100`). Neither outweighs the `cube100` byte minimum.
+
+**The generalisable rule is better than the constant:** set the leaf target
+to the device's readahead window (`/sys/block/<dev>/queue/read_ahead_kb`),
+which is 1 MB here and is a tunable, not a law. "Use 1 MiB" is the right
+default *on this class of host*; "match the readahead window" is the rule
+that transfers.
+
+---
+
+## Drive-cache limitation
+
+`posix_fadvise(POSIX_FADV_DONTNEED)` evicts the kernel page cache but has no
+reach into the **drive's own 128 MB DRAM cache** (WD Black 6TB). Any HDD
+condition whose footprint fits in that cache is therefore served at SATA-link
+speed rather than platter speed. Implied throughput makes this unmistakable:
+
+| condition | bytes read | implied MB/s | verdict |
+|---|---|---|---|
+| `cube10`, all targets ≤ 2 MiB | 2–30 MiB | 416–513 | drive cache |
+| `plane`, all targets | 4–6 MiB | 317–528 | drive cache |
+| `cube100`, all targets | 96–387 MiB | 67–172 | **platter-bound, trustworthy** |
+
+The drive's measured sequential read is 174 MB/s, so any figure materially
+above that cannot have come from the platters.
+
+**What this invalidates.** An earlier draft of this document claimed the DAOS
+shape beats `16×16×1000` on the plane selection by **47×** (9.6 ms vs 451 ms)
+on HDD. That compared a cache-served number against a platter-served one and
+is **overstated**. Normalising both to the measured 174 MB/s sequential rate
+via their (trustworthy) byte counts — 4.78 MiB vs 62.79 MiB — gives a real
+advantage of about **13×**. The conclusion is unchanged; the magnitude was
+inflated 3.6×, and the corrected figure is the one to quote.
+
+**What survives untouched:** all byte and I/O counts (Findings 1–3, 6) are
+read from `/proc/self/io` and are not timings; the `cube100` latencies
+(Finding 4) exceed the cache; and the audit throughput (Finding 5) streams
+4.0 GB, far beyond it.
+
+Fixing this properly needs either a device larger-footprint than its cache
+for every condition, or `hdparm -W0`/O_DIRECT — neither available without
+root here.
 
 ---
 
