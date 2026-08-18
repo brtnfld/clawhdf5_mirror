@@ -7,6 +7,7 @@ use clawhdf5_format::selection::Selection;
 use clawhdf5_format::subset_proof::{
     ChunkData, ChunkGridParams, LeafOrder, SubsetProof, extract_subset, verify_subset,
 };
+use clawhdf5_format::verification_grid::LayoutClass;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -16,7 +17,7 @@ fn hex(bytes: &[u8]) -> String {
 fn build_grid() -> (MerkleTree, ChunkGridParams, Vec<Vec<u8>>) {
     let dims = vec![8u64, 8u64];
     let chunk_shape = vec![1u64, 1u64];
-    let grid = ChunkGridParams::new(dims, chunk_shape, HashAlg::Blake3);
+    let grid = ChunkGridParams::new(dims, chunk_shape, 4, LayoutClass::Chunked, HashAlg::Blake3);
 
     let chunks: Vec<Vec<u8>> = (0..64).map(|i| format!("chunk-{i}").into_bytes()).collect();
     let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
@@ -75,6 +76,17 @@ fn print_proof(label: &str, proof: &SubsetProof, root: &[u8; 32], last: bool) {
             .join(", ")
     );
     println!(
+        "      \"elem_size\": {},",
+        proof.grid_params.elem_size
+    );
+    println!(
+        "      \"layout_class\": \"{}\",",
+        match proof.grid_params.layout_class {
+            LayoutClass::Chunked => "chunked",
+            LayoutClass::Contiguous => "contiguous",
+        }
+    );
+    println!(
         "      \"grid_hash\": \"{}\"",
         hex(&proof.grid_params.grid_hash)
     );
@@ -103,7 +115,8 @@ fn main() {
     println!("  \"description\": \"Verifiable subset extraction test vectors (P1.5)\",");
     println!("  \"specification\": \"S2-D2-Yr2/Merkle-tree-HDF5.tex sec:subset\",");
     println!(
-        "  \"grid\": {{ \"dims\": [8, 8], \"chunk_shape\": [1, 1], \"leaf_order\": \"row_major\" }},"
+        "  \"grid\": {{ \"dims\": [8, 8], \"chunk_shape\": [1, 1], \"elem_size\": 4, \
+         \"layout_class\": \"chunked\", \"leaf_order\": \"row_major\" }},"
     );
     println!("  \"root\": \"{}\",", hex(&root));
 

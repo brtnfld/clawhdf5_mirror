@@ -10,9 +10,9 @@
     "grid_params": {
       "dims": [65536],
       "chunk_shape": [1],
-      "grid_hash": "af567b1093c8e03ce72d92eb5cb1f9dace521fef038ff48d48113065d40a79dc"
+      "grid_hash": "5806ae496e6ec0b21a65d2d128f4ade999b9d276b5a28fcf41c44b4f34da6467"
     },
-    "coverage_cert": "e7d2bd41b0bb6e5480fdb606fc469721d29cf719048589bbf13d41834e6627bd"
+    "coverage_cert": "47ebdd9f09b7358a72ce718625a557e1a0f8ce948c8dccab1bfea2f3548952de"
   },
   {
     "hyperslab_type": "strided",
@@ -25,9 +25,9 @@
     "grid_params": {
       "dims": [65536],
       "chunk_shape": [1],
-      "grid_hash": "af567b1093c8e03ce72d92eb5cb1f9dace521fef038ff48d48113065d40a79dc"
+      "grid_hash": "5806ae496e6ec0b21a65d2d128f4ade999b9d276b5a28fcf41c44b4f34da6467"
     },
-    "coverage_cert": "9079c400de1de316c20044842db8597ec1f5c82152337fc9a05af8e4898fc0d5"
+    "coverage_cert": "030b2966114f5d3f3818323459daae5e6fe4fb8399cd650ee14a1215d1f246ec"
   },
   {
     "hyperslab_type": "random",
@@ -40,8 +40,8 @@
     "grid_params": {
       "dims": [65536],
       "chunk_shape": [1],
-      "grid_hash": "af567b1093c8e03ce72d92eb5cb1f9dace521fef038ff48d48113065d40a79dc"
+      "grid_hash": "5806ae496e6ec0b21a65d2d128f4ade999b9d276b5a28fcf41c44b4f34da6467"
     },
-    "coverage_cert": "f57cdeaacc5121cf993487560148252c32dc41ac3454b2bea53a05fedece8f37"
+    "coverage_cert": "7898d67c3d0f9e2b5e0a411764bf9e821621337b64a5546dcc30f1bad4a89dbb"
   }
 ]

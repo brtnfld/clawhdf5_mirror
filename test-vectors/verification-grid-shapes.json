@@ -1,0 +1,49 @@
+{
+  "description": "Verification-grid derivation test vectors (P2.8a)",
+  "specification": "S2-D2-Yr2/Merkle-tree-HDF5.tex sec:contiguous-design",
+  "target_bytes": 1048576,
+  "cases": [
+    {
+      "dims": [1000, 1000, 1000],
+      "elem_size": 4,
+      "grid": [1, 250, 1000],
+      "n_leaves": 4000,
+      "note": "4000 leaves, depth 12"
+    },
+    {
+      "dims": [8760, 720, 1440],
+      "elem_size": 4,
+      "grid": [1, 180, 1440],
+      "n_leaves": 35040,
+      "note": "35,040 leaves, depth 16"
+    },
+    {
+      "dims": [1073741824],
+      "elem_size": 8,
+      "grid": [131072],
+      "n_leaves": 8192,
+      "note": "1-D, 8192 leaves"
+    },
+    {
+      "dims": [1000000],
+      "elem_size": 4,
+      "grid": [250000],
+      "n_leaves": 4,
+      "note": "1-D, 4 leaves"
+    },
+    {
+      "dims": [100, 100],
+      "elem_size": 8,
+      "grid": null,
+      "n_leaves": 1,
+      "note": "below threshold, single leaf"
+    },
+    {
+      "dims": [2, 3, 4],
+      "elem_size": 4,
+      "grid": null,
+      "n_leaves": 1,
+      "note": "degenerate, single leaf"
+    }
+  ]
+}

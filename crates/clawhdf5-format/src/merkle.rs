@@ -49,6 +49,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
+use crate::verification_grid::LayoutClass;
+
 /// Size of hash output in bytes (256 bits).
 pub(crate) const HASH_SIZE: usize = 32;
 
@@ -60,6 +62,13 @@ const INTERNAL_PREFIX: u8 = 0x01;
 
 /// Domain separator for null/unallocated sparse-chunk slots.
 const NULL_PREFIX: u8 = 0x02;
+
+/// Domain separator for the grid-parameter preimage (P2.8a). `0x03` was
+/// already taken by [`INTEGRITY_PREFIX`], so the grid preimage continues the
+/// scheme at `0x04`. Its purpose is the same as the others: a grid-parameter
+/// preimage must never be reinterpretable as a leaf, an internal node, a
+/// null sentinel, or an attribute-integrity hash.
+pub(crate) const GRID_PREFIX: u8 = 0x04;
 
 /// Maximum tree depth (supports up to 2^40 ≈ 1 trillion chunks).
 /// Prevents out-of-memory attacks from maliciously large inputs.
@@ -493,6 +502,20 @@ impl HashAlg {
         combined[1..HASH_SIZE + 1].copy_from_slice(left);
         combined[HASH_SIZE + 1..].copy_from_slice(right);
         self.hash_raw(&combined)
+    }
+
+    /// Hash a grid-parameter preimage with domain separation prefix `0x04`
+    /// (P2.8a; see [`GRID_PREFIX`]).
+    ///
+    /// Applies the prefix directly rather than routing through
+    /// [`Self::hash_leaf`]: nesting it inside a leaf preimage would produce
+    /// `H(0x00 || 0x04 || ...)`, which collides with the leaf hash of chunk
+    /// data that happens to begin with `0x04` — exactly the confusion the
+    /// prefix scheme exists to prevent.
+    #[inline]
+    #[must_use]
+    pub fn hash_grid(&self, data: &[u8]) -> [u8; HASH_SIZE] {
+        self.hash_raw(data)
     }
 
     /// Compute the null sentinel hash for padding sparse-chunk slots.
@@ -1430,22 +1453,35 @@ impl MerkleAttr {
 
     /// Verify the chunk-grid parameters against the stored grid hash.
     ///
-    /// Computes `H(dims || chunk_shape)` the same way
-    /// `subset_proof::compute_grid_hash` does and compares it with the
-    /// stored `grid_hash`, using this attribute's own hash algorithm.
+    /// Computes `H(0x04 || layout_class || elem_size || dims || chunk_shape)`
+    /// the same way `subset_proof::compute_grid_hash` does and compares it
+    /// with the stored `grid_hash`, using this attribute's own hash
+    /// algorithm.
     ///
     /// # Returns
     ///
-    /// - `Valid`: Grid hash matches the provided `dims`/`chunk_shape`
+    /// - `Valid`: Grid hash matches the provided parameters
     /// - `NoGrid`: No grid hash present (hash is all zeros)
     /// - `HashMismatch`: Verification failed (possible tampering)
     #[must_use]
-    pub fn verify_grid(&self, dims: &[u64], chunk_shape: &[u64]) -> GridVerifyResult {
+    pub fn verify_grid(
+        &self,
+        dims: &[u64],
+        chunk_shape: &[u64],
+        elem_size: u32,
+        layout_class: LayoutClass,
+    ) -> GridVerifyResult {
         // All zeros means no grid hash bound
         if self.grid_hash == [0u8; HASH_SIZE] {
             return GridVerifyResult::NoGrid;
         }
-        let computed = crate::subset_proof::compute_grid_hash(dims, chunk_shape, self.algorithm);
+        let computed = crate::subset_proof::compute_grid_hash(
+            dims,
+            chunk_shape,
+            elem_size,
+            layout_class,
+            self.algorithm,
+        );
         if constant_time_eq(&computed, &self.grid_hash) {
             GridVerifyResult::Valid
         } else {
@@ -1798,19 +1834,27 @@ impl<'a> MerkleAttrRef<'a> {
     ///
     /// # Returns
     ///
-    /// - `Ok(Valid)`: Grid hash matches the provided `dims`/`chunk_shape`
+    /// - `Ok(Valid)`: Grid hash matches the provided parameters
     /// - `Ok(NoGrid)`: No grid hash present (hash is all zeros)
     /// - `Ok(HashMismatch)`: Verification failed (possible tampering)
     pub fn verify_grid(
         &self,
         dims: &[u64],
         chunk_shape: &[u64],
+        elem_size: u32,
+        layout_class: LayoutClass,
     ) -> Result<GridVerifyResult, MerkleError> {
         if !self.has_grid_hash() {
             return Ok(GridVerifyResult::NoGrid);
         }
         let algorithm = self.algorithm()?;
-        let computed = crate::subset_proof::compute_grid_hash(dims, chunk_shape, algorithm);
+        let computed = crate::subset_proof::compute_grid_hash(
+            dims,
+            chunk_shape,
+            elem_size,
+            layout_class,
+            algorithm,
+        );
         // Safe: grid_hash() always returns exactly HASH_SIZE bytes for v0
         let grid_arr: &[u8; HASH_SIZE] = match self.grid_hash().try_into() {
             Ok(arr) => arr,
@@ -1872,9 +1916,17 @@ impl<'a> From<&'a MerkleAttr> for MerkleAttrRef<'static> {
 /// declared shape/chunk grid could be tampered with undetected (see
 /// [`subset_proof::verify_subset`](crate::subset_proof::verify_subset)'s
 /// `trusted_grid_hash` parameter, which authenticates against exactly this
-/// field). If either is unset (e.g. an unchunked/contiguous dataset with
-/// no `with_chunks` call), the grid hash is left at the all-zero "not
-/// bound" sentinel, matching prior behavior.
+/// field). An unchunked (contiguous) dataset -- shape and datatype set, but
+/// no `with_chunks` call -- gets [`LayoutClass::Contiguous`] instead: the
+/// leaf grid is derived automatically via
+/// [`verification_grid::verification_grid`](crate::verification_grid::verification_grid)
+/// at [`verification_grid::DEFAULT_TARGET_BYTES`](crate::verification_grid::DEFAULT_TARGET_BYTES)
+/// (P2.8b). Whoever builds `tree` for a contiguous dataset must tile its raw
+/// bytes with that same target -- see
+/// [`subset_proof::contiguous_tree_and_grid`](crate::subset_proof::contiguous_tree_and_grid)
+/// -- or the bound `grid_hash` will describe a different tiling than `tree`
+/// actually hashes. If shape or datatype is unset, the grid hash is left at
+/// the all-zero "not bound" sentinel, matching prior behavior.
 ///
 /// # Arguments
 ///
@@ -1905,9 +1957,33 @@ pub fn write_merkle_attr(
     dataset: &mut crate::type_builders::DatasetBuilder,
     tree: &MerkleTree,
 ) -> Result<(), MerkleError> {
-    let grid_hash = match (&dataset.shape, &dataset.chunk_options.chunk_dims) {
-        (Some(dims), Some(chunk_dims)) => {
-            crate::subset_proof::compute_grid_hash(dims, chunk_dims, tree.algorithm())
+    let grid_hash = match (&dataset.shape, &dataset.datatype) {
+        (Some(dims), Some(dt)) => {
+            let elem_size = dt.type_size();
+            match &dataset.chunk_options.chunk_dims {
+                Some(chunk_dims) => crate::subset_proof::compute_grid_hash(
+                    dims,
+                    chunk_dims,
+                    elem_size,
+                    LayoutClass::Chunked,
+                    tree.algorithm(),
+                ),
+                None => {
+                    let chunk_shape = crate::verification_grid::verification_grid(
+                        dims,
+                        elem_size,
+                        crate::verification_grid::DEFAULT_TARGET_BYTES,
+                    )
+                    .unwrap_or_else(|| dims.clone());
+                    crate::subset_proof::compute_grid_hash(
+                        dims,
+                        &chunk_shape,
+                        elem_size,
+                        LayoutClass::Contiguous,
+                        tree.algorithm(),
+                    )
+                }
+            }
         }
         _ => [0u8; HASH_SIZE],
     };
@@ -3714,7 +3790,9 @@ mod tests {
         };
         let attr = MerkleAttr::unpack(packed).expect("attribute should unpack");
 
-        let expected_grid_hash = compute_grid_hash(&[8], &[4], HashAlg::Blake3);
+        // elem_size 1: the dataset was built with `with_u8_data`.
+        let expected_grid_hash =
+            compute_grid_hash(&[8], &[4], 1, LayoutClass::Chunked, HashAlg::Blake3);
         assert_ne!(
             expected_grid_hash,
             [0u8; HASH_SIZE],
@@ -3730,11 +3808,12 @@ mod tests {
 
     #[test]
     #[cfg(feature = "blake3")]
-    fn test_write_merkle_attr_leaves_grid_hash_unbound_without_chunks() {
-        // Mirrors test_write_merkle_attr's setup (no `.with_chunks()` call) to
-        // confirm the fallback path leaves grid_hash at the "not bound"
-        // sentinel rather than erroring or guessing.
+    fn test_write_merkle_attr_binds_contiguous_grid_hash_without_chunks() {
+        // Mirrors test_write_merkle_attr's setup (no `.with_chunks()` call).
+        // P2.8b: an unchunked dataset now gets a LayoutClass::Contiguous grid
+        // hash derived automatically, rather than staying unbound.
         use crate::file_writer::FileWriter;
+        use crate::subset_proof::compute_grid_hash;
         use crate::type_builders::AttrValue;
 
         let chunks = make_test_chunks();
@@ -3757,8 +3836,99 @@ mod tests {
         };
         let attr = MerkleAttr::unpack(packed).expect("attribute should unpack");
 
+        // 4 bytes is far below DEFAULT_TARGET_BYTES, so verification_grid
+        // returns None and the fallback single-leaf chunk_shape == dims.
+        let expected_grid_hash =
+            compute_grid_hash(&[4], &[4], 1, LayoutClass::Contiguous, HashAlg::Blake3);
+        assert!(attr.has_grid_hash());
+        assert_eq!(attr.grid_hash, expected_grid_hash);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_attr_leaves_grid_hash_unbound_without_shape() {
+        // A dataset with neither shape nor datatype set (no `with_*_data`
+        // call at all) has nothing to derive a grid from, chunked or
+        // contiguous, so grid_hash stays at the "not bound" sentinel.
+        use crate::file_writer::FileWriter;
+        use crate::type_builders::AttrValue;
+
+        let chunks = make_test_chunks();
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+
+        write_merkle_attr(ds, &tree).expect("write_merkle_attr should succeed");
+
+        let (_, packed_value) = ds
+            .attrs
+            .iter()
+            .find(|(name, _)| name == MERKLE_ATTR_NAME)
+            .expect("merkle_root attribute should be set");
+        let AttrValue::Bytes(packed) = packed_value else {
+            panic!("expected Bytes attribute value");
+        };
+        let attr = MerkleAttr::unpack(packed).expect("attribute should unpack");
+
         assert!(!attr.has_grid_hash());
         assert_eq!(attr.grid_hash, [0u8; HASH_SIZE]);
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_write_merkle_attr_binds_contiguous_grid_hash_consistent_with_helper() {
+        // The grid_hash write_merkle_attr independently derives for a
+        // contiguous dataset must match the ChunkGridParams produced by
+        // subset_proof::contiguous_tree_and_grid when both use
+        // DEFAULT_TARGET_BYTES -- otherwise the bound hash would describe a
+        // different tiling than the tree it's supposed to authenticate.
+        use crate::file_writer::FileWriter;
+        use crate::type_builders::AttrValue;
+        use crate::verification_grid::DEFAULT_TARGET_BYTES;
+
+        let values: Vec<i32> = (0..2000i32).collect();
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_i32_data(&values);
+
+        // Read back exactly what write_merkle_attr itself will see, so this
+        // test can't silently drift from its actual inputs.
+        let dims = ds.shape.clone().expect("shape set by with_i32_data");
+        let elem_size = ds
+            .datatype
+            .as_ref()
+            .expect("datatype set by with_i32_data")
+            .type_size();
+        let data = ds.data.clone().expect("data set by with_i32_data");
+
+        let (tree, grid) = crate::subset_proof::contiguous_tree_and_grid(
+            &data,
+            &dims,
+            elem_size,
+            DEFAULT_TARGET_BYTES,
+            HashAlg::Blake3,
+        );
+
+        write_merkle_attr(ds, &tree).expect("write_merkle_attr should succeed");
+
+        let (_, packed_value) = ds
+            .attrs
+            .iter()
+            .find(|(name, _)| name == MERKLE_ATTR_NAME)
+            .expect("merkle_root attribute should be set");
+        let AttrValue::Bytes(packed) = packed_value else {
+            panic!("expected Bytes attribute value");
+        };
+        let attr = MerkleAttr::unpack(packed).expect("attribute should unpack");
+
+        assert_eq!(attr.root, *tree.root());
+        assert_eq!(attr.grid_hash, grid.grid_hash);
+        assert_eq!(
+            attr.verify_grid(&dims, &grid.chunk_shape, elem_size, LayoutClass::Contiguous),
+            GridVerifyResult::Valid
+        );
     }
 
     #[test]
@@ -4022,7 +4192,14 @@ mod tests {
         let companion_hash = compute_sha256(b"test companion data");
         let dims = vec![10u64, 20u64];
         let chunk_shape = vec![2u64, 4u64];
-        let grid_hash = crate::subset_proof::compute_grid_hash(&dims, &chunk_shape, tree.algorithm());
+        let elem_size = 4u32;
+        let grid_hash = crate::subset_proof::compute_grid_hash(
+            &dims,
+            &chunk_shape,
+            elem_size,
+            LayoutClass::Chunked,
+            tree.algorithm(),
+        );
 
         let attr =
             MerkleAttr::from_tree_with_companion_and_grid(&tree, companion_hash, grid_hash);
@@ -4038,7 +4215,7 @@ mod tests {
 
         // Correct dims/chunk_shape verify as Valid.
         assert_eq!(
-            unpacked.verify_grid(&dims, &chunk_shape),
+            unpacked.verify_grid(&dims, &chunk_shape, elem_size, LayoutClass::Chunked),
             GridVerifyResult::Valid
         );
 
@@ -4046,14 +4223,14 @@ mod tests {
         // an attacker changing the declared shape/chunk grid is now detected).
         let tampered_dims = vec![99u64, 20u64];
         assert_eq!(
-            unpacked.verify_grid(&tampered_dims, &chunk_shape),
+            unpacked.verify_grid(&tampered_dims, &chunk_shape, elem_size, LayoutClass::Chunked),
             GridVerifyResult::HashMismatch
         );
 
         // Basic from_tree (no grid hash bound) reports NoGrid.
         let no_grid_attr = MerkleAttr::from_tree(&tree);
         assert_eq!(
-            no_grid_attr.verify_grid(&dims, &chunk_shape),
+            no_grid_attr.verify_grid(&dims, &chunk_shape, elem_size, LayoutClass::Chunked),
             GridVerifyResult::NoGrid
         );
 
@@ -4061,11 +4238,15 @@ mod tests {
         let attr_ref = MerkleAttrRef::from_slice(&packed).expect("should parse");
         assert!(attr_ref.has_grid_hash());
         assert_eq!(
-            attr_ref.verify_grid(&dims, &chunk_shape).unwrap(),
+            attr_ref
+                .verify_grid(&dims, &chunk_shape, elem_size, LayoutClass::Chunked)
+                .unwrap(),
             GridVerifyResult::Valid
         );
         assert_eq!(
-            attr_ref.verify_grid(&tampered_dims, &chunk_shape).unwrap(),
+            attr_ref
+                .verify_grid(&tampered_dims, &chunk_shape, elem_size, LayoutClass::Chunked)
+                .unwrap(),
             GridVerifyResult::HashMismatch
         );
     }

@@ -109,6 +109,8 @@ pub mod subset_proof;
 pub mod superblock;
 pub mod symbol_table;
 pub mod type_builders;
+#[cfg(feature = "merkle")]
+pub mod verification_grid;
 pub mod vl_data;
 
 #[cfg(feature = "provenance")]

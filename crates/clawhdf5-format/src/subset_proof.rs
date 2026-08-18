@@ -17,29 +17,51 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
 
-use crate::merkle::{HASH_SIZE, HashAlg, MerkleError, MerkleTree, constant_time_eq};
+use crate::merkle::{GRID_PREFIX, HASH_SIZE, HashAlg, MerkleError, MerkleTree, constant_time_eq};
 use crate::selection::Selection;
+use crate::verification_grid::{self, LayoutClass};
 
 /// Trusted chunk-grid parameters anchored by the Merkle path to the
 /// file-level signed root (the "coverage certificate" component (b)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkGridParams {
+    /// Whether `chunk_shape` is a real HDF5 chunk grid or a verification
+    /// grid constructed over a contiguous byte stream (P2.8a). Bound into
+    /// `grid_hash`, which is what stops a contiguous dataset's proof from
+    /// being replayed as a chunked one with the same extents.
+    pub layout_class: LayoutClass,
     /// Dataset dimensions (element counts per axis).
     pub dims: Vec<u64>,
-    /// Chunk dimensions (element counts per axis).
+    /// Chunk dimensions (element counts per axis): real chunks under
+    /// [`LayoutClass::Chunked`], the verification grid under
+    /// [`LayoutClass::Contiguous`].
     pub chunk_shape: Vec<u64>,
-    /// `H(dims || chunk_shape)`, binding the grid parameters.
+    /// File datatype size in bytes. Bound into `grid_hash` so the same byte
+    /// stream cannot be re-presented under a different element width (e.g.
+    /// f32 claimed as f64, halving the apparent extent).
+    pub elem_size: u32,
+    /// `H(0x04 || layout_class || elem_size || dims || chunk_shape)`,
+    /// binding the grid parameters.
     pub grid_hash: [u8; HASH_SIZE],
 }
 
 impl ChunkGridParams {
-    /// Construct grid params, computing `grid_hash` from `dims` and `chunk_shape`.
+    /// Construct grid params, computing `grid_hash` from the layout class,
+    /// element size, `dims`, and `chunk_shape`.
     #[must_use]
-    pub fn new(dims: Vec<u64>, chunk_shape: Vec<u64>, alg: HashAlg) -> Self {
-        let grid_hash = compute_grid_hash(&dims, &chunk_shape, alg);
+    pub fn new(
+        dims: Vec<u64>,
+        chunk_shape: Vec<u64>,
+        elem_size: u32,
+        layout_class: LayoutClass,
+        alg: HashAlg,
+    ) -> Self {
+        let grid_hash = compute_grid_hash(&dims, &chunk_shape, elem_size, layout_class, alg);
         Self {
+            layout_class,
             dims,
             chunk_shape,
+            elem_size,
             grid_hash,
         }
     }
@@ -68,15 +90,85 @@ impl ChunkGridParams {
     }
 }
 
-pub(crate) fn compute_grid_hash(dims: &[u64], chunk_shape: &[u64], alg: HashAlg) -> [u8; HASH_SIZE] {
-    let mut buf = Vec::with_capacity((dims.len() + chunk_shape.len()) * 8);
+pub(crate) fn compute_grid_hash(
+    dims: &[u64],
+    chunk_shape: &[u64],
+    elem_size: u32,
+    layout_class: LayoutClass,
+    alg: HashAlg,
+) -> [u8; HASH_SIZE] {
+    let mut buf = Vec::with_capacity(6 + (dims.len() + chunk_shape.len()) * 8);
+    buf.push(GRID_PREFIX);
+    buf.push(layout_class as u8);
+    buf.extend_from_slice(&elem_size.to_le_bytes());
     for &d in dims {
         buf.extend_from_slice(&d.to_le_bytes());
     }
     for &c in chunk_shape {
         buf.extend_from_slice(&c.to_le_bytes());
     }
-    alg.hash_leaf(&buf)
+    alg.hash_grid(&buf)
+}
+
+/// Build a Merkle tree and matching [`ChunkGridParams`] for a *contiguous*
+/// (unchunked) dataset's raw byte stream (P2.8b).
+///
+/// Derives the leaf-granularity grid via
+/// [`verification_grid::verification_grid`], falling back to a single
+/// whole-buffer leaf when the dataset is too small to be worth tiling (that
+/// function's documented `None` case), then slices `data` into the
+/// resulting leaf byte ranges and hashes each range as one Merkle leaf. The
+/// returned [`ChunkGridParams`] carries [`LayoutClass::Contiguous`] and the
+/// derived tiling, so a proof built from this tree can never be replayed
+/// against a real chunk grid with the same extents (or vice versa).
+///
+/// `target_bytes` must match the value `write_merkle_attr` uses to
+/// independently re-derive this same grid when binding `grid_hash` --
+/// [`verification_grid::DEFAULT_TARGET_BYTES`] is that shared default.
+///
+/// # Panics
+///
+/// In debug builds, panics if `data.len()` does not equal the byte size
+/// implied by `dims` and `elem_size` (`elem_size * product(dims)`) -- a
+/// caller bug (inconsistent dataset dimensions), not malicious input, since
+/// this runs on the trusted write path.
+#[must_use]
+pub fn contiguous_tree_and_grid(
+    data: &[u8],
+    dims: &[u64],
+    elem_size: u32,
+    target_bytes: u64,
+    alg: HashAlg,
+) -> (MerkleTree, ChunkGridParams) {
+    debug_assert_eq!(
+        dims.iter()
+            .fold(u128::from(elem_size), |acc, &d| acc * u128::from(d)),
+        data.len() as u128,
+        "contiguous data length does not match dims * elem_size"
+    );
+
+    let chunk_shape = verification_grid::verification_grid(dims, elem_size, target_bytes)
+        .unwrap_or_else(|| dims.to_vec());
+    let grid = ChunkGridParams::new(
+        dims.to_vec(),
+        chunk_shape.clone(),
+        elem_size,
+        LayoutClass::Contiguous,
+        alg,
+    );
+
+    let n_per_dim = grid.n_chunks_per_dim();
+    let total_leaves: u64 = n_per_dim.iter().product();
+
+    let leaves: Vec<&[u8]> = (0..total_leaves)
+        .map(|idx| {
+            let range = verification_grid::leaf_byte_range(&chunk_shape, dims, elem_size, idx);
+            &data[range.start as usize..range.end as usize]
+        })
+        .collect();
+
+    let tree = MerkleTree::from_chunks(&leaves, alg);
+    (tree, grid)
 }
 
 /// Leaf-linearization ordering used to map an N-dimensional chunk
@@ -511,16 +603,24 @@ pub fn verify_subset(
     sel: &Selection,
     order: LeafOrder,
 ) -> Result<bool, MerkleError> {
-    // Authenticate expected_grid's dims/chunk_shape against the caller's
+    // Authenticate expected_grid's parameters against the caller's
     // cryptographically-anchored grid hash *before* trusting anything else
-    // about expected_grid. Recomputing from expected_grid's own dims/
-    // chunk_shape (rather than trusting its `grid_hash` field, which is a
-    // plain pub field an attacker could set to match tampered dims/
-    // chunk_shape) is what prevents a coherent-looking but wrong
-    // `expected_grid` from slipping through when its contents were sourced
-    // from an unauthenticated location (e.g. a live object-header read).
-    let recomputed_grid_hash =
-        compute_grid_hash(&expected_grid.dims, &expected_grid.chunk_shape, alg);
+    // about expected_grid. Recomputing from expected_grid's own fields
+    // (rather than trusting its `grid_hash` field, which is a plain pub
+    // field an attacker could set to match tampered parameters) is what
+    // prevents a coherent-looking but wrong `expected_grid` from slipping
+    // through when its contents were sourced from an unauthenticated
+    // location (e.g. a live object-header read). P2.8a extends the covered
+    // set from dims/chunk_shape to elem_size and layout_class, so a
+    // reinterpretation attack (f32 claimed as f64) or a cross-layout replay
+    // (a contiguous proof presented as chunked) is caught here too.
+    let recomputed_grid_hash = compute_grid_hash(
+        &expected_grid.dims,
+        &expected_grid.chunk_shape,
+        expected_grid.elem_size,
+        expected_grid.layout_class,
+        alg,
+    );
     if !constant_time_eq(&recomputed_grid_hash, trusted_grid_hash) {
         return Err(MerkleError::GridHashMismatch);
     }
@@ -615,7 +715,7 @@ mod tests {
         let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
         let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
         // 1D grid: n_chunks chunks of shape [1], dataset dims [n_chunks].
-        let grid = ChunkGridParams::new(vec![n_chunks as u64], vec![1], HashAlg::Blake3);
+        let grid = ChunkGridParams::new(vec![n_chunks as u64], vec![1], 4, LayoutClass::Chunked, HashAlg::Blake3);
         (tree, grid, chunks)
     }
 
@@ -652,7 +752,7 @@ mod tests {
         // one with a zero `chunk_shape` entry directly (bypassing every
         // `validate_grid_shape` gate inside this module) and then call the
         // public accessors straight away.
-        let grid = ChunkGridParams::new(vec![10, 10], vec![2, 0], HashAlg::Blake3);
+        let grid = ChunkGridParams::new(vec![10, 10], vec![2, 0], 4, LayoutClass::Chunked, HashAlg::Blake3);
         assert_eq!(grid.n_chunks_per_dim(), vec![5, 0]);
         assert_eq!(grid.total_chunk_count(), 0);
     }
@@ -832,7 +932,7 @@ mod tests {
         // 4x4 grid of single-element chunks, built with Morton leaf ordering.
         let dims = vec![4u64, 4u64];
         let chunk_shape = vec![1u64, 1u64];
-        let grid = ChunkGridParams::new(dims, chunk_shape, HashAlg::Blake3);
+        let grid = ChunkGridParams::new(dims, chunk_shape, 4, LayoutClass::Chunked, HashAlg::Blake3);
         let n_per_dim = grid.n_chunks_per_dim();
 
         let n_chunks = grid.total_chunk_count() as usize;
@@ -884,7 +984,7 @@ mod tests {
     fn test_extract_subset_rank_too_low_errors_not_panics() {
         let dims = vec![4u64, 4u64];
         let chunk_shape = vec![1u64, 1u64];
-        let grid = ChunkGridParams::new(dims, chunk_shape, HashAlg::Blake3); // grid is 2D
+        let grid = ChunkGridParams::new(dims, chunk_shape, 4, LayoutClass::Chunked, HashAlg::Blake3); // grid is 2D
         let chunks: Vec<Vec<u8>> = (0..16).map(|i| format!("chunk-{i}").into_bytes()).collect();
         let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
         let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
@@ -950,7 +1050,13 @@ mod tests {
         let mut bad_grid = grid.clone();
         bad_grid.chunk_shape.push(1); // now mismatched vs dims.len()
         let bad_trusted_hash =
-            compute_grid_hash(&bad_grid.dims, &bad_grid.chunk_shape, HashAlg::Blake3);
+            compute_grid_hash(
+                &bad_grid.dims,
+                &bad_grid.chunk_shape,
+                bad_grid.elem_size,
+                bad_grid.layout_class,
+                HashAlg::Blake3,
+            );
 
         let err = verify_subset(
             tree.root(),
@@ -984,7 +1090,13 @@ mod tests {
         let mut bad_grid = grid.clone();
         bad_grid.chunk_shape[0] = 0; // would divide-by-zero in div_ceil
         let bad_trusted_hash =
-            compute_grid_hash(&bad_grid.dims, &bad_grid.chunk_shape, HashAlg::Blake3);
+            compute_grid_hash(
+                &bad_grid.dims,
+                &bad_grid.chunk_shape,
+                bad_grid.elem_size,
+                bad_grid.layout_class,
+                HashAlg::Blake3,
+            );
 
         let err = verify_subset(
             tree.root(),
@@ -1016,7 +1128,7 @@ mod tests {
             .collect();
 
         // Two axes whose chunk counts overflow u64 when multiplied together.
-        let bad_grid = ChunkGridParams::new(vec![u64::MAX, 2], vec![1, 1], HashAlg::Blake3);
+        let bad_grid = ChunkGridParams::new(vec![u64::MAX, 2], vec![1, 1], 4, LayoutClass::Chunked, HashAlg::Blake3);
         let bad_sel = Selection::slice(&[0..1, 0..1]); // rank must match bad_grid
 
         let err = verify_subset(
@@ -1050,7 +1162,7 @@ mod tests {
 
         // A single axis whose chunk count doesn't overflow the multiply but
         // whose next_power_of_two() would overflow usize.
-        let bad_grid = ChunkGridParams::new(vec![u64::MAX], vec![1], HashAlg::Blake3);
+        let bad_grid = ChunkGridParams::new(vec![u64::MAX], vec![1], 4, LayoutClass::Chunked, HashAlg::Blake3);
 
         let err = verify_subset(
             tree.root(),
@@ -1068,8 +1180,8 @@ mod tests {
 
     #[test]
     fn test_grid_hash_changes_with_params() {
-        let g1 = ChunkGridParams::new(vec![10], vec![2], HashAlg::Blake3);
-        let g2 = ChunkGridParams::new(vec![10], vec![5], HashAlg::Blake3);
+        let g1 = ChunkGridParams::new(vec![10], vec![2], 4, LayoutClass::Chunked, HashAlg::Blake3);
+        let g2 = ChunkGridParams::new(vec![10], vec![5], 4, LayoutClass::Chunked, HashAlg::Blake3);
         assert_ne!(g1.grid_hash, g2.grid_hash);
     }
 
@@ -1143,7 +1255,7 @@ mod tests {
         // chunks of shape [1]), but its own `grid_hash` field is coherently
         // recomputed for the forged values (i.e. it would pass a naive "is
         // grid_params self-consistent" check).
-        let forged_grid = ChunkGridParams::new(vec![999], vec![1], HashAlg::Blake3);
+        let forged_grid = ChunkGridParams::new(vec![999], vec![1], 4, LayoutClass::Chunked, HashAlg::Blake3);
         assert_ne!(forged_grid.grid_hash, grid.grid_hash);
 
         // The verifier's trusted hash reflects the REAL dataset grid,
@@ -1162,5 +1274,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MerkleError::GridHashMismatch));
+    }
+
+    #[test]
+    fn test_contiguous_grid_falls_back_to_single_leaf_when_below_threshold() {
+        // Below the verification_grid split threshold: chunk_shape == dims,
+        // matching that function's documented "stay a single leaf" contract.
+        let dims = vec![10u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..10u32).flat_map(|v| v.to_le_bytes()).collect();
+
+        let (tree, grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, 1024 * 1024, HashAlg::Blake3);
+
+        assert_eq!(grid.layout_class, LayoutClass::Contiguous);
+        assert_eq!(grid.chunk_shape, dims);
+        assert_eq!(tree.leaf_count(), 1);
+    }
+
+    #[test]
+    fn test_contiguous_layout_extract_and_verify_subset_round_trip() {
+        // Full P2.8b round trip: derive a verification grid over a raw
+        // contiguous byte stream, extract a subset proof, and verify it by
+        // re-slicing the same raw bytes the way a real contiguous-dataset
+        // read would -- not by peeking at the tree's internal leaves.
+        let dims = vec![100u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..100u32).flat_map(|v| v.to_le_bytes()).collect();
+        // Small target so this modest buffer actually gets tiled instead of
+        // falling back to the single-leaf case (covered separately above).
+        let target_bytes = 64;
+
+        let (tree, grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, target_bytes, HashAlg::Blake3);
+        assert_eq!(grid.layout_class, LayoutClass::Contiguous);
+        assert!(
+            grid.chunk_shape[0] < dims[0],
+            "buffer should actually be tiled, not fall back to a single leaf"
+        );
+
+        // Selection straddling two tiles' boundary.
+        let sel = Selection::slice(&[10..20]);
+        let proof = extract_subset(&tree, &grid, &sel, LeafOrder::RowMajor).unwrap();
+        assert!(proof.chunk_indices.len() >= 2);
+
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| {
+                let range =
+                    verification_grid::leaf_byte_range(&grid.chunk_shape, &dims, elem_size, idx as u64);
+                ChunkData {
+                    index: idx,
+                    data: &data[range.start as usize..range.end as usize],
+                }
+            })
+            .collect();
+
+        let ok = verify_subset(
+            tree.root(),
+            HashAlg::Blake3,
+            &delivered,
+            &proof,
+            &grid,
+            &grid.grid_hash,
+            &sel,
+            LeafOrder::RowMajor,
+        )
+        .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_contiguous_layout_grid_hash_differs_from_chunked_same_extents() {
+        // Domain separation (P2.8a): a Contiguous grid and a Chunked grid
+        // with identical dims/chunk_shape/elem_size must not hash the same,
+        // so a contiguous-dataset proof can never be replayed as a chunked
+        // one (or vice versa).
+        let dims = vec![10u64];
+        let elem_size = 4u32;
+        let data: Vec<u8> = (0..10u32).flat_map(|v| v.to_le_bytes()).collect();
+
+        let (_, contiguous_grid) =
+            contiguous_tree_and_grid(&data, &dims, elem_size, 1024 * 1024, HashAlg::Blake3);
+        let chunked_grid = ChunkGridParams::new(
+            dims,
+            contiguous_grid.chunk_shape.clone(),
+            elem_size,
+            LayoutClass::Chunked,
+            HashAlg::Blake3,
+        );
+
+        assert_ne!(contiguous_grid.grid_hash, chunked_grid.grid_hash);
     }
 }

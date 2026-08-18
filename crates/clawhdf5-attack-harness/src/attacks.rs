@@ -48,6 +48,7 @@ use clawhdf5_format::selection::Selection;
 use clawhdf5_format::subset_proof::{
     ChunkData, ChunkGridParams, LeafOrder, extract_subset, verify_subset,
 };
+use clawhdf5_format::verification_grid::LayoutClass;
 
 use crate::fixture::HarnessDataset;
 use crate::report::AttackResult;
@@ -514,7 +515,13 @@ pub fn t6a_root_attribute_stripped(ds: &HarnessDataset) -> AttackResult {
 /// substitution, wrong-coverage detection) generically over "chunk `i` of
 /// N," not real 2D hyperslab coverage against the satellite image's true grid.
 fn whole_dataset_grid(ds: &HarnessDataset) -> ChunkGridParams {
-    ChunkGridParams::new(vec![ds.chunk_count() as u64], vec![1], HashAlg::Blake3)
+    ChunkGridParams::new(
+        vec![ds.chunk_count() as u64],
+        vec![1],
+        4,
+        LayoutClass::Chunked,
+        HashAlg::Blake3,
+    )
 }
 
 /// A contiguous 1D hyperslab `start..end`, built directly (rather than via
@@ -1240,7 +1247,8 @@ pub fn t7_verification_dos() -> AttackResult {
     // A hostile grid: one dimension of size u64::MAX with chunk_shape 1,
     // implying ~2^64 chunks -- the "tiny hyperslab maps to astronomically
     // many chunks" scenario from Sec. threat, T7.
-    let hostile_grid = ChunkGridParams::new(vec![u64::MAX], vec![1], HashAlg::Blake3);
+    let hostile_grid =
+        ChunkGridParams::new(vec![u64::MAX], vec![1], 4, LayoutClass::Chunked, HashAlg::Blake3);
     let sel = Selection::All;
     let proof = clawhdf5_format::subset_proof::SubsetProof {
         chunk_indices: Vec::new(),

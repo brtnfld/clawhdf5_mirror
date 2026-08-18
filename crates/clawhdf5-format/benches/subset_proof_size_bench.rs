@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use clawhdf5_format::merkle::{HashAlg, MerkleTree};
 use clawhdf5_format::selection::Selection;
+use clawhdf5_format::verification_grid::LayoutClass;
 use clawhdf5_format::subset_proof::{
     ChunkData, ChunkGridParams, LeafOrder, SubsetProof, extract_subset, verify_subset,
 };
@@ -207,7 +208,13 @@ fn make_chunks(n: usize) -> Vec<Vec<u8>> {
 fn make_tree_1d(chunks: &[Vec<u8>]) -> (MerkleTree, ChunkGridParams) {
     let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
     let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
-    let grid = ChunkGridParams::new(vec![chunks.len() as u64], vec![1], HashAlg::Blake3);
+    let grid = ChunkGridParams::new(
+        vec![chunks.len() as u64],
+        vec![1],
+        4,
+        LayoutClass::Chunked,
+        HashAlg::Blake3,
+    );
     (tree, grid)
 }
 
@@ -254,6 +261,7 @@ fn time_extract_and_verify(
             &delivered,
             &proof,
             grid,
+            &grid.grid_hash,
             sel,
             LeafOrder::RowMajor,
         );
@@ -283,6 +291,7 @@ fn time_extract_and_verify(
             &delivered,
             &proof,
             grid,
+            &grid.grid_hash,
             sel,
             LeafOrder::RowMajor,
         );
