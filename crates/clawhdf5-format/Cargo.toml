@@ -38,6 +38,11 @@ hostname = "0.4"
 # the normal build graph -- only in `cargo test`.
 clawhdf5-sign = { path = "../clawhdf5-sign", version = "2.1.0", features = ["ed25519", "mldsa"] }
 proptest = "1"
+# Dev-only: P2.8c's contiguous cost-model benchmark needs posix_fadvise
+# (POSIX_FADV_DONTNEED) to evict a file's page cache between trials without
+# root, since the Statistical Protocol requires caches dropped for
+# I/O-sensitive runs and this machine has no passwordless sudo.
+libc = "0.2"
 
 [[bench]]
 name = "bench"
@@ -78,6 +83,11 @@ required-features = ["merkle"]
 name = "subset_proof_size_bench"
 harness = false
 required-features = ["merkle"]
+
+[[bench]]
+name = "contiguous_tileshape_bench"
+harness = false
+required-features = ["merkle", "blake3"]
 
 [[example]]
 name = "gen_merkle_vectors"
