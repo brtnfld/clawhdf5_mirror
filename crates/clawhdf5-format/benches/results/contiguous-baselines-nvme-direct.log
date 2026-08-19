@@ -1,0 +1,4 @@
+==> nvme/direct bao baseline
+sequential read bandwidth: 9079 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+reusing outboard at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.obao

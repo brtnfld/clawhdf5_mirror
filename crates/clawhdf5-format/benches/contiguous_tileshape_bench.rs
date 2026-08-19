@@ -257,45 +257,6 @@ fn build_tree_streaming(path: &Path, shape: &[u64; 3], direct: bool) -> std::io:
     Ok(MerkleTree::from_leaf_hashes(&leaf_hashes, HashAlg::Blake3))
 }
 
-// ===== statistics =====
-
-fn median(xs: &mut [f64]) -> f64 {
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = xs.len();
-    if n == 0 {
-        return f64::NAN;
-    }
-    if n % 2 == 1 {
-        xs[n / 2]
-    } else {
-        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
-    }
-}
-
-/// 95% bootstrap CI on the median. Deterministic LCG so a rerun of the same
-/// samples reproduces the same interval.
-fn bootstrap_ci(xs: &[f64], iters: usize) -> (f64, f64) {
-    if xs.len() < 2 {
-        return (f64::NAN, f64::NAN);
-    }
-    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
-    let mut meds = Vec::with_capacity(iters);
-    let mut sample = vec![0.0; xs.len()];
-    for _ in 0..iters {
-        for s in sample.iter_mut() {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *s = xs[(state >> 33) as usize % xs.len()];
-        }
-        meds.push(median(&mut sample));
-    }
-    meds.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let lo = meds[(iters as f64 * 0.025) as usize];
-    let hi = meds[((iters as f64 * 0.975) as usize).min(iters - 1)];
-    (lo, hi)
-}
-
 // ===== the measurement =====
 
 struct Row {
@@ -336,8 +297,19 @@ impl Row {
     }
 
     fn csv_row(&self, env: &BenchEnv) -> String {
+        // An unmeasurable quantity is blank, never zero and never a number
+        // from a counter that does not see this filesystem.
+        let (b, blo, bhi) = if self.bytes_source == BytesSource::Unavailable {
+            (String::new(), String::new(), String::new())
+        } else {
+            (
+                format!("{:.0}", self.bytes_transferred),
+                format!("{:.0}", self.bytes_ci.0),
+                format!("{:.0}", self.bytes_ci.1),
+            )
+        };
         format!(
-            "{},{},{},{},{},{},{},{},{:.0},{},{:.0},{:.0},{},{},{},{},{},\
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
              {:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{}",
             self.leaf_shape,
             self.leaf_bytes,
@@ -347,10 +319,10 @@ impl Row {
             self.cache_dropped,
             self.selection,
             self.useful_bytes,
-            self.bytes_transferred,
+            b,
             self.bytes_source.as_str(),
-            self.bytes_ci.0,
-            self.bytes_ci.1,
+            blo,
+            bhi,
             self.proc_bytes_delta,
             self.llite_bytes_delta,
             self.issued_bytes,
@@ -460,6 +432,8 @@ fn measure(
                 }
             },
             BytesSource::ProcSelfIo => d_proc,
+            // Nothing measured it; the column is emitted empty below.
+            BytesSource::Unavailable => 0,
         };
 
         let delivered: Vec<ChunkData<'_>> = proof

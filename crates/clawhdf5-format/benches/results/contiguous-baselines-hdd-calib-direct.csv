@@ -1,0 +1,4 @@
+approach,storage_class,block_size_bytes,block_size_source,stripe_count,stripe_size_bytes,readahead_bytes,o_direct,seq_read_mbps,seq_write_mbps,cache_dropped,selection,useful_bytes,n_ranges,chunks_touched,bytes_transferred,bytes_ci95_low,bytes_ci95_high,bytes_source,proc_read_bytes_delta,llite_read_bytes_delta,issued_bytes,io_ops,osc_read_rpcs,read_ms,read_ci95_low,read_ci95_high,proof_naive_bytes,proof_dedup_bytes,trials
+bao,hdd,4096,O_DIRECT alignment unit,,,,1,179,,1,cube10,4000,100,103,413696,NaN,NaN,proc_self_io,413696,,413696,100,,55.991,NaN,NaN,141856,16416,1
+bao,hdd,4096,O_DIRECT alignment unit,,,,1,179,,1,cube100,4000000,10000,13750,44810240,NaN,NaN,proc_self_io,44810240,,44810240,10000,,788.423,NaN,NaN,14390000,1357472,1
+bao,hdd,4096,O_DIRECT alignment unit,,,,1,179,,1,plane,4000000,1000,3907,4001792,NaN,NaN,proc_self_io,4001792,,4001792,1,,27.673,NaN,NaN,1664256,125856,1

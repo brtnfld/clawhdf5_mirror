@@ -1,0 +1,6 @@
+==> nvme/buffered bao baseline
+sequential read bandwidth: 10238 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+reusing outboard at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.obao

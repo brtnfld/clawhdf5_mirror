@@ -51,6 +51,17 @@ pub enum BytesSource {
     /// `llite.*.stats` lives in root-only debugfs, which is the common case
     /// on Lustre 2.10+ and cannot be assumed away inside a batch allocation.
     ODirectIssued,
+    /// No counter on this system measures device traffic for this arm.
+    ///
+    /// Reached on Lustre with buffered I/O where the stats files are in
+    /// root-only debugfs. `/proc/self/io` is *not* an acceptable fallback
+    /// there: measured on Orion it reports 0 for an O_DIRECT read of
+    /// 10 039 296 bytes -- proving it does not see Lustre traffic -- while
+    /// reporting 123 498 496 for a buffered read of the same selection. A
+    /// zero looks broken and gets investigated; a plausible-looking 123 MB
+    /// does not, which makes it the more dangerous number of the two. The
+    /// byte column is emitted empty instead.
+    Unavailable,
 }
 
 impl BytesSource {
@@ -60,6 +71,7 @@ impl BytesSource {
             BytesSource::OscStats => "osc_stats",
             BytesSource::LliteStats => "llite_stats_vfs_level",
             BytesSource::ODirectIssued => "o_direct_issued",
+            BytesSource::Unavailable => "unavailable",
         }
     }
 }
@@ -460,23 +472,33 @@ pub fn eviction_works(path: &Path, lustre: bool) -> Option<bool> {
         Ok((dt, delta(before, after)))
     };
 
-    let _ = warm(path).ok()?; // populate the cache
+    let _ = warm(path).ok()?; // first touch: populates the cache
+    let (dt_warm, _) = warm(path).ok()?; // served from cache if caching works
     let evicted = evict_cache(path);
     let (dt_cold, rpcs) = warm(path).ok()?;
-    match rpcs {
-        Some(n) => {
-            eprintln!(
-                "### cache eviction check: {} OST read RPCs after evict ({}), {:.2}s",
-                n,
-                if evicted { "reported ok" } else { "reported failure" },
-                dt_cold
-            );
-            Some(n > 0)
-        }
-        None => {
-            eprintln!("### cache eviction check: no RPC counter; cold re-read took {dt_cold:.2}s");
-            None
-        }
+    if let Some(n) = rpcs {
+        eprintln!(
+            "### cache eviction check: {} OST read RPCs after evict ({}), {:.2}s",
+            n,
+            if evicted { "reported ok" } else { "reported failure" },
+            dt_cold
+        );
+        return Some(n > 0);
+    }
+    // No counter. Decide it by timing instead: a cache-served read runs at
+    // memory bandwidth and a server-served one does not, so the ratio between
+    // a warm read and a post-eviction read separates them without any
+    // privileged parameter. 1.5x is well below the gap between RAM and any
+    // storage device and well above run-to-run jitter on a quiet node.
+    let ratio = if dt_warm > 0.0 { dt_cold / dt_warm } else { f64::NAN };
+    eprintln!(
+        "### cache eviction check (timing): warm {:.3}s, after evict {:.3}s, ratio {:.2}x",
+        dt_warm, dt_cold, ratio
+    );
+    if ratio.is_nan() {
+        None
+    } else {
+        Some(ratio >= 1.5)
     }
 }
 
@@ -751,6 +773,14 @@ pub fn choose_bytes_source(env: &BenchEnv) -> BytesSource {
     if env.o_direct {
         return BytesSource::ODirectIssued;
     }
+    if llite_read_bytes().is_none() && osc_read_bytes().is_none() {
+        eprintln!("WARNING: no Lustre client byte counter is readable and O_DIRECT is off, so");
+        eprintln!("         bytes_transferred is not measurable on this arm and is emitted");
+        eprintln!("         empty. /proc/self/io is deliberately NOT used as a fallback: it");
+        eprintln!("         reports 0 for reads this filesystem definitely served, so its");
+        eprintln!("         buffered figure is spurious rather than merely inflated.");
+        return BytesSource::Unavailable;
+    }
     if llite_read_bytes().is_some() {
         eprintln!("WARNING: falling back to llite.*.stats, which is VFS-level: the");
         eprintln!("         bytes_transferred column will report what was requested,");
@@ -785,3 +815,41 @@ pub fn seq_read_mbps(path: &Path, direct: bool) -> std::io::Result<f64> {
     Ok((read as f64) / dt / 1.0e6)
 }
 
+// ===== statistics =====
+
+pub fn median(xs: &mut [f64]) -> f64 {
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = xs.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n % 2 == 1 {
+        xs[n / 2]
+    } else {
+        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+    }
+}
+
+/// 95% bootstrap CI on the median. Deterministic LCG so a rerun of the same
+/// samples reproduces the same interval.
+pub fn bootstrap_ci(xs: &[f64], iters: usize) -> (f64, f64) {
+    if xs.len() < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut meds = Vec::with_capacity(iters);
+    let mut sample = vec![0.0; xs.len()];
+    for _ in 0..iters {
+        for s in sample.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *s = xs[(state >> 33) as usize % xs.len()];
+        }
+        meds.push(median(&mut sample));
+    }
+    meds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let lo = meds[(iters as f64 * 0.025) as usize];
+    let hi = meds[((iters as f64 * 0.975) as usize).min(iters - 1)];
+    (lo, hi)
+}

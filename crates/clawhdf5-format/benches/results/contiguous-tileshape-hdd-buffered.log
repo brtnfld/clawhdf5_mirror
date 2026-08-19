@@ -1,0 +1,123 @@
+### 2026-08-19T21:22:48Z localhost.localdomain
+### class=hdd mode=buffered dir=/home/brtnfld_2025/brtnfld/p28c-hdd
+### device: /dev/sda1 ext4 /home/brtnfld_2025
+### clawhdf5 9b929cb
+### bin /home/brtnfld/work/clawhdf5_mirror/target/release/deps/contiguous_tileshape_bench-ac9d5f3aeda338fc
+==> hdd/buffered 1x250x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.56s
+### cache eviction unverified (no RPC counter)
+building tree for 1x250x1000...
+  built in 21.4s
+  1x250x1000/cube10: 0.9s for 30 trials
+    27s
+==> hdd/buffered 1x250x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.53s
+### cache eviction unverified (no RPC counter)
+building tree for 1x250x1000...
+  built in 21.4s
+  1x250x1000/cube100: 50.3s for 30 trials
+    76s
+==> hdd/buffered 1x250x1000/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.51s
+### cache eviction unverified (no RPC counter)
+building tree for 1x250x1000...
+  built in 21.4s
+  1x250x1000/plane: 0.7s for 30 trials
+    27s
+==> hdd/buffered 4x64x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.51s
+### cache eviction unverified (no RPC counter)
+building tree for 4x64x1000...
+  built in 21.4s
+  4x64x1000/cube10: 0.4s for 30 trials
+    26s
+==> hdd/buffered 4x64x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.51s
+### cache eviction unverified (no RPC counter)
+building tree for 4x64x1000...
+  built in 21.4s
+  4x64x1000/cube100: 72.9s for 30 trials
+    99s
+==> hdd/buffered 4x64x1000/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 176 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.53s
+### cache eviction unverified (no RPC counter)
+building tree for 4x64x1000...
+  built in 21.4s
+  4x64x1000/plane: 1.8s for 30 trials
+    28s
+==> hdd/buffered 16x16x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.54s
+### cache eviction unverified (no RPC counter)
+building tree for 16x16x1000...
+  built in 21.4s
+  16x16x1000/cube10: 0.3s for 30 trials
+    26s
+==> hdd/buffered 16x16x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.51s
+### cache eviction unverified (no RPC counter)
+building tree for 16x16x1000...
+  built in 21.4s
+  16x16x1000/cube100: 89.3s for 30 trials
+    115s
+==> hdd/buffered 16x16x1000/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.51s
+### cache eviction unverified (no RPC counter)
+building tree for 16x16x1000...
+  built in 21.4s
+  16x16x1000/plane: 15.6s for 30 trials
+    42s
+==> hdd/buffered 64x64x64/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.53s
+### cache eviction unverified (no RPC counter)
+building tree for 64x64x64...
+  built in 21.5s
+  64x64x64/cube10: 11.2s for 30 trials
+    37s
+==> hdd/buffered 64x64x64/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.51s
+### cache eviction unverified (no RPC counter)
+building tree for 64x64x64...
+  built in 21.5s
+  64x64x64/cube100: 126.4s for 30 trials
+    153s
+==> hdd/buffered 64x64x64/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 174 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 1.52s
+### cache eviction unverified (no RPC counter)
+building tree for 64x64x64...
+  built in 21.5s

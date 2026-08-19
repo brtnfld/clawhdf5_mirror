@@ -107,6 +107,7 @@ struct Row {
     n_ranges: usize,
     chunks: u64,
     bytes_transferred: u64,
+    bytes_ci: (f64, f64),
     bytes_source: BytesSource,
     proc_bytes_delta: u64,
     llite_bytes_delta: String,
@@ -115,8 +116,10 @@ struct Row {
     osc_rpcs: String,
     cache_dropped: u8,
     read_ms: f64,
+    read_ci: (f64, f64),
     proof_naive: u64,
     proof_dedup: u64,
+    trials: usize,
 }
 
 fn main() -> std::io::Result<()> {
@@ -129,6 +132,8 @@ fn main() -> std::io::Result<()> {
             .unwrap_or_else(|| d.to_string())
     };
     let dir = PathBuf::from(get("--dir", "."));
+    let trials: usize = get("--trials", "30").parse().unwrap_or(30);
+    let warmups: usize = get("--warmups", "5").parse().unwrap_or(5);
     let o_direct = args.iter().any(|a| a == "--o-direct")
         || std::env::var("BENCH_O_DIRECT").map(|v| v == "1").unwrap_or(false);
     let data_path = dir.join("clawbench-contiguous-1000cubed.f32");
@@ -192,8 +197,10 @@ fn main() -> std::io::Result<()> {
 
     println!(
         "approach,{},cache_dropped,selection,useful_bytes,n_ranges,chunks_touched,\
-         bytes_transferred,bytes_source,proc_read_bytes_delta,llite_read_bytes_delta,\
-         issued_bytes,io_ops,osc_read_rpcs,read_ms,proof_naive_bytes,proof_dedup_bytes",
+         bytes_transferred,bytes_ci95_low,bytes_ci95_high,bytes_source,\
+         proc_read_bytes_delta,llite_read_bytes_delta,\
+         issued_bytes,io_ops,osc_read_rpcs,read_ms,read_ci95_low,read_ci95_high,\
+         proof_naive_bytes,proof_dedup_bytes,trials",
         BenchEnv::csv_header()
     );
 
@@ -225,38 +232,63 @@ fn main() -> std::io::Result<()> {
         }
         let max_span = spans.iter().map(|(_, l)| *l).max().unwrap_or(BAO_CHUNK);
 
-        let mut cache_dropped = env.o_direct;
-        if !env.o_direct {
-            cache_dropped = evict_cache(&data_path) & evict_cache(&obao_path);
-        }
-        let mut rr = RunReader::open(&data_path, env.o_direct, max_span)?;
-        let before = Counters::snapshot(env.lustre);
-        let t0 = Instant::now();
-        let mut buf = Vec::new();
-        for &(off, len) in &spans {
-            buf.resize(len as usize, 0);
-            rr.read_run(off, len, &mut buf)?;
-        }
-        let read_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let after = Counters::snapshot(env.lustre);
+        // Warmups discarded, then measured trials, caches evicted before
+        // each -- the same protocol as the measurement this is a baseline
+        // for. A baseline aggregated differently from the thing it is
+        // compared against is not a comparison.
+        let mut cache_dropped = true;
+        let mut byte_samples = Vec::with_capacity(trials);
+        let mut read_samples = Vec::with_capacity(trials);
+        let (mut io_ops, mut issued_bytes) = (0u64, 0u64);
+        let (mut d_proc, mut d_llite, mut d_osc) = (0u64, None, None);
 
-        let io_ops = rr.issued_ops;
-        let d_proc = after.proc_bytes.saturating_sub(before.proc_bytes);
-        let d_llite = delta(before.llite_bytes, after.llite_bytes);
-        let d_osc = delta(before.osc_rpcs, after.osc_rpcs);
-        let d_osc_bytes = delta(before.osc_bytes, after.osc_bytes);
-        // A trial that issued no OST read RPC was served from cache.
-        if env.lustre {
-            if let Some(rpcs) = d_osc {
-                cache_dropped = cache_dropped && rpcs > 0;
+        for t in 0..(warmups + trials) {
+            if !env.o_direct {
+                cache_dropped &= evict_cache(&data_path) & evict_cache(&obao_path);
+            }
+            let mut rr = RunReader::open(&data_path, env.o_direct, max_span)?;
+            let before = Counters::snapshot(env.lustre);
+            let t0 = Instant::now();
+            let mut buf = Vec::new();
+            for &(off, len) in &spans {
+                buf.resize(len as usize, 0);
+                rr.read_run(off, len, &mut buf)?;
+            }
+            let read_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let after = Counters::snapshot(env.lustre);
+
+            let p = after.proc_bytes.saturating_sub(before.proc_bytes);
+            let l = delta(before.llite_bytes, after.llite_bytes);
+            let o = delta(before.osc_rpcs, after.osc_rpcs);
+            let ob = delta(before.osc_bytes, after.osc_bytes);
+            // A trial that issued no OST read RPC was served from cache.
+            if env.lustre {
+                if let Some(rpcs) = o {
+                    cache_dropped = cache_dropped && rpcs > 0;
+                }
+            }
+            let primary = match source {
+                BytesSource::OscStats => ob.unwrap_or(rr.issued_bytes),
+                BytesSource::ODirectIssued => rr.issued_bytes,
+                BytesSource::LliteStats => l.unwrap_or(rr.issued_bytes),
+                BytesSource::ProcSelfIo => p,
+                BytesSource::Unavailable => 0,
+            };
+            if t >= warmups {
+                byte_samples.push(primary as f64);
+                read_samples.push(read_ms);
+                io_ops = rr.issued_ops;
+                issued_bytes = rr.issued_bytes;
+                d_proc = p;
+                d_llite = l;
+                d_osc = o;
             }
         }
-        let bytes_transferred = match source {
-            BytesSource::OscStats => d_osc_bytes.unwrap_or(rr.issued_bytes),
-            BytesSource::ODirectIssued => rr.issued_bytes,
-            BytesSource::LliteStats => d_llite.unwrap_or(rr.issued_bytes),
-            BytesSource::ProcSelfIo => d_proc,
-        };
+        let bytes_transferred = median(&mut byte_samples.clone()) as u64;
+        let bytes_ci = bootstrap_ci(&byte_samples, 2000);
+        let read_ms = median(&mut read_samples.clone());
+        let read_ci = bootstrap_ci(&read_samples, 2000);
+        let n_trials = byte_samples.len();
 
         // --- proof size, naive: real per-range slice proofs from bao.
         // A slice contains proof nodes interleaved with the covered data, so
@@ -302,26 +334,40 @@ fn main() -> std::io::Result<()> {
             n_ranges: ranges.len(),
             chunks: chunks.len() as u64,
             bytes_transferred,
+            bytes_ci,
             bytes_source: source,
             proc_bytes_delta: d_proc,
             llite_bytes_delta: d_llite.map(|v| v.to_string()).unwrap_or_default(),
-            issued_bytes: rr.issued_bytes,
+            issued_bytes,
             io_ops,
             osc_rpcs: d_osc.map(|v| v.to_string()).unwrap_or_default(),
             cache_dropped: u8::from(cache_dropped),
             read_ms,
+            read_ci,
             proof_naive,
             proof_dedup,
+            trials: n_trials,
+        };
+        let (bcol, blo, bhi) = if r.bytes_source == BytesSource::Unavailable {
+            (String::new(), String::new(), String::new())
+        } else {
+            (
+                r.bytes_transferred.to_string(),
+                format!("{:.0}", r.bytes_ci.0),
+                format!("{:.0}", r.bytes_ci.1),
+            )
         };
         println!(
-            "bao,{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{}",
+            "bao,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{},{}",
             env.csv_fields(),
             r.cache_dropped,
             r.selection,
             r.useful_bytes,
             r.n_ranges,
             r.chunks,
-            r.bytes_transferred,
+            bcol,
+            blo,
+            bhi,
             r.bytes_source.as_str(),
             r.proc_bytes_delta,
             r.llite_bytes_delta,
@@ -329,8 +375,11 @@ fn main() -> std::io::Result<()> {
             r.io_ops,
             r.osc_rpcs,
             r.read_ms,
+            r.read_ci.0,
+            r.read_ci.1,
             r.proof_naive,
-            r.proof_dedup
+            r.proof_dedup,
+            r.trials
         );
     }
     Ok(())

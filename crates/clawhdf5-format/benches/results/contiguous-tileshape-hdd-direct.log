@@ -1,0 +1,101 @@
+### 2026-08-19T19:58:18Z localhost.localdomain
+### class=hdd mode=direct dir=/home/brtnfld_2025/brtnfld/p28c-hdd
+### device: /dev/sda1 ext4 /home/brtnfld_2025
+### clawhdf5 9b929cb
+### bin /home/brtnfld/work/clawhdf5_mirror/target/release/deps/contiguous_tileshape_bench-ac9d5f3aeda338fc
+==> hdd/direct 1x250x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 1x250x1000...
+  built in 22.7s
+  1x250x1000/cube10: 0.9s for 30 trials
+    26s
+==> hdd/direct 1x250x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 1x250x1000...
+  built in 22.7s
+  1x250x1000/cube100: 50.2s for 30 trials
+    76s
+==> hdd/direct 1x250x1000/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 1x250x1000...
+  built in 22.8s
+  1x250x1000/plane: 0.3s for 30 trials
+    27s
+==> hdd/direct 4x64x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 4x64x1000...
+  built in 22.7s
+  4x64x1000/cube10: 0.3s for 30 trials
+    26s
+==> hdd/direct 4x64x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 4x64x1000...
+  built in 22.7s
+  4x64x1000/cube100: 69.1s for 30 trials
+    94s
+==> hdd/direct 4x64x1000/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 171 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 4x64x1000...
+  built in 22.8s
+  4x64x1000/plane: 1.7s for 30 trials
+    28s
+==> hdd/direct 16x16x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 16x16x1000...
+  built in 22.7s
+  16x16x1000/cube10: 0.3s for 30 trials
+    26s
+==> hdd/direct 16x16x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 16x16x1000...
+  built in 22.7s
+  16x16x1000/cube100: 155.5s for 30 trials
+    181s
+==> hdd/direct 16x16x1000/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 167 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 16x16x1000...
+  built in 22.8s
+  16x16x1000/plane: 26.3s for 30 trials
+    53s
+==> hdd/direct 64x64x64/cube10 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 64x64x64...
+  built in 22.7s
+  64x64x64/cube10: 14.8s for 30 trials
+    40s
+==> hdd/direct 64x64x64/cube100 (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 64x64x64...
+  built in 22.7s
+  64x64x64/cube100: 426.9s for 30 trials
+    453s
+==> hdd/direct 64x64x64/plane (trials=30)
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 64x64x64...
+  built in 22.8s
+  64x64x64/plane: 3822.5s for 30 trials
+    3848s

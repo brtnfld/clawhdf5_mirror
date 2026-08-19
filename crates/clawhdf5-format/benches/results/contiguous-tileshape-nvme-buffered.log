@@ -1,0 +1,125 @@
+### 2026-08-19T21:20:57Z localhost.localdomain
+### class=nvme mode=buffered dir=/home/brtnfld/p28c-nvme
+### device: /dev/nvme0n1p4 ext4 /home
+### clawhdf5 9b929cb
+### bin /home/brtnfld/work/clawhdf5_mirror/target/release/deps/contiguous_tileshape_bench-ac9d5f3aeda338fc
+==> nvme/buffered 1x250x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 6110 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 1x250x1000...
+  built in 3.9s
+  1x250x1000/cube10: 0.2s for 30 trials
+    4s
+==> nvme/buffered 1x250x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10058 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 1x250x1000...
+  built in 3.6s
+  1x250x1000/cube100: 2.0s for 30 trials
+    6s
+==> nvme/buffered 1x250x1000/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10215 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 1x250x1000...
+  built in 3.6s
+  1x250x1000/plane: 0.1s for 30 trials
+    3s
+==> nvme/buffered 4x64x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9684 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 4x64x1000...
+  built in 3.5s
+  4x64x1000/cube10: 0.1s for 30 trials
+    4s
+==> nvme/buffered 4x64x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10221 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 4x64x1000...
+  built in 3.6s
+  4x64x1000/cube100: 2.1s for 30 trials
+    6s
+==> nvme/buffered 4x64x1000/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10252 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 4x64x1000...
+  built in 3.6s
+  4x64x1000/plane: 0.2s for 30 trials
+    4s
+==> nvme/buffered 16x16x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9977 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 16x16x1000...
+  built in 3.5s
+  16x16x1000/cube10: 0.0s for 30 trials
+    3s
+==> nvme/buffered 16x16x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10119 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 16x16x1000...
+  built in 3.6s
+  16x16x1000/cube100: 1.8s for 30 trials
+    6s
+==> nvme/buffered 16x16x1000/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9937 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 16x16x1000...
+  built in 3.5s
+  16x16x1000/plane: 1.0s for 30 trials
+    5s
+==> nvme/buffered 64x64x64/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9909 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 64x64x64...
+  built in 4.6s
+  64x64x64/cube10: 0.5s for 30 trials
+    5s
+==> nvme/buffered 64x64x64/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10304 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 64x64x64...
+  built in 4.6s
+  64x64x64/cube100: 2.9s for 30 trials
+    7s
+==> nvme/buffered 64x64x64/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 10160 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check: no RPC counter; cold re-read took 0.03s
+### cache eviction unverified (no RPC counter)
+building tree for 64x64x64...
+  built in 4.6s
+  64x64x64/plane: 11.3s for 30 trials
+    16s

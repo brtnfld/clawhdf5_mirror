@@ -1,0 +1,4 @@
+==> hdd/direct bao baseline
+sequential read bandwidth: 179 MB/s (O_DIRECT)
+class=hdd B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+reusing outboard at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.obao

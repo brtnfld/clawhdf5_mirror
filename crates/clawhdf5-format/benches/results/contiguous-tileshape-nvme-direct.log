@@ -1,0 +1,101 @@
+### 2026-08-19T19:36:39Z localhost.localdomain
+### class=nvme mode=direct dir=/home/brtnfld/p28c-nvme
+### device: /dev/nvme0n1p4 ext4 /home
+### clawhdf5 9b929cb
+### bin /home/brtnfld/work/clawhdf5_mirror/target/release/deps/contiguous_tileshape_bench-ac9d5f3aeda338fc
+==> nvme/direct 1x250x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8967 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 1x250x1000...
+  built in 3.6s
+  1x250x1000/cube10: 0.1s for 30 trials
+    4s
+==> nvme/direct 1x250x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9215 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 1x250x1000...
+  built in 3.5s
+  1x250x1000/cube100: 1.5s for 30 trials
+    5s
+==> nvme/direct 1x250x1000/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9136 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 1x250x1000...
+  built in 3.5s
+  1x250x1000/plane: 0.0s for 30 trials
+    3s
+==> nvme/direct 4x64x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8828 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 4x64x1000...
+  built in 3.5s
+  4x64x1000/cube10: 0.1s for 30 trials
+    3s
+==> nvme/direct 4x64x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8991 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 4x64x1000...
+  built in 3.5s
+  4x64x1000/cube100: 1.6s for 30 trials
+    5s
+==> nvme/direct 4x64x1000/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8949 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 4x64x1000...
+  built in 3.5s
+  4x64x1000/plane: 0.3s for 30 trials
+    4s
+==> nvme/direct 16x16x1000/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9063 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 16x16x1000...
+  built in 3.5s
+  16x16x1000/cube10: 0.0s for 30 trials
+    4s
+==> nvme/direct 16x16x1000/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9287 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 16x16x1000...
+  built in 3.5s
+  16x16x1000/cube100: 2.3s for 30 trials
+    6s
+==> nvme/direct 16x16x1000/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 9049 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 16x16x1000...
+  built in 3.6s
+  16x16x1000/plane: 3.0s for 30 trials
+    6s
+==> nvme/direct 64x64x64/cube10 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8710 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 64x64x64...
+  built in 4.7s
+  64x64x64/cube10: 2.0s for 30 trials
+    7s
+==> nvme/direct 64x64x64/cube100 (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8581 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 64x64x64...
+  built in 4.7s
+  64x64x64/cube100: 55.4s for 30 trials
+    60s
+==> nvme/direct 64x64x64/plane (trials=30)
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8827 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building tree for 64x64x64...
+  built in 4.7s
+  64x64x64/plane: 514.3s for 30 trials
+    519s

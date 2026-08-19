@@ -1,0 +1,5 @@
+==> nvme/direct bao baseline
+sequential read bandwidth: 8962 MB/s (O_DIRECT)
+class=nvme B=4096 (O_DIRECT alignment unit) stripe=-x- readahead=- o_direct=1
+building Bao outboard (249 MB expected)...
+  outboard built in 6.3s, root 7c9c5bb584f3a49965f7614e5bc6d8819904faa76ce35e6e45e20d951f4a9999
