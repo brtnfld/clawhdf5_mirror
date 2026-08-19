@@ -557,14 +557,30 @@ pub fn detect_block_size(path: &Path) -> (u64, String) {
         let stripe = lfs_field(path, "-S").and_then(|s| s.parse::<u64>().ok());
         let count = lfs_field(path, "-c").and_then(|s| s.parse::<i64>().ok());
         let rpc = lustre_rpc_bytes();
+        // Both candidates go into the source string, not just the winner.
+        // On Orion the RPC size is 16 MiB against a 1 MiB stripe, and the two
+        // are not the same kind of quantity: a stripe boundary splits a run,
+        // whereas the RPC size is an upper bound on how much the client will
+        // coalesce and not a minimum charge. Which one the device actually
+        // steps at is what the run-length sweep exists to find out, so the
+        // column records the evidence rather than hiding a choice. Commas are
+        // avoided: this string is a CSV field.
         return match (stripe, rpc) {
             (Some(s), Some(r)) if count == Some(1) => {
-                (r.min(s), "osc max_pages_per_rpc (stripe_count=1)".into())
+                // Stripe count 1: the whole file is one object on one OST, so
+                // there is no stripe boundary left to split anything.
+                if r <= s {
+                    (r, format!("osc max_pages_per_rpc={r} governs at stripe_count=1 (stripe_size={s})"))
+                } else {
+                    (s, format!("lfs stripe_size={s} at stripe_count=1 (rpc={r} is larger and only bounds coalescing)"))
+                }
             }
-            (Some(s), Some(r)) if r < s => (r, "osc max_pages_per_rpc (< stripe_size)".into()),
-            (Some(s), Some(_)) => (s, "lfs stripe_size (<= rpc size)".into()),
-            (Some(s), None) => (s, "lfs stripe_size (rpc size unknown)".into()),
-            (None, Some(r)) => (r, "osc max_pages_per_rpc (stripe size unknown)".into()),
+            (Some(s), Some(r)) if r < s => {
+                (r, format!("osc max_pages_per_rpc={r} below stripe_size={s}"))
+            }
+            (Some(s), Some(r)) => (s, format!("lfs stripe_size={s} at or below rpc={r}")),
+            (Some(s), None) => (s, format!("lfs stripe_size={s} (rpc size unreadable)")),
+            (None, Some(r)) => (r, format!("osc max_pages_per_rpc={r} (stripe size unreadable)")),
             (None, None) => (512, "default (lustre parameters unreadable)".into()),
         };
     }
