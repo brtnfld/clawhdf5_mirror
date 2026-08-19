@@ -33,13 +33,23 @@
 //! cargo bench --features merkle,blake3 --bench contiguous_bao_baseline -- \
 //!     --dir /path/on/device --storage-class nvme
 //! ```
+//!
+//! On a parallel filesystem add `--o-direct`: `/proc/self/io` counts
+//! block-layer traffic and reads ~0 there, the 4 GB working set fits in a
+//! compute node's page cache, and dropping caches needs root a batch
+//! allocation does not have. The device, layout and counter provenance are
+//! recorded per row by `common/storage_io.rs`, shared with the tileshape
+//! bench so the baseline and the measurement count bytes the same way.
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::time::Instant;
+
+#[path = "common/storage_io.rs"]
+mod storage_io;
+use storage_io::*;
 
 const DIMS: [u64; 3] = [1000, 1000, 1000];
 const ELEM_SIZE: u64 = 4;
@@ -47,24 +57,6 @@ const ELEM_SIZE: u64 = 4;
 /// fixed by the BLAKE3 specification, which is precisely the constraint this
 /// comparison exists to expose.
 const BAO_CHUNK: u64 = 1024;
-
-fn proc_read_bytes() -> u64 {
-    let s = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    for line in s.lines() {
-        if let Some(v) = line.strip_prefix("read_bytes:") {
-            return v.trim().parse().unwrap_or(0);
-        }
-    }
-    0
-}
-
-fn evict_cache(path: &Path) {
-    if let Ok(f) = File::open(path) {
-        unsafe {
-            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
-    }
-}
 
 /// The contiguous byte ranges a 3-D hyperslab occupies in a C-order stream.
 /// One range per (i0, i1) row-segment; this is what Bao actually has to
@@ -115,7 +107,13 @@ struct Row {
     n_ranges: usize,
     chunks: u64,
     bytes_transferred: u64,
+    bytes_source: BytesSource,
+    proc_bytes_delta: u64,
+    llite_bytes_delta: String,
+    issued_bytes: u64,
     io_ops: u64,
+    osc_rpcs: String,
+    cache_dropped: u8,
     read_ms: f64,
     proof_naive: u64,
     proof_dedup: u64,
@@ -131,7 +129,8 @@ fn main() -> std::io::Result<()> {
             .unwrap_or_else(|| d.to_string())
     };
     let dir = PathBuf::from(get("--dir", "."));
-    let sc = get("--storage-class", "unknown");
+    let o_direct = args.iter().any(|a| a == "--o-direct")
+        || std::env::var("BENCH_O_DIRECT").map(|v| v == "1").unwrap_or(false);
     let data_path = dir.join("clawbench-contiguous-1000cubed.f32");
     let obao_path = dir.join("clawbench-contiguous-1000cubed.obao");
     if !data_path.exists() {
@@ -139,6 +138,12 @@ fn main() -> std::io::Result<()> {
         eprintln!("generate it first with the contiguous_tileshape_bench harness");
         std::process::exit(1);
     }
+    // Same dataset, same device parameters, same counter policy as the
+    // measurement it is a baseline for -- otherwise the comparison is between
+    // two experiments rather than two approaches.
+    let env = BenchEnv::detect(&get, &data_path, o_direct)?;
+    let source = choose_bytes_source(&env);
+
     let total = DIMS.iter().product::<u64>() * ELEM_SIZE;
     let n_chunks = total.div_ceil(BAO_CHUNK);
 
@@ -186,8 +191,10 @@ fn main() -> std::io::Result<()> {
     ];
 
     println!(
-        "approach,storage_class,selection,useful_bytes,n_ranges,chunks_touched,\
-         bytes_transferred,io_ops,read_ms,proof_naive_bytes,proof_dedup_bytes"
+        "approach,{},cache_dropped,selection,useful_bytes,n_ranges,chunks_touched,\
+         bytes_transferred,bytes_source,proc_read_bytes_delta,llite_read_bytes_delta,\
+         issued_bytes,io_ops,osc_read_rpcs,read_ms,proof_naive_bytes,proof_dedup_bytes",
+        BenchEnv::csv_header()
     );
 
     for (label, start, end) in cases {
@@ -198,15 +205,10 @@ fn main() -> std::io::Result<()> {
         // --- measured I/O: read every covering 1 KiB chunk from the data
         // file, plus the proof spans from the outboard. Adjacent chunk
         // indices are coalesced into one pread, which is the most favourable
-        // honest reading for Bao.
-        evict_cache(&data_path);
-        evict_cache(&obao_path);
-        let mut f = File::open(&data_path)?;
-        let before = proc_read_bytes();
-        let t0 = Instant::now();
-        let mut io_ops = 0u64;
+        // honest reading for Bao. The spans are enumerated before the timer
+        // starts so the bounce buffer can be sized once.
+        let mut spans: Vec<(u64, u64)> = Vec::new();
         let mut it = chunks.iter().peekable();
-        let mut buf = Vec::new();
         while let Some(&first) = it.next() {
             let mut last = first;
             while let Some(&&nxt) = it.peek() {
@@ -219,13 +221,42 @@ fn main() -> std::io::Result<()> {
             }
             let off = first * BAO_CHUNK;
             let len = ((last - first + 1) * BAO_CHUNK).min(total - off);
+            spans.push((off, len));
+        }
+        let max_span = spans.iter().map(|(_, l)| *l).max().unwrap_or(BAO_CHUNK);
+
+        let mut cache_dropped = env.o_direct;
+        if !env.o_direct {
+            cache_dropped = evict_cache(&data_path) & evict_cache(&obao_path);
+        }
+        let mut rr = RunReader::open(&data_path, env.o_direct, max_span)?;
+        let before = Counters::snapshot(env.lustre);
+        let t0 = Instant::now();
+        let mut buf = Vec::new();
+        for &(off, len) in &spans {
             buf.resize(len as usize, 0);
-            f.seek(SeekFrom::Start(off))?;
-            f.read_exact(&mut buf)?;
-            io_ops += 1;
+            rr.read_run(off, len, &mut buf)?;
         }
         let read_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let bytes_transferred = proc_read_bytes() - before;
+        let after = Counters::snapshot(env.lustre);
+
+        let io_ops = rr.issued_ops;
+        let d_proc = after.proc_bytes.saturating_sub(before.proc_bytes);
+        let d_llite = delta(before.llite_bytes, after.llite_bytes);
+        let d_osc = delta(before.osc_rpcs, after.osc_rpcs);
+        let d_osc_bytes = delta(before.osc_bytes, after.osc_bytes);
+        // A trial that issued no OST read RPC was served from cache.
+        if env.lustre {
+            if let Some(rpcs) = d_osc {
+                cache_dropped = cache_dropped && rpcs > 0;
+            }
+        }
+        let bytes_transferred = match source {
+            BytesSource::OscStats => d_osc_bytes.unwrap_or(rr.issued_bytes),
+            BytesSource::ODirectIssued => rr.issued_bytes,
+            BytesSource::LliteStats => d_llite.unwrap_or(rr.issued_bytes),
+            BytesSource::ProcSelfIo => d_proc,
+        };
 
         // --- proof size, naive: real per-range slice proofs from bao.
         // A slice contains proof nodes interleaved with the covered data, so
@@ -271,20 +302,32 @@ fn main() -> std::io::Result<()> {
             n_ranges: ranges.len(),
             chunks: chunks.len() as u64,
             bytes_transferred,
+            bytes_source: source,
+            proc_bytes_delta: d_proc,
+            llite_bytes_delta: d_llite.map(|v| v.to_string()).unwrap_or_default(),
+            issued_bytes: rr.issued_bytes,
             io_ops,
+            osc_rpcs: d_osc.map(|v| v.to_string()).unwrap_or_default(),
+            cache_dropped: u8::from(cache_dropped),
             read_ms,
             proof_naive,
             proof_dedup,
         };
         println!(
-            "bao,{},{},{},{},{},{},{},{:.3},{},{}",
-            sc,
+            "bao,{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{}",
+            env.csv_fields(),
+            r.cache_dropped,
             r.selection,
             r.useful_bytes,
             r.n_ranges,
             r.chunks,
             r.bytes_transferred,
+            r.bytes_source.as_str(),
+            r.proc_bytes_delta,
+            r.llite_bytes_delta,
+            r.issued_bytes,
             r.io_ops,
+            r.osc_rpcs,
             r.read_ms,
             r.proof_naive,
             r.proof_dedup

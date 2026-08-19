@@ -40,8 +40,7 @@
 //! rather than discovered eight hours in.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -78,60 +77,9 @@ fn selections() -> Vec<(&'static str, Selection)> {
     ]
 }
 
-// ===== measured-I/O plumbing =====
-
-/// Bytes this process has actually read from the block layer, per
-/// `/proc/self/io`'s `read_bytes`. This is the counter the design plan
-/// requires ("from /proc/self/io or getrusage, not computed") — it excludes
-/// page-cache hits, which is exactly what makes it meaningful here.
-fn proc_read_bytes() -> u64 {
-    let s = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    for line in s.lines() {
-        if let Some(v) = line.strip_prefix("read_bytes:") {
-            return v.trim().parse().unwrap_or(0);
-        }
-    }
-    0
-}
-
-/// Evict `path`'s clean page-cache pages, so the next read goes to the device.
-fn evict_cache(path: &Path) {
-    if let Ok(f) = File::open(path) {
-        unsafe {
-            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
-    }
-}
-
-/// Device logical block size, for the model's `ceil(run_len / B) * B` term.
-fn device_block_size(dir: &Path) -> u64 {
-    // Best-effort; 512 is the near-universal logical block size and only
-    // affects the *predicted* column, never a measured one.
-    let _ = dir;
-    512
-}
-
-/// Measured sequential read bandwidth for the device holding `path`, so the
-/// cost model can be re-evaluated for untested hardware from this row alone.
-/// Reads a 512 MiB prefix of the (already-generated) dataset after evicting
-/// its cache, so this is device bandwidth, not page-cache bandwidth.
-fn seq_read_mbps(path: &Path) -> std::io::Result<f64> {
-    const SPAN: usize = 512 * 1024 * 1024;
-    evict_cache(path);
-    let mut f = File::open(path)?;
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    let mut read = 0usize;
-    let t = Instant::now();
-    while read < SPAN {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        read += n;
-    }
-    let dt = t.elapsed().as_secs_f64();
-    Ok((read as f64) / dt / 1.0e6)
-}
+#[path = "common/storage_io.rs"]
+mod storage_io;
+use storage_io::*;
 
 // ===== grid geometry =====
 
@@ -268,7 +216,7 @@ fn generate_dataset(path: &Path) -> std::io::Result<u64> {
 /// `HashAlg::hash_leaf` over the gathered buffer — the streaming build is an
 /// optimization, not a different tree. `tree_build_matches_gathered` in the
 /// test module pins that equivalence on a small case.
-fn build_tree_streaming(path: &Path, shape: &[u64; 3]) -> std::io::Result<MerkleTree> {
+fn build_tree_streaming(path: &Path, shape: &[u64; 3], direct: bool) -> std::io::Result<MerkleTree> {
     let nt = tiles_per_dim(shape);
     let n_leaves = (nt[0] * nt[1] * nt[2]) as usize;
     let mut hashers: Vec<blake3::Hasher> = (0..n_leaves)
@@ -280,7 +228,7 @@ fn build_tree_streaming(path: &Path, shape: &[u64; 3]) -> std::io::Result<Merkle
         .collect();
 
     let elem = u64::from(ELEM_SIZE);
-    let mut f = File::open(path)?;
+    let mut f = SeqReader::open(path, direct)?;
     // Read a whole plane (4 MB) per I/O rather than a row (4 KB): 1000 reads
     // instead of 1,000,000, so the build is bandwidth- not syscall-bound.
     let plane_bytes = (DIMS[1] * DIMS[2] * elem) as usize;
@@ -355,13 +303,17 @@ struct Row {
     leaf_bytes: u64,
     runs_per_leaf: u64,
     run_len_bytes: u64,
-    storage_class: String,
-    block_size_bytes: u64,
     selection: String,
     useful_bytes: u64,
     bytes_transferred: f64,
+    bytes_source: BytesSource,
     bytes_ci: (f64, f64),
+    proc_bytes_delta: u64,
+    llite_bytes_delta: String,
+    issued_bytes: u64,
     io_ops: u64,
+    osc_rpcs: String,
+    cache_dropped: u8,
     read_ms: f64,
     read_ci: (f64, f64),
     proof_size_bytes: usize,
@@ -371,10 +323,56 @@ struct Row {
     trials: usize,
 }
 
+impl Row {
+    fn csv_header() -> String {
+        format!(
+            "leaf_shape,leaf_bytes,runs_per_leaf,run_len_bytes,{},cache_dropped,selection,\
+             useful_bytes,bytes_transferred,bytes_source,bytes_ci95_low,bytes_ci95_high,\
+             proc_read_bytes_delta,llite_read_bytes_delta,issued_bytes,io_ops,osc_read_rpcs,\
+             read_ms,read_ci95_low,read_ci95_high,proof_size_bytes,verify_ms,verify_ci95_low,\
+             verify_ci95_high,model_bytes_predicted,trials",
+            BenchEnv::csv_header()
+        )
+    }
+
+    fn csv_row(&self, env: &BenchEnv) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{:.0},{},{:.0},{:.0},{},{},{},{},{},\
+             {:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{}",
+            self.leaf_shape,
+            self.leaf_bytes,
+            self.runs_per_leaf,
+            self.run_len_bytes,
+            env.csv_fields(),
+            self.cache_dropped,
+            self.selection,
+            self.useful_bytes,
+            self.bytes_transferred,
+            self.bytes_source.as_str(),
+            self.bytes_ci.0,
+            self.bytes_ci.1,
+            self.proc_bytes_delta,
+            self.llite_bytes_delta,
+            self.issued_bytes,
+            self.io_ops,
+            self.osc_rpcs,
+            self.read_ms,
+            self.read_ci.0,
+            self.read_ci.1,
+            self.proof_size_bytes,
+            self.verify_ms,
+            self.verify_ci.0,
+            self.verify_ci.1,
+            self.model_bytes_predicted,
+            self.trials
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn measure(
     path: &Path,
-    storage_class: &str,
+    env: &BenchEnv,
     shape: &[u64; 3],
     shape_label: &str,
     sel_label: &str,
@@ -388,24 +386,36 @@ fn measure(
     let proof: SubsetProof = extract_subset(tree, grid, sel, LeafOrder::RowMajor)
         .expect("extract_subset should succeed");
 
-    let block = device_block_size(path.parent().unwrap_or(Path::new("/")));
+    let block = env.block_size;
     let sample_runs = leaf_runs(shape, leaves[0]);
     let runs_per_leaf = sample_runs.len() as u64;
     let run_len = sample_runs[0].1;
     let leaf_bytes: u64 = sample_runs.iter().map(|(_, l)| *l).sum();
+    let max_run = sample_runs.iter().map(|(_, l)| *l).max().unwrap_or(run_len);
 
+    let mut source = choose_bytes_source(env);
     let mut io_ops = 0u64;
+    let mut issued_bytes = 0u64;
+    let mut proc_bytes_delta = 0u64;
+    let mut llite_bytes_delta: Option<u64> = None;
+    let mut osc_rpcs: Option<u64> = None;
+    let mut cache_dropped = true;
     let mut byte_samples = Vec::with_capacity(trials);
     let mut read_samples = Vec::with_capacity(trials);
     let mut verify_samples = Vec::with_capacity(trials);
 
     for t in 0..(warmups + trials) {
-        evict_cache(path);
-        let mut f = File::open(path)?;
+        // Under O_DIRECT the page cache is not in the path at all, so there
+        // is nothing to evict and `cache_dropped` is satisfied by
+        // construction. Buffered runs still try fadvise and record whether
+        // it reported success.
+        if !env.o_direct {
+            cache_dropped &= evict_cache(path);
+        }
+        let mut rr = RunReader::open(path, env.o_direct, max_run)?;
 
-        let before = proc_read_bytes();
+        let before = Counters::snapshot(env.lustre);
         let t_read = Instant::now();
-        let mut ops = 0u64;
         let mut leaf_bufs: Vec<Vec<u8>> = Vec::with_capacity(leaves.len());
         for &idx in &leaves {
             let runs = leaf_runs(shape, idx);
@@ -413,15 +423,44 @@ fn measure(
             let mut buf = vec![0u8; total as usize];
             let mut at = 0usize;
             for (off, len) in runs {
-                f.seek(SeekFrom::Start(off))?;
-                f.read_exact(&mut buf[at..at + len as usize])?;
+                rr.read_run(off, len, &mut buf[at..at + len as usize])?;
                 at += len as usize;
-                ops += 1;
             }
             leaf_bufs.push(buf);
         }
         let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
-        let after = proc_read_bytes();
+        let after = Counters::snapshot(env.lustre);
+
+        let d_proc = after.proc_bytes.saturating_sub(before.proc_bytes);
+        let d_llite = delta(before.llite_bytes, after.llite_bytes);
+        let d_osc = delta(before.osc_rpcs, after.osc_rpcs);
+        let d_osc_bytes = delta(before.osc_bytes, after.osc_bytes);
+        // On Lustre a trial that issued no OST read RPC was served from
+        // cache. That is a measurement of cache-coldness, not an assumption
+        // about whether an advisory call worked.
+        if env.lustre {
+            if let Some(rpcs) = d_osc {
+                cache_dropped &= rpcs > 0;
+            }
+        }
+        let primary = match source {
+            BytesSource::OscStats => d_osc_bytes.unwrap_or(rr.issued_bytes),
+            BytesSource::ODirectIssued => rr.issued_bytes,
+            BytesSource::LliteStats => match d_llite {
+                Some(v) => v,
+                None => {
+                    // The parameter was readable when the source was chosen
+                    // and is not now; fall back rather than log a zero.
+                    source = if env.o_direct {
+                        BytesSource::ODirectIssued
+                    } else {
+                        BytesSource::ProcSelfIo
+                    };
+                    if env.o_direct { rr.issued_bytes } else { d_proc }
+                }
+            },
+            BytesSource::ProcSelfIo => d_proc,
+        };
 
         let delivered: Vec<ChunkData<'_>> = proof
             .chunk_indices
@@ -446,10 +485,14 @@ fn measure(
         assert!(ok, "{shape_label}/{sel_label} failed to verify");
 
         if t >= warmups {
-            byte_samples.push((after - before) as f64);
+            byte_samples.push(primary as f64);
             read_samples.push(read_ms);
             verify_samples.push(vms);
-            io_ops = ops;
+            io_ops = rr.issued_ops;
+            issued_bytes = rr.issued_bytes;
+            proc_bytes_delta = d_proc;
+            llite_bytes_delta = d_llite;
+            osc_rpcs = d_osc;
         }
     }
 
@@ -468,13 +511,17 @@ fn measure(
         leaf_bytes,
         runs_per_leaf,
         run_len_bytes: run_len,
-        storage_class: storage_class.to_string(),
-        block_size_bytes: block,
         selection: sel_label.to_string(),
         useful_bytes: useful,
         bytes_transferred: median(&mut bs),
+        bytes_source: source,
         bytes_ci: bootstrap_ci(&byte_samples, 2000),
+        proc_bytes_delta,
+        llite_bytes_delta: llite_bytes_delta.map(|v| v.to_string()).unwrap_or_default(),
+        issued_bytes,
         io_ops,
+        osc_rpcs: osc_rpcs.map(|v| v.to_string()).unwrap_or_default(),
+        cache_dropped: u8::from(cache_dropped),
         read_ms: median(&mut read_samples.clone()),
         read_ci: bootstrap_ci(&read_samples, 2000),
         proof_size_bytes: proof_size(&proof),
@@ -567,44 +614,6 @@ fn main() -> std::io::Result<()> {
             .cloned()
             .unwrap_or_else(|| d.to_string())
     };
-    if args.iter().any(|a| a == "--sweep") {
-        // Target sweep: does a target other than 1 MiB beat the default?
-        // Smaller targets amplify less but drop runs below the readahead
-        // window; larger targets amplify more. Measure where the optimum is
-        // instead of arguing from the model.
-        use clawhdf5_format::verification_grid::verification_grid;
-        let dir = PathBuf::from(get("--dir", "."));
-        let sc = get("--storage-class", "unknown");
-        let n_trials: usize = get("--trials", "30").parse().unwrap_or(30);
-        let path = dir.join("clawbench-contiguous-1000cubed.f32");
-        if !path.exists() {
-            eprintln!("generating 4 GB dataset at {}...", path.display());
-            generate_dataset(&path)?;
-        }
-        println!("target_kib,leaf_shape,leaf_bytes,run_len_bytes,storage_class,\
-                  selection,useful_bytes,bytes_transferred,io_ops,read_ms,\
-                  read_ci95_low,read_ci95_high,proof_size_bytes,trials");
-        for shift in [18u32, 19, 20, 21, 22] {
-            let target = 1u64 << shift;
-            let Some(g) = verification_grid(&DIMS, ELEM_SIZE, target) else { continue };
-            let shape = [g[0], g[1], g[2]];
-            let label = format!("{}x{}x{}", shape[0], shape[1], shape[2]);
-            eprintln!("target {}K -> {label}, building tree...", target / 1024);
-            let tree = build_tree_streaming(&path, &shape)?;
-            let grid = ChunkGridParams::new(DIMS.to_vec(), shape.to_vec(), ELEM_SIZE,
-                                            LayoutClass::Contiguous, HashAlg::Blake3);
-            for (sel_label, sel) in selections() {
-                let r = measure(&path, &sc, &shape, &label, sel_label, &sel,
-                                &tree, &grid, n_trials, 5)?;
-                println!("{},{},{},{},{},{},{},{:.0},{},{:.3},{:.3},{:.3},{},{}",
-                         target / 1024, r.leaf_shape, r.leaf_bytes, r.run_len_bytes,
-                         r.storage_class, r.selection, r.useful_bytes,
-                         r.bytes_transferred, r.io_ops, r.read_ms,
-                         r.read_ci.0, r.read_ci.1, r.proof_size_bytes, r.trials);
-            }
-        }
-        return Ok(());
-    }
     if args.iter().any(|a| a == "--grids") {
         // What grid does the DAOS rule derive at each target, and what does
         // that imply for read amplification? Amplification is the ratio of
@@ -639,70 +648,159 @@ fn main() -> std::io::Result<()> {
         }
         return Ok(());
     }
+    // ---- common setup: dataset, device parameters, measurement mode ----
+    let dir = PathBuf::from(get("--dir", "."));
+    let o_direct = args.iter().any(|a| a == "--o-direct")
+        || std::env::var("BENCH_O_DIRECT").map(|v| v == "1").unwrap_or(false);
+    let path = dir.join("clawbench-contiguous-1000cubed.f32");
+    if !path.exists() {
+        eprintln!("generating 4 GB dataset at {}...", path.display());
+        let t = Instant::now();
+        let n = generate_dataset(&path)?;
+        eprintln!("  wrote {n} bytes in {:.1}s", t.elapsed().as_secs_f64());
+    } else {
+        eprintln!("reusing dataset at {}", path.display());
+    }
+
+    let env = BenchEnv::detect(&get, &path, o_direct)?;
+
+    if args.iter().any(|a| a == "--sweep") {
+        // Step 2, the run-length rule: the model predicts a cliff when the
+        // run length falls below the device block size B. The default targets
+        // are B/4, B/2, B, 2B, 4B for B = 1 MiB, which is what a Lustre run
+        // at stripe size 1M gives. Pass --targets 1024,2048,4096,8192,16384
+        // (KiB) instead when B is 4 MiB.
+        use clawhdf5_format::verification_grid::verification_grid;
+        let n_trials: usize = get("--trials", "30").parse().unwrap_or(30);
+        let warmups: usize = get("--warmups", "5").parse().unwrap_or(5);
+        let only_sel = get("--selection", "");
+        let targets: Vec<u64> = get("--targets", "256,512,1024,2048,4096")
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+            .collect();
+        println!("target_kib,{}", Row::csv_header());
+        for target in targets {
+            let Some(g) = verification_grid(&DIMS, ELEM_SIZE, target) else {
+                continue;
+            };
+            let shape = [g[0], g[1], g[2]];
+            let label = format!("{}x{}x{}", shape[0], shape[1], shape[2]);
+            eprintln!("target {}K -> {label}, building tree...", target / 1024);
+            let tree = build_tree_streaming(&path, &shape, env.o_direct)?;
+            let grid = ChunkGridParams::new(
+                DIMS.to_vec(),
+                shape.to_vec(),
+                ELEM_SIZE,
+                LayoutClass::Contiguous,
+                HashAlg::Blake3,
+            );
+            for (sel_label, sel) in selections() {
+                if !only_sel.is_empty() && only_sel != sel_label {
+                    continue;
+                }
+                let r = measure(
+                    &path, &env, &shape, &label, sel_label, &sel, &tree, &grid, n_trials,
+                    warmups,
+                )?;
+                println!("{},{}", target / 1024, r.csv_row(&env));
+            }
+        }
+        if env.lustre {
+            dump_readahead_stats("after");
+        }
+        return Ok(());
+    }
+
     if args.iter().any(|a| a == "--audit") {
         // Step 5: whole-dataset audit throughput. The design claims the
         // streaming tree construction runs at sequential-read bandwidth --
         // i.e. that the tree is nearly free relative to the flat hash it has
-        // to beat. Measure both over the same bytes, caches evicted.
-        let dir = PathBuf::from(get("--dir", "."));
-        let sc = get("--storage-class", "unknown");
-        let path = dir.join("clawbench-contiguous-1000cubed.f32");
-        if !path.exists() {
-            eprintln!("generating 4 GB dataset at {}...", path.display());
-            generate_dataset(&path)?;
-        }
+        // to beat. Measure both over the same bytes, under the same cache
+        // regime, with a pure-read control so "fraction of device bandwidth"
+        // can be separated from "this device does not deliver its datasheet
+        // figure on this access pattern".
         let n_trials: usize = get("--trials", "5").parse().unwrap_or(5);
         let total = DIMS.iter().product::<u64>() * u64::from(ELEM_SIZE);
-        println!("approach,storage_class,trial,wall_ms,throughput_mbps");
+        let dev = format!(
+            "{},{},{},{},{:.0}",
+            env.storage_class,
+            u8::from(env.o_direct),
+            env.stripe_count,
+            env.stripe_size,
+            env.seq_read_mbps
+        );
+        println!(
+            "approach,storage_class,o_direct,stripe_count,stripe_size_bytes,seq_read_mbps,\
+             trial,wall_ms,throughput_mbps"
+        );
         for t in 0..n_trials {
             // Pure read, no hashing, same 64 MiB batch pattern: the ceiling
-            // any build can reach on this device and access pattern. Without
-            // this row, "62% of device bandwidth" cannot be separated from
-            // "the device does not deliver its benchmark figure here".
-            evict_cache(&path);
-            let mut f = File::open(&path)?;
+            // any build can reach on this device and access pattern.
+            if !env.o_direct {
+                evict_cache(&path);
+            }
+            let mut f = SeqReader::open(&path, env.o_direct)?;
             let mut rbuf = vec![0u8; 64 << 20];
             let t0 = Instant::now();
             let mut got = 0u64;
             loop {
                 let n = f.read(&mut rbuf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 got += n as u64;
             }
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             assert_eq!(got, total);
-            println!("read_only,{sc},{t},{ms:.1},{:.1}", total as f64 / (ms / 1000.0) / 1.0e6);
+            println!(
+                "read_only,{dev},{t},{ms:.1},{:.1}",
+                total as f64 / (ms / 1000.0) / 1.0e6
+            );
 
             // flat BLAKE3 over the whole file
-            evict_cache(&path);
-            let mut f = File::open(&path)?;
+            if !env.o_direct {
+                evict_cache(&path);
+            }
+            let mut f = SeqReader::open(&path, env.o_direct)?;
             let mut buf = vec![0u8; 8 << 20];
             let mut h = blake3::Hasher::new();
             let t0 = Instant::now();
             loop {
                 let n = f.read(&mut buf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 h.update(&buf[..n]);
             }
             let _ = h.finalize();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            println!("flat_hash,{sc},{t},{ms:.1},{:.1}", total as f64 / (ms / 1000.0) / 1.0e6);
+            println!(
+                "flat_hash,{dev},{t},{ms:.1},{:.1}",
+                total as f64 / (ms / 1000.0) / 1.0e6
+            );
 
             // streaming Merkle build at the DAOS default shape, via the
             // bench's own interleaved-hasher helper (the pre-P2.9 path, kept
             // so the improvement is measured against a real baseline).
-            evict_cache(&path);
+            if !env.o_direct {
+                evict_cache(&path);
+            }
             let t0 = Instant::now();
-            let _tree = build_tree_streaming(&path, &[1, 250, 1000])?;
+            let _tree = build_tree_streaming(&path, &[1, 250, 1000], env.o_direct)?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            println!("grid_tree_interleaved,{sc},{t},{ms:.1},{:.1}",
-                     total as f64 / (ms / 1000.0) / 1.0e6);
+            println!(
+                "grid_tree_interleaved,{dev},{t},{ms:.1},{:.1}",
+                total as f64 / (ms / 1000.0) / 1.0e6
+            );
 
             // The production streaming builder: one sequential pass, leaves
             // hashed in parallel. This is what ships, so this is the number
             // that matters.
-            evict_cache(&path);
-            let mut f = File::open(&path)?;
+            if !env.o_direct {
+                evict_cache(&path);
+            }
+            let mut f = SeqReader::open(&path, env.o_direct)?;
             let t0 = Instant::now();
             let (_tree, _grid) = clawhdf5_format::subset_proof::contiguous_tree_streaming(
                 &mut f,
@@ -712,13 +810,18 @@ fn main() -> std::io::Result<()> {
                 HashAlg::Blake3,
             )?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            println!("grid_tree_parallel,{sc},{t},{ms:.1},{:.1}",
-                     total as f64 / (ms / 1000.0) / 1.0e6);
+            println!(
+                "grid_tree_parallel,{dev},{t},{ms:.1},{:.1}",
+                total as f64 / (ms / 1000.0) / 1.0e6
+            );
+        }
+        if env.lustre {
+            dump_readahead_stats("after");
         }
         return Ok(());
     }
-    let dir = PathBuf::from(get("--dir", "."));
-    let storage_class = get("--storage-class", "unknown");
+
+    // ---- step 1: Table tab:tileshape, measured ----
     let calibrate = args.iter().any(|a| a == "--calibrate");
     let trials: usize = if calibrate {
         1
@@ -731,27 +834,9 @@ fn main() -> std::io::Result<()> {
         get("--warmups", "5").parse().unwrap_or(5)
     };
     let only_shape = get("--shape", "");
+    let only_sel = get("--selection", "");
 
-    let path = dir.join("clawbench-contiguous-1000cubed.f32");
-    if !path.exists() {
-        eprintln!("generating 4 GB dataset at {}...", path.display());
-        let t = Instant::now();
-        let n = generate_dataset(&path)?;
-        eprintln!("  wrote {} bytes in {:.1}s", n, t.elapsed().as_secs_f64());
-    } else {
-        eprintln!("reusing dataset at {}", path.display());
-    }
-
-    let seq_mbps = seq_read_mbps(&path)?;
-    eprintln!("sequential read bandwidth: {seq_mbps:.0} MB/s");
-
-    println!(
-        "leaf_shape,leaf_bytes,runs_per_leaf,run_len_bytes,storage_class,block_size_bytes,\
-         seq_read_mbps,selection,useful_bytes,bytes_transferred,bytes_ci95_low,bytes_ci95_high,\
-         io_ops,read_ms,read_ci95_low,read_ci95_high,proof_size_bytes,\
-         verify_ms,verify_ci95_low,verify_ci95_high,\
-         model_bytes_predicted,trials"
-    );
+    println!("{}", Row::csv_header());
 
     for (shape, label) in SHAPES {
         if !only_shape.is_empty() && only_shape != *label {
@@ -759,7 +844,7 @@ fn main() -> std::io::Result<()> {
         }
         eprintln!("building tree for {label}...");
         let t = Instant::now();
-        let tree = build_tree_streaming(&path, shape)?;
+        let tree = build_tree_streaming(&path, shape, env.o_direct)?;
         eprintln!("  built in {:.1}s", t.elapsed().as_secs_f64());
         let grid = ChunkGridParams::new(
             DIMS.to_vec(),
@@ -770,50 +855,23 @@ fn main() -> std::io::Result<()> {
         );
 
         for (sel_label, sel) in selections() {
+            if !only_sel.is_empty() && only_sel != sel_label {
+                continue;
+            }
             let t = Instant::now();
             let r = measure(
-                &path,
-                &storage_class,
-                shape,
-                label,
-                sel_label,
-                &sel,
-                &tree,
-                &grid,
-                trials,
-                warmups,
+                &path, &env, shape, label, sel_label, &sel, &tree, &grid, trials, warmups,
             )?;
             eprintln!(
                 "  {label}/{sel_label}: {:.1}s for {} trials",
                 t.elapsed().as_secs_f64(),
                 r.trials
             );
-            println!(
-                "{},{},{},{},{},{},{:.0},{},{},{:.0},{:.0},{:.0},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{}",
-                r.leaf_shape,
-                r.leaf_bytes,
-                r.runs_per_leaf,
-                r.run_len_bytes,
-                r.storage_class,
-                r.block_size_bytes,
-                seq_mbps,
-                r.selection,
-                r.useful_bytes,
-                r.bytes_transferred,
-                r.bytes_ci.0,
-                r.bytes_ci.1,
-                r.io_ops,
-                r.read_ms,
-                r.read_ci.0,
-                r.read_ci.1,
-                r.proof_size_bytes,
-                r.verify_ms,
-                r.verify_ci.0,
-                r.verify_ci.1,
-                r.model_bytes_predicted,
-                r.trials
-            );
+            println!("{}", r.csv_row(&env));
         }
+    }
+    if env.lustre {
+        dump_readahead_stats("after");
     }
     Ok(())
 }
