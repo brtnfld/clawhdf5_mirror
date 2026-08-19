@@ -80,8 +80,29 @@ pub fn proc_read_bytes() -> u64 {
 /// parameter is unreadable. Since Lustre 2.10 the stats files live in
 /// debugfs, which is root-only at many sites; every caller therefore treats
 /// absence as a fact to record rather than an error to abort on.
+/// Locate `lctl`. It is not on the default PATH on every Lustre client --
+/// Frontier's login nodes are one, where it lives in /usr/sbin -- and without
+/// it there are no client counters at all, so the byte column silently falls
+/// back to a source that reads zero on this filesystem. Resolved once.
+fn lctl_exe() -> Option<&'static str> {
+    static EXE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *EXE.get_or_init(|| {
+        for exe in ["lctl", "/usr/sbin/lctl", "/sbin/lctl"] {
+            let ok = Command::new(exe)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(exe);
+            }
+        }
+        None
+    })
+}
+
 pub fn lctl_get(param: &str) -> Option<String> {
-    let out = Command::new("lctl")
+    let out = Command::new(lctl_exe()?)
         .args(["get_param", "-n", param])
         .output()
         .ok()?;
