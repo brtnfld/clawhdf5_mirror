@@ -13,6 +13,9 @@ categories = ["parser-implementations", "science", "encoding"]
 clawhdf5-format = { path = "../clawhdf5-format", version = "2.1.0" }
 clawhdf5-io = { path = "../clawhdf5-io", version = "2.1.0" }
 rayon = { version = "1", optional = true }
+# Only pulled in by the `bench-ed25519-fast` feature, to switch on
+# ed25519-dalek's precomputed base-point tables for benchmark builds.
+ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["fast"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -24,6 +27,10 @@ libc = "0.2"
 
 [[example]]
 name = "phase1_bench"
+required-features = []
+
+[[example]]
+name = "fourway_bench"
 required-features = []
 
 [[bench]]
@@ -44,6 +51,10 @@ zstd = ["clawhdf5-format/zstd"]
 blake3_hash = ["clawhdf5-format/blake3_hash"]
 lz4 = ["clawhdf5-format/lz4"]
 pcodec = ["clawhdf5-format/pcodec"]
+# Benchmark-only: enable ed25519-dalek's `fast` (precomputed tables) so the
+# per-chunk Ed25519 baseline signs at its representative speed. Off by
+# default so existing benchmark numbers stay reproducible.
+bench-ed25519-fast = ["dep:ed25519-dalek"]
 
 [package.metadata.docs.rs]
 features = ["mmap"]
