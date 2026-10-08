@@ -785,8 +785,12 @@ mod pfs {
                  hash_max_ms,subtree_max_ms,reduce_ms,companion_ms,companion_writes,companion_bytes"
             );
         }
-        if strategy == "gather" && lay.companion_bytes() * 2 > (8 << 30) {
-            die("gather strategy would hold >8 GiB on rank 0; use distributed");
+        // Rank 0 holds the gathered subtrees and the assembled array at once.
+        // A Frontier node has 512 GB; 64 GiB leaves the node's other ranks
+        // their share. Beyond that the naive coordinator is not a baseline
+        // worth running -- which is itself the point of the comparison.
+        if strategy == "gather" && lay.companion_bytes() * 2 > (64 << 30) {
+            die("gather strategy would hold >64 GiB on rank 0; use distributed");
         }
         if ctx.root() && matches!(strategy.as_str(), "gather" | "distributed") {
             let f = OpenOptions::new().create(true).write(true).truncate(false).open(&companion)?;
