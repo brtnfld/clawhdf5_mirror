@@ -30,6 +30,13 @@ name = "mpi_io_bench"
 path = "src/bin/mpi_io_bench.rs"
 required-features = ["mpi-io"]
 
+# Parallel-filesystem study of the Merkle verification grid (S2-D2 Paper A):
+# distributed construction, concurrent partial verification, parallel writers.
+[[bin]]
+name = "pfs_merkle_bench"
+path = "src/bin/pfs_merkle_bench.rs"
+required-features = ["pfs"]
+
 # ---------------------------------------------------------------------------
 # h5bench-equivalent Criterion benchmarks
 # ---------------------------------------------------------------------------
@@ -50,6 +57,11 @@ harness = false
 clawhdf5-agent = { path = "../clawhdf5-agent" }
 clawhdf5-io = { path = "../clawhdf5-io" }
 mpi = { version = "0.8", optional = true }
+clawhdf5-format = { path = "../clawhdf5-format", optional = true, features = ["merkle"] }
+rayon = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+sha2 = { version = "0.10", optional = true }
+blake3 = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
@@ -66,3 +78,4 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # When enabled, benchmarks add matching libhdf5 variants for side-by-side comparison.
 libhdf5-compare = ["hdf5"]
 mpi-io = ["clawhdf5-io/mpi-io", "mpi"]
+pfs = ["mpi", "dep:clawhdf5-format", "dep:rayon", "dep:libc", "dep:sha2", "dep:blake3"]
