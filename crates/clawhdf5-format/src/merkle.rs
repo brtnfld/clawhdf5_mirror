@@ -2779,23 +2779,40 @@ pub fn verify_root(d: &Dataset<'_>) -> Result<bool, MerkleError> {
 ///
 /// The implementation MUST return `true` only if it holds a signature that is
 /// valid, under trusted public keys, over the canonical payload binding
-/// **all** of `(root, companion_hash, alg, version, timestamp)` — i.e. exactly
-/// the tuple `verify_signed_root` passes in. Binding every field is what makes
+/// **every** field of `attr` that `clawhdf5_sign::canonical_payload` covers —
+/// `root`, `companion_hash`, `algorithm`, `leaf_format`, `grid_hash` — plus
+/// `version` and `timestamp`. Binding every field is what makes
 /// [`verify_signed_root`] catch attacks that mere self-consistency cannot:
 /// an algorithm downgrade (T6b) changes `alg`, a companion-tree forgery (T1d)
 /// changes `companion_hash`, and a rollback changes `version` — each produces a
 /// different payload the held signature cannot cover.
+///
+/// # Why the whole attribute, not a field tuple (2026-10 red-team finding)
+///
+/// This trait used to receive only `(root, companion_hash, alg, version,
+/// timestamp)`, mirroring an 81-byte payload that left `leaf_format` and
+/// `grid_hash` unsigned. Both are load-bearing for what the root *means*, and
+/// both are only protected by the attribute's unkeyed integrity hash (which a
+/// T1 attacker simply recomputes), so a valid signature survived:
+///
+/// - **Leaf-format downgrade with re-framing.** Flip a [`LeafFormat::Bound`]
+///   dataset to [`LeafFormat::Content`] and rewrite each stored chunk as the
+///   bound preimage suffix `be32(8) || le64(k) || be32(len) || data || le64(v)`.
+///   Under `Content`, `H(0x00 || framed)` equals the original bound leaf, so
+///   the signed root is untouched and `verify_dataset`/`verify_chunk` accept
+///   bytes the signer never committed to.
+/// - **Grid rewrite.** Rewrite the declared `dims`/`chunk_shape` and recompute
+///   `grid_hash` with the public preimage; the root is unchanged, and
+///   `verify_subset` (which trusts the attribute's `grid_hash`) then delivers
+///   a different chunk for the same requested hyperslab.
+///
+/// Passing the attribute itself means any field added to [`MerkleAttr`] later
+/// is at least *available* to the signer, so the question becomes "did
+/// `canonical_payload` bind it?" rather than "was it even plumbed through?".
 pub trait SignedRootVerifier {
     /// Return `true` iff a trusted signature validates over the canonical
-    /// payload binding these fields.
-    fn verify_signed_root(
-        &self,
-        root: &[u8; HASH_SIZE],
-        companion_hash: &[u8; HASH_SIZE],
-        alg: HashAlg,
-        version: u64,
-        timestamp: u64,
-    ) -> bool;
+    /// payload binding `attr`'s signed fields, `version`, and `timestamp`.
+    fn verify_signed_root(&self, attr: &MerkleAttr, version: u64, timestamp: u64) -> bool;
 }
 
 /// Verify a **signed** dataset's root (P2.4: the signature-bound counterpart to
@@ -2804,13 +2821,15 @@ pub trait SignedRootVerifier {
 /// 1. Runs [`verify_root`]'s self-consistency check (companion integrity, or
 ///    the attribute's own integrity hash).
 /// 2. Asks the injected `verifier` to confirm a trusted signature binds the
-///    on-disk `(root, companion_hash, alg, version, timestamp)`. If it does
-///    not, returns [`MerkleError::SignatureInvalid`].
+///    on-disk attribute (`root`, `companion_hash`, `algorithm`, `leaf_format`,
+///    `grid_hash`) together with `version` and `timestamp`. If it does not,
+///    returns [`MerkleError::SignatureInvalid`].
 ///
 /// For a signed dataset this closes the gaps [`verify_root`] alone cannot: an
 /// attacker with full storage access can rebuild a self-consistent tree under
-/// a weaker algorithm or with forged companion nodes, but cannot produce a
-/// signature over the altered payload without the private key.
+/// a weaker algorithm, with forged companion nodes, under a downgraded leaf
+/// format, or with a rewritten chunk grid, but cannot produce a signature over
+/// the altered payload without the private key.
 pub fn verify_signed_root<V: SignedRootVerifier + ?Sized>(
     d: &Dataset<'_>,
     version: u64,
@@ -2821,13 +2840,7 @@ pub fn verify_signed_root<V: SignedRootVerifier + ?Sized>(
     // the more expensive signature check).
     verify_root(d)?;
 
-    if verifier.verify_signed_root(
-        &d.merkle_attr.root,
-        &d.merkle_attr.companion_hash,
-        d.merkle_attr.algorithm,
-        version,
-        timestamp,
-    ) {
+    if verifier.verify_signed_root(&d.merkle_attr, version, timestamp) {
         Ok(true)
     } else {
         Err(MerkleError::SignatureInvalid)
@@ -5845,21 +5858,34 @@ mod signed_root_tests {
         }
     }
 
+    // Same two-instance bridge for `LeafFormat` (see `to_sign_alg`).
+    fn to_sign_leaf_format(f: LeafFormat) -> clawhdf5_sign::LeafFormat {
+        clawhdf5_sign::LeafFormat::from_id(f.to_id()).expect("same id space")
+    }
+
+    /// Build the v1 canonical payload for an attribute (bridging the two crate
+    /// instances' `HashAlg`/`LeafFormat`).
+    fn payload_for(attr: &MerkleAttr, version: u64, timestamp: u64) -> Vec<u8> {
+        canonical_payload(
+            &attr.root,
+            &attr.companion_hash,
+            version,
+            timestamp,
+            to_sign_alg(attr.algorithm),
+            to_sign_leaf_format(attr.leaf_format),
+            &attr.grid_hash,
+        )
+        .to_vec()
+    }
+
     struct RealVerifier {
         sig: HybridSignature,
         ed_pub: VerifyingKey,
         ml_pub: MlDsaVerifyingKey,
     }
     impl SignedRootVerifier for RealVerifier {
-        fn verify_signed_root(
-            &self,
-            root: &[u8; HASH_SIZE],
-            companion_hash: &[u8; HASH_SIZE],
-            alg: HashAlg,
-            version: u64,
-            timestamp: u64,
-        ) -> bool {
-            let payload = canonical_payload(root, companion_hash, version, timestamp, to_sign_alg(alg));
+        fn verify_signed_root(&self, attr: &MerkleAttr, version: u64, timestamp: u64) -> bool {
+            let payload = payload_for(attr, version, timestamp);
             verify_sig(&payload, &self.sig, &self.ed_pub, &self.ml_pub).is_ok()
         }
     }
@@ -5885,22 +5911,21 @@ mod signed_root_tests {
         let nodes = nodes_bytes(&tree);
         let attr = MerkleAttr::from_tree_with_companion(&tree, companion_of(&nodes));
 
+        let verifier = sign_attr(&attr);
+        (attr, nodes, chunks, verifier)
+    }
+
+    /// Sign `attr` at (VERSION, TS) with fresh hybrid keys.
+    fn sign_attr(attr: &MerkleAttr) -> RealVerifier {
         let ed = SigningKey::generate();
         let ml = MlDsaSigningKey::generate();
-        let payload = canonical_payload(
-            &attr.root,
-            &attr.companion_hash,
-            VERSION,
-            TS,
-            to_sign_alg(attr.algorithm),
-        );
+        let payload = payload_for(attr, VERSION, TS);
         let sig = sign_root(&payload, &ed, &ml).unwrap();
-        let verifier = RealVerifier {
+        RealVerifier {
             sig,
             ed_pub: ed.verifying_key(),
             ml_pub: ml.verifying_key(),
-        };
-        (attr, nodes, chunks, verifier)
+        }
     }
 
     #[test]
@@ -5954,6 +5979,132 @@ mod signed_root_tests {
         let view = Dataset::from_owned(attr, nodes, chunks);
         assert!(matches!(
             verify_signed_root(&view, VERSION + 1, TS, &verifier),
+            Err(MerkleError::SignatureInvalid)
+        ));
+    }
+
+    /// 2026-10 red-team regression: leaf-format downgrade with re-framing.
+    ///
+    /// The attacker flips a `Bound` dataset's attribute to `Content`
+    /// (recomputing the unkeyed integrity hash via the public constructor) and
+    /// rewrites every stored chunk as the bound preimage suffix. Under
+    /// `Content`, `H(0x00 || framed)` equals the original bound leaf, so the
+    /// signed root is untouched; `verify_dataset`/`verify_chunk` are satisfied
+    /// by construction. The only thing that can catch it is the signature —
+    /// which it did not, while `leaf_format` was outside the payload.
+    #[test]
+    fn signed_leaf_format_downgrade_with_reframing_is_rejected() {
+        let alg = HashAlg::Blake3;
+        let data: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 64]).collect();
+        let versions: Vec<u64> = vec![7, 8, 9, 10];
+        let leaves: Vec<[u8; HASH_SIZE]> = data
+            .iter()
+            .enumerate()
+            .map(|(k, d)| hash_chunk_bound(k as u64, d, versions[k], alg))
+            .collect();
+        let tree = MerkleTree::from_leaf_hashes(&leaves, alg);
+        let nodes = nodes_bytes(&tree);
+        let attr = MerkleAttr::from_tree_with_companion(&tree, companion_of(&nodes))
+            .with_leaf_format(LeafFormat::Bound);
+        let verifier = sign_attr(&attr);
+
+        // Honest state verifies end to end.
+        let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+        let honest = Dataset::new(attr.clone(), &nodes, refs).with_versions(versions.clone());
+        assert!(matches!(verify_signed_root(&honest, VERSION, TS, &verifier), Ok(true)));
+        assert!(matches!(verify_dataset(&honest), Ok(true)));
+
+        // Attacker: downgrade + re-frame. Root/companion/alg untouched.
+        let downgraded = MerkleAttr::from_tree_with_companion(&tree, companion_of(&nodes));
+        assert_eq!(downgraded.leaf_format, LeafFormat::Content);
+        assert_eq!(downgraded.root, attr.root);
+        let downgraded = MerkleAttr::unpack(&downgraded.pack()).expect("self-consistent");
+        let framed: Vec<Vec<u8>> = data
+            .iter()
+            .enumerate()
+            .map(|(k, d)| {
+                let mut b = Vec::new();
+                b.extend_from_slice(&8u32.to_be_bytes());
+                b.extend_from_slice(&(k as u64).to_le_bytes());
+                b.extend_from_slice(&(d.len() as u32).to_be_bytes());
+                b.extend_from_slice(d);
+                b.extend_from_slice(&versions[k].to_le_bytes());
+                b
+            })
+            .collect();
+        let framed_refs: Vec<&[u8]> = framed.iter().map(Vec::as_slice).collect();
+        let forged = Dataset::new(downgraded, &nodes, framed_refs);
+
+        // The unsigned checks are fooled by construction (this is what makes
+        // the attack real) ...
+        assert!(matches!(verify_dataset(&forged), Ok(true)));
+        assert!(matches!(verify_chunk(&forged, 2), Ok(true)));
+        // ... and the signature now catches it, because leaf_format is signed.
+        assert!(matches!(
+            verify_signed_root(&forged, VERSION, TS, &verifier),
+            Err(MerkleError::SignatureInvalid)
+        ));
+    }
+
+    /// 2026-10 red-team regression: grid rewrite under a valid signature.
+    ///
+    /// `grid_hash` has a public preimage and was in neither the integrity hash
+    /// nor the signed payload. Rewriting it (together with the unsigned
+    /// dataspace/layout metadata it describes) left the root — and the v0
+    /// signature — intact, and `verify_subset`, which trusts the attribute's
+    /// `grid_hash`, then delivered a different chunk for the same requested
+    /// hyperslab. The attribute-level signature must reject the rewrite.
+    #[test]
+    fn signed_grid_hash_rewrite_is_rejected() {
+        use crate::selection::Selection;
+        use crate::subset_proof::{ChunkData, ChunkGridParams, LeafOrder, extract_subset, verify_subset};
+        use crate::verification_grid::LayoutClass;
+
+        let alg = HashAlg::Blake3;
+        let chunks: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 24]).collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let tree = MerkleTree::from_chunks(&refs, alg);
+        let nodes = nodes_bytes(&tree);
+        let honest_grid = ChunkGridParams::new(vec![2, 2], vec![1, 1], 4, LayoutClass::Chunked, alg);
+        let attr = MerkleAttr::from_tree_with_companion_and_grid(&tree, companion_of(&nodes), honest_grid.grid_hash);
+        let verifier = sign_attr(&attr);
+
+        // Attacker: declare a 4x1 grid instead of 2x2 and recompute grid_hash.
+        let tampered_grid = ChunkGridParams::new(vec![4, 1], vec![1, 1], 4, LayoutClass::Chunked, alg);
+        let tampered_attr = MerkleAttr {
+            grid_hash: tampered_grid.grid_hash,
+            ..attr.clone()
+        };
+        let tampered_attr = MerkleAttr::unpack(&tampered_attr.pack()).expect("self-consistent");
+
+        // The substitution the rewrite enables: the element at (1,0) maps to
+        // leaf 2 under the honest grid but leaf 1 under the tampered one, and
+        // verify_subset -- trusting the attribute's grid_hash -- accepts c1.
+        let sel = Selection::slice(&[1..2, 0..1]);
+        let honest_proof = extract_subset(&tree, &honest_grid, &sel, LeafOrder::RowMajor).unwrap();
+        assert_eq!(honest_proof.chunk_indices, vec![2]);
+        let tampered_proof = extract_subset(&tree, &tampered_grid, &sel, LeafOrder::RowMajor).unwrap();
+        assert_eq!(tampered_proof.chunk_indices, vec![1]);
+        let delivered = [ChunkData { index: 1, data: &chunks[1] }];
+        assert!(matches!(
+            verify_subset(
+                tree.root(),
+                alg,
+                &delivered,
+                &tampered_proof,
+                &tampered_grid,
+                &tampered_attr.grid_hash,
+                &sel,
+                LeafOrder::RowMajor,
+            ),
+            Ok(true)
+        ));
+
+        // So the attribute-level signature check is the gate, and it must
+        // fail: grid_hash is now in the payload.
+        let view = Dataset::new(tampered_attr, &nodes, refs);
+        assert!(matches!(
+            verify_signed_root(&view, VERSION, TS, &verifier),
             Err(MerkleError::SignatureInvalid)
         ));
     }

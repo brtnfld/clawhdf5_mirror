@@ -47,22 +47,35 @@ a redesign — everything below applies unchanged either way.
 ### 1.2 Root attribute: `merkle_root`
 
 A fixed-size attribute on the dataset, mirroring `MerkleAttr`
-(`clawhdf5-format/src/merkle.rs:1312-1448`), **129 bytes**:
+(`clawhdf5-format/src/merkle.rs`, attribute format v1 since commit 87f6b08),
+**130 bytes**:
 
 | Offset | Size | Field | Encoding |
 |---|---|---|---|
 | 0 | 32 | `root` | Merkle root hash, raw bytes |
 | 32 | 1 | `algorithm` | `0x00`=SHA-256, `0x01`=BLAKE3, `0x02`=K12 |
-| 33 | 32 | `integrity` | `H(0x03 \|\| root \|\| algorithm)` — binds the attribute's own fields together |
-| 65 | 32 | `companion_hash` | SHA-256 of the flattened companion node array (all-zero if none) |
-| 97 | 32 | `grid_hash` | `H(0x04 \|\| layout_class \|\| elem_size \|\| dims \|\| chunk_shape)`, binding the grid parameters (all-zero = unbound) — see §1.6 |
+| 33 | 1 | `leaf_format` | `0x00`=Content (`H(0x00 \|\| data)`), `0x01`=Bound (`H(0x00 \|\| len(k) \|\| k \|\| len(data) \|\| data \|\| v_k)`) — which leaf preimage the tree was built with, see §6.2 |
+| 34 | 32 | `integrity` | `H(0x03 \|\| root \|\| algorithm \|\| leaf_format)` — binds the attribute's own fields together |
+| 66 | 32 | `companion_hash` | SHA-256 of the flattened companion node array (all-zero if none) |
+| 98 | 32 | `grid_hash` | `H(0x04 \|\| layout_class \|\| elem_size \|\| dims \|\| chunk_shape)`, binding the grid parameters (all-zero = unbound) — see §1.6 |
 
-A reader recomputes `integrity` from the first 33 bytes on every read and
-rejects (`H5E_MERKLE_INVALID_ATTR`, §2.4) on mismatch, size mismatch, or an
-unrecognized algorithm byte — this is the C equivalent of `MerkleAttr::unpack`'s
-constant-time integrity recheck (`merkle.rs:1389-1448`).
+A reader recomputes `integrity` from the first 34 bytes on every read and
+rejects (`H5E_MERKLE_INVALID_ATTR`, §2.4) on mismatch, size mismatch, an
+unrecognized algorithm byte, or an unrecognized leaf-format byte — this is
+the C equivalent of `MerkleAttr::unpack`'s constant-time integrity recheck.
+A 129-byte (v0) attribute is rejected outright rather than read as
+`leaf_format = Content`, since inferring the unbound format from the old
+length is exactly the downgrade the field exists to prevent.
 
-This attribute is intentionally small (129 bytes, well under HDF5's
+**The integrity hash is unkeyed and is not a security boundary.** It catches
+accidental corruption and naive edits; a storage-level attacker recomputes it
+trivially. The only authoritative binding of this attribute's fields is the
+hybrid signature (§1.5), whose payload therefore covers `root`,
+`companion_hash`, `algorithm`, `leaf_format`, **and** `grid_hash`. A C port
+must not treat `integrity` as protecting `leaf_format` against a directed
+adversary.
+
+This attribute is intentionally small (130 bytes, well under HDF5's
 object-header attribute limits) so it imposes negligible per-dataset
 overhead and is always loaded with the dataset's object header — the
 "instant root verification" property S2-D2-Yr2 §"Storage of the Merkle
@@ -138,23 +151,42 @@ roots. The serialized signature (mirroring `HybridSignature::to_bytes()`,
 `clawhdf5-sign/src/lib.rs:261-277`) is:
 
 ```
-offset 0:  version        1 byte    (0x00)
+offset 0:  version        1 byte    (0x01 — signature format v1, see below)
 offset 1:  ed25519_sig    64 bytes
 offset 65: mldsa65_sig    3309 bytes
 ```
 Total 3374 bytes, fixed-width, no separators — `SERIALIZED_SIZE`
-(`clawhdf5-sign/src/lib.rs:242`).
+(`clawhdf5-sign/src/lib.rs`).
 
 The canonical signed payload `R` (mirroring `canonical_payload`,
-`clawhdf5-sign/src/lib.rs:158-188`) is 81 bytes:
+`clawhdf5-sign/src/lib.rs`; `CANONICAL_PAYLOAD_SIZE`) is **114 bytes**
+(payload v1):
 
 ```
-offset 0:  root            32 bytes  raw
-offset 32: companion_hash  32 bytes  raw
-offset 64: version         8 bytes   big-endian u64
-offset 72: timestamp       8 bytes   big-endian u64 (Unix seconds)
-offset 80: alg_id          1 byte
+offset 0:   root            32 bytes  raw
+offset 32:  companion_hash  32 bytes  raw
+offset 64:  version         8 bytes   big-endian u64
+offset 72:  timestamp       8 bytes   big-endian u64 (Unix seconds)
+offset 80:  alg_id          1 byte
+offset 81:  leaf_format     1 byte    (§1.2)
+offset 82:  grid_hash       32 bytes  raw (all-zero sentinel when unbound; signed as such)
 ```
+
+**Why v1 (2026-10 red-team finding).** Payload v0 (81 bytes) ended at
+`alg_id`. The two trailing fields were protected only by the unkeyed
+attribute integrity hash (`leaf_format`) or by nothing at all (`grid_hash`),
+so an attacker with file write access but no signing key could (a) flip a
+`Bound` dataset to `Content` and re-frame every stored chunk as the bound
+preimage suffix, leaving every leaf hash and the signed root unchanged while
+all verifiers accepted bytes the signer never committed to; or (b) rewrite
+the declared dims/chunk shape and recompute `grid_hash` with its public
+preimage, leaving the root unchanged while `H5Dextract_subset`'s verifier
+delivered a different chunk for the same requested hyperslab. Both are
+closed by signing the fields. The signature format version byte was bumped
+from `0x00` to `0x01` at the same time so that a stored v0 signature is
+rejected at parse time instead of being verified against a payload it never
+bound; v0-signed files must be re-signed. A C implementation must reproduce
+the v1 layout exactly and must reject version byte `0x00`.
 
 **Storage location — correction.** An earlier draft of this document
 claimed no signature attribute exists in the prototype at all; that was
@@ -821,9 +853,15 @@ called out inline at its point of relevance above, this is the summary:
    widening `merkle_sig` to a 3391-byte `AlgID||version||timestamp||sig`
    layout that is a strict superset of the existing bare format, not a
    redesign of the existing function pair.
-5. **Leaf hash formula**: two different, unreconciled formulas exist in
-   the Rust prototype today (§6.2) — reconciling them is a prerequisite,
-   not a detail this spec can leave implicit.
+5. **Leaf hash formula**: the two formulas of §6.2 are now both
+   first-class in the prototype, selected per dataset by the `leaf_format`
+   attribute byte (§1.2, commit 87f6b08) and bound into the signed payload
+   (§1.5). The remaining gap is that the prototype's *writers*
+   (`write_merkle_attr`, `clawhdf5-secure-demo`) still emit `Content`
+   trees, and `extract_subset`/`verify_subset` compute only the `Content`
+   preimage, so a `Bound` dataset cannot yet be subset-verified. A C port
+   should implement the `Bound` preimage end to end, including in
+   `H5Dextract_subset`.
 6. **Filter order**: not a paper-vs-implementation gap after all — an
    earlier draft of this document misattributed this (corrected in §6.1).
    S2-D2-Yr2's own design section (§"Filter Pipeline Interaction") already

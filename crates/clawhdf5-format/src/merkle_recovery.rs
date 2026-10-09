@@ -427,12 +427,17 @@ mod real_signature_tests {
             let Ok(sig) = HybridSignature::from_bytes(&record.hybrid_sig) else {
                 return false;
             };
+            // The journal record carries no leaf_format/grid_hash either; a
+            // real verifier captures them from the signed attribute, as it
+            // does companion_hash/alg_id. These tests sign Content/unbound.
             let payload = canonical_payload(
                 &record.signed_root,
                 &self.companion_hash,
                 record.version,
                 record.timestamp,
                 self.alg_id,
+                clawhdf5_sign::LeafFormat::Content,
+                &[0u8; HASH_SIZE],
             );
             verify_sig(&payload, &sig, &self.ed_pub, &self.ml_pub).is_ok()
         }
@@ -459,7 +464,7 @@ mod real_signature_tests {
         let root = [0x22; HASH_SIZE];
         let version = 1u64;
         let timestamp = 1_700_000_000u64;
-        let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
+        let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id, clawhdf5_sign::LeafFormat::Content, &[0u8; HASH_SIZE]);
         let sig = sign_root(&payload, &ed_key, &ml_key).expect("signing should succeed");
 
         let mut journal = ProvenanceJournal::new();
@@ -493,7 +498,7 @@ mod real_signature_tests {
         let journaled_root = [0x33; HASH_SIZE];
         let version = 1u64;
         let timestamp = 1_700_000_000u64;
-        let payload = canonical_payload(&signed_root, &companion_hash, version, timestamp, alg_id);
+        let payload = canonical_payload(&signed_root, &companion_hash, version, timestamp, alg_id, clawhdf5_sign::LeafFormat::Content, &[0u8; HASH_SIZE]);
         let sig = sign_root(&payload, &ed_key, &ml_key).expect("signing should succeed");
 
         let mut journal = ProvenanceJournal::new();
@@ -529,7 +534,7 @@ mod real_signature_tests {
         let root = [0x44; HASH_SIZE];
         let version = 1u64;
         let timestamp = 1_700_000_000u64;
-        let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
+        let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id, clawhdf5_sign::LeafFormat::Content, &[0u8; HASH_SIZE]);
         let forged_sig =
             sign_root(&payload, &attacker_ed, &attacker_ml).expect("signing should succeed");
 

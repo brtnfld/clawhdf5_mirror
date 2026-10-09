@@ -25,7 +25,7 @@
 //! Output: benches/results/signing-$(hostname).csv (merged by platform column;
 //! re-running for one platform label refreshes only that label's rows).
 
-use clawhdf5_sign::{HashAlg, canonical_payload, sign_root, verify_sig};
+use clawhdf5_sign::{HashAlg, LeafFormat, canonical_payload, sign_root, verify_sig};
 use clawhdf5_sign::{SigningKey, mldsa::MlDsaSigningKey};
 use std::io::Write as IoWrite;
 use std::time::Instant;
@@ -223,7 +223,7 @@ fn run_hybrid_benchmark(n_datasets: usize, platform: &str, rows: &mut Vec<Benchm
     let companion_hash = [0x43; 32];
     let version = 1;
     let timestamp = 1704067200;
-    let payload = canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3);
+    let payload = canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
     // Measure signature size (constant per scheme)
     let sample_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
@@ -274,7 +274,7 @@ fn run_ed25519_benchmark(n_datasets: usize, platform: &str, rows: &mut Vec<Bench
     let companion_hash = [0x43; 32];
     let version = 1;
     let timestamp = 1704067200;
-    let payload = canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3);
+    let payload = canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
     // Measure signature size
     let sample_sig = ed_key.sign_payload(&payload);

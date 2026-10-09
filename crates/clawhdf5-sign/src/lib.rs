@@ -40,11 +40,16 @@ use alloc::string::String;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-// Re-export HashAlg from clawhdf5-format for canonical payload encoding
-pub use clawhdf5_format::merkle::HashAlg;
+// Re-export HashAlg and LeafFormat from clawhdf5-format for canonical payload
+// encoding: both are algorithm identifiers the signed payload must bind (T6).
+pub use clawhdf5_format::merkle::{HashAlg, LeafFormat};
 
 /// Hash size in bytes (Blake3/SHA-256).
 pub const HASH_SIZE: usize = 32;
+
+/// Size in bytes of the canonical signed payload produced by
+/// [`canonical_payload`] (payload format v1).
+pub const CANONICAL_PAYLOAD_SIZE: usize = 114;
 
 /// Errors that can occur during signing or verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,25 +103,50 @@ pub type Signature = [u8; SIGNATURE_SIZE];
 
 /// Encode the canonical signed payload for hybrid post-quantum signatures.
 ///
-/// The payload binds together the Merkle root, companion integrity hash,
-/// dataset version counter, timestamp, and algorithm identifier. This
-/// canonical encoding prevents algorithm substitution attacks and ensures
-/// all critical metadata is authenticated by both Ed25519 and ML-DSA-65
-/// signatures.
+/// The payload binds together every field of the `merkle_root` attribute that
+/// gives the root its meaning — the Merkle root, companion integrity hash,
+/// hash-algorithm identifier, leaf-preimage format, and chunk-grid hash —
+/// plus the dataset version counter and timestamp. This canonical encoding
+/// prevents algorithm-substitution attacks (T6) and ensures all critical
+/// metadata is authenticated by both Ed25519 and ML-DSA-65 signatures.
 ///
-/// # Format
+/// # Format (payload v1)
 ///
 /// The encoding is a big-endian fixed-width binary format with no separators:
 ///
-/// | Field           | Size (bytes) | Encoding     | Description                |
-/// |-----------------|--------------|--------------|----------------------------|
-/// | root            | 32           | raw bytes    | Merkle root hash           |
-/// | companion_hash  | 32           | raw bytes    | Companion integrity hash   |
-/// | version         | 8            | big-endian   | Dataset version counter    |
-/// | timestamp       | 8            | big-endian   | Unix seconds               |
-/// | alg_id          | 1            | raw byte     | Hash algorithm identifier  |
+/// | Field           | Offset | Size (bytes) | Encoding     | Description                     |
+/// |-----------------|--------|--------------|--------------|---------------------------------|
+/// | root            | 0      | 32           | raw bytes    | Merkle root hash                |
+/// | companion_hash  | 32     | 32           | raw bytes    | Companion integrity hash        |
+/// | version         | 64     | 8            | big-endian   | Dataset version counter         |
+/// | timestamp       | 72     | 8            | big-endian   | Unix seconds                    |
+/// | alg_id          | 80     | 1            | raw byte     | Hash algorithm identifier       |
+/// | leaf_format     | 81     | 1            | raw byte     | Leaf-preimage format identifier |
+/// | grid_hash       | 82     | 32           | raw bytes    | Chunk-grid binding hash         |
 ///
-/// **Total: 81 bytes**
+/// **Total: 114 bytes** ([`CANONICAL_PAYLOAD_SIZE`]).
+///
+/// # Why `leaf_format` and `grid_hash` are signed (2026-10 red-team finding)
+///
+/// Payload v0 (81 bytes) stopped after `alg_id`. Both omitted fields live in
+/// the `merkle_root` attribute, where they are protected only by an *unkeyed*
+/// integrity hash (`leaf_format`) or by nothing at all (`grid_hash`), so a
+/// storage-level attacker without the signing key could rewrite them while the
+/// v0 signature still verified:
+///
+/// - Downgrading `LeafFormat::Bound` to `Content` and re-framing each stored
+///   chunk as the bound preimage suffix (`be32(8) || le64(k) || be32(len) ||
+///   data || le64(v)`) leaves every leaf hash — and the signed root — unchanged
+///   while every verifier accepts bytes the signer never committed to.
+/// - Rewriting the declared dims/chunk shape and recomputing `grid_hash` with
+///   its public preimage leaves the root unchanged while `verify_subset`
+///   delivers a different chunk for the same requested hyperslab.
+///
+/// Signatures over the v0 layout are rejected outright: the
+/// [`HybridSignature`] format version was bumped alongside this change, so a
+/// stored v0 signature fails `HybridSignature::from_bytes` rather than being
+/// re-verified against a payload it never bound. Files signed under v0 must be
+/// re-signed.
 ///
 /// # Arguments
 ///
@@ -125,10 +155,15 @@ pub type Signature = [u8; SIGNATURE_SIZE];
 /// * `version` - Dataset-level version counter (increments on each update)
 /// * `timestamp` - Unix timestamp in seconds when the signature was created
 /// * `alg_id` - Hash algorithm used (from `HashAlg::to_id()`)
+/// * `leaf_format` - Leaf-preimage format the tree was built with
+///   (`MerkleAttr::leaf_format`)
+/// * `grid_hash` - The attribute's 32-byte chunk-grid hash
+///   (`MerkleAttr::grid_hash`; all-zero when unbound — that sentinel is signed
+///   too, so an attacker cannot later *add* a grid binding)
 ///
 /// # Returns
 ///
-/// A fixed 81-byte array containing the canonical payload ready for signing.
+/// A fixed 114-byte array containing the canonical payload ready for signing.
 ///
 /// # Example
 ///
@@ -141,8 +176,11 @@ pub type Signature = [u8; SIGNATURE_SIZE];
 /// let timestamp = 1704067200; // 2024-01-01 00:00:00 UTC
 /// let alg_id = HashAlg::Blake3;
 ///
-/// let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
-/// assert_eq!(payload.len(), 81);
+/// let payload = canonical_payload(
+///     &root, &companion_hash, version, timestamp, alg_id,
+///     LeafFormat::Content, &[0u8; 32],
+/// );
+/// assert_eq!(payload.len(), CANONICAL_PAYLOAD_SIZE);
 /// ```
 ///
 /// # Spec Reference
@@ -154,6 +192,10 @@ pub type Signature = [u8; SIGNATURE_SIZE];
 /// ```
 ///
 /// where `||` denotes concatenation and all multi-byte integers are big-endian.
+/// `AlgID` is realised here as the pair `(alg_id, leaf_format)` followed by
+/// `grid_hash`, so that *every* identifier and parameter the verifier reads
+/// out of the attribute is under the signature, as the design's threat T6
+/// requires.
 #[must_use]
 pub fn canonical_payload(
     root: &[u8; 32],
@@ -161,8 +203,10 @@ pub fn canonical_payload(
     version: u64,
     timestamp: u64,
     alg_id: HashAlg,
-) -> [u8; 81] {
-    let mut payload = [0u8; 81];
+    leaf_format: LeafFormat,
+    grid_hash: &[u8; 32],
+) -> [u8; CANONICAL_PAYLOAD_SIZE] {
+    let mut payload = [0u8; CANONICAL_PAYLOAD_SIZE];
     let mut offset = 0;
 
     // 32 bytes: Merkle root
@@ -183,6 +227,14 @@ pub fn canonical_payload(
 
     // 1 byte: algorithm identifier
     payload[offset] = alg_id.to_id();
+    offset += 1;
+
+    // 1 byte: leaf-preimage format identifier
+    payload[offset] = leaf_format.to_id();
+    offset += 1;
+
+    // 32 bytes: chunk-grid binding hash (all-zero sentinel when unbound)
+    payload[offset..offset + 32].copy_from_slice(grid_hash);
 
     payload
 }
@@ -236,7 +288,15 @@ pub struct HybridSignature {
 
 impl HybridSignature {
     /// The current signature format version.
-    pub const VERSION: u8 = 0;
+    ///
+    /// Version 0 signed the 81-byte payload v0 (`root || companion_hash ||
+    /// version || timestamp || alg_id`), which left `leaf_format` and
+    /// `grid_hash` unsigned (see [`canonical_payload`]). Version 1 signs the
+    /// 114-byte payload v1. The version byte is checked in
+    /// [`from_bytes`](Self::from_bytes), so a stored v0 signature is rejected
+    /// rather than verified against a payload it never covered — the only
+    /// fail-closed option, since accepting it would re-open the downgrade.
+    pub const VERSION: u8 = 1;
 
     /// Total serialized size: 1 (version) + 64 (Ed25519) + 3309 (ML-DSA-65).
     pub const SERIALIZED_SIZE: usize = 1 + SIGNATURE_SIZE + MLDSA65_SIGNATURE_SIZE;
@@ -338,7 +398,7 @@ impl HybridSignature {
 ///
 /// let root = [0x42; 32];
 /// let companion_hash = [0x43; 32];
-/// let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+/// let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 ///
 /// let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 /// ```
@@ -398,7 +458,7 @@ pub fn sign_root(
 /// // Signer: generate keys and sign
 /// let ed_key = SigningKey::generate();
 /// let ml_key = MlDsaSigningKey::generate();
-/// let payload = canonical_payload(&[0x42; 32], &[0x43; 32], 1, 1704067200, HashAlg::Blake3);
+/// let payload = canonical_payload(&[0x42; 32], &[0x43; 32], 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 /// let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 ///
 /// // Verifier: verify with public keys
@@ -450,7 +510,7 @@ pub const SIG_ATTR_NAME: &str = "merkle_sig";
 /// use clawhdf5_sign::{canonical_payload, sign_root, write_sig_attr, HashAlg};
 /// use clawhdf5_format::file_writer::FileWriter;
 ///
-/// let payload = canonical_payload(&root, &companion_hash, 1, timestamp, HashAlg::Blake3);
+/// let payload = canonical_payload(&root, &companion_hash, 1, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 /// let sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 ///
 /// let mut fw = FileWriter::new();
@@ -1094,16 +1154,17 @@ mod tests {
         let timestamp = 1704067200; // 2024-01-01 00:00:00 UTC
 
         let payload_blake3 =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3);
-        assert_eq!(payload_blake3.len(), 81);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
+        assert_eq!(payload_blake3.len(), CANONICAL_PAYLOAD_SIZE);
 
         let payload_sha256 =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Sha256);
-        assert_eq!(payload_sha256.len(), 81);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Sha256, LeafFormat::Content, &[0u8; 32]);
+        assert_eq!(payload_sha256.len(), CANONICAL_PAYLOAD_SIZE);
 
         let payload_k12 =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::K12);
-        assert_eq!(payload_k12.len(), 81);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::K12, LeafFormat::Content, &[0u8; 32]);
+        assert_eq!(payload_k12.len(), CANONICAL_PAYLOAD_SIZE);
+        assert_eq!(CANONICAL_PAYLOAD_SIZE, 114);
     }
 
     #[test]
@@ -1112,9 +1173,14 @@ mod tests {
         let companion_hash = [0x02; 32];
         let version = 0x0123456789ABCDEFu64;
         let timestamp = 0xFEDCBA9876543210u64;
+        let grid_hash = [0x03; 32];
 
         let payload =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3, LeafFormat::Bound, &grid_hash);
+
+        // Check leaf_format (byte 81) and grid_hash (bytes 82-113)
+        assert_eq!(payload[81], LeafFormat::Bound.to_id());
+        assert_eq!(&payload[82..114], &grid_hash);
 
         // Check root (bytes 0-31)
         assert_eq!(&payload[0..32], &root);
@@ -1148,18 +1214,64 @@ mod tests {
         let timestamp = 1704067200;
 
         let payload_blake3 =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
         let payload_sha256 =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Sha256);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Sha256, LeafFormat::Content, &[0u8; 32]);
         let payload_k12 =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::K12);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::K12, LeafFormat::Content, &[0u8; 32]);
 
-        // Payloads should differ only in the last byte (algorithm ID)
+        // Payloads should differ only in byte 80 (algorithm ID)
         assert_eq!(&payload_blake3[..80], &payload_sha256[..80]);
         assert_eq!(&payload_blake3[..80], &payload_k12[..80]);
         assert_ne!(payload_blake3[80], payload_sha256[80]);
         assert_ne!(payload_blake3[80], payload_k12[80]);
         assert_ne!(payload_sha256[80], payload_k12[80]);
+        assert_eq!(&payload_blake3[81..], &payload_sha256[81..]);
+        assert_eq!(&payload_blake3[81..], &payload_k12[81..]);
+    }
+
+    #[test]
+    fn canonical_payload_differs_by_leaf_format() {
+        // 2026-10 red-team regression: the leaf-preimage format must be
+        // signed, or a Bound->Content downgrade with re-framed chunks passes.
+        let root = [0x42; 32];
+        let companion_hash = [0x43; 32];
+        let content = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
+        let bound = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Bound, &[0u8; 32]);
+        assert_ne!(content, bound);
+        assert_eq!(&content[..81], &bound[..81]);
+        assert_ne!(content[81], bound[81]);
+        assert_eq!(&content[82..], &bound[82..]);
+    }
+
+    #[test]
+    fn canonical_payload_differs_by_grid_hash() {
+        // 2026-10 red-team regression: the grid hash must be signed, or a
+        // rewritten dims/chunk_shape (with recomputed grid_hash) passes.
+        let root = [0x42; 32];
+        let companion_hash = [0x43; 32];
+        let unbound = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
+        let bound = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0x55u8; 32]);
+        assert_ne!(unbound, bound);
+        assert_eq!(&unbound[..82], &bound[..82]);
+        assert_ne!(&unbound[82..], &bound[82..]);
+    }
+
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn hybrid_signature_from_bytes_rejects_payload_v0_signatures() {
+        // A version-0 signature was computed over the 81-byte payload that
+        // left leaf_format/grid_hash unsigned; it must be rejected at parse
+        // time rather than verified against a v1 payload it never bound.
+        let mut data = vec![0x00]; // v0 version byte
+        data.extend_from_slice(&[0u8; SIGNATURE_SIZE]);
+        data.extend_from_slice(&[0u8; MLDSA65_SIGNATURE_SIZE]);
+        assert_eq!(data.len(), HybridSignature::SERIALIZED_SIZE);
+        assert!(matches!(
+            HybridSignature::from_bytes(&data),
+            Err(SignError::InvalidSignature)
+        ));
+        assert_eq!(HybridSignature::VERSION, 1);
     }
 
     #[test]
@@ -1168,8 +1280,8 @@ mod tests {
         let companion_hash = [0x43; 32];
         let timestamp = 1704067200;
 
-        let payload_v1 = canonical_payload(&root, &companion_hash, 1, timestamp, HashAlg::Blake3);
-        let payload_v2 = canonical_payload(&root, &companion_hash, 2, timestamp, HashAlg::Blake3);
+        let payload_v1 = canonical_payload(&root, &companion_hash, 1, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
+        let payload_v2 = canonical_payload(&root, &companion_hash, 2, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         // Should differ in the version field (bytes 64-71)
         assert_ne!(payload_v1, payload_v2);
@@ -1185,9 +1297,9 @@ mod tests {
         let version = 1;
 
         let payload_t1 =
-            canonical_payload(&root, &companion_hash, version, 1704067200, HashAlg::Blake3);
+            canonical_payload(&root, &companion_hash, version, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
         let payload_t2 =
-            canonical_payload(&root, &companion_hash, version, 1704067201, HashAlg::Blake3);
+            canonical_payload(&root, &companion_hash, version, 1704067201, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         // Should differ in the timestamp field (bytes 72-79)
         assert_ne!(payload_t1, payload_t2);
@@ -1205,7 +1317,7 @@ mod tests {
         let timestamp = 0;
 
         let payload =
-            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3);
+            canonical_payload(&root, &companion_hash, version, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         // All 0xFF bytes from root should be preserved
         assert_eq!(&payload[0..32], &[0xFF; 32]);
@@ -1227,7 +1339,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1307,7 +1419,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1339,8 +1451,8 @@ mod tests {
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
 
-        let payload1 = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
-        let payload2 = canonical_payload(&root, &companion_hash, 2, 1704067200, HashAlg::Blake3);
+        let payload1 = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
+        let payload2 = canonical_payload(&root, &companion_hash, 2, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let sig1 = sign_root(&payload1, &ed_key, &ml_key).unwrap();
         let sig2 = sign_root(&payload2, &ed_key, &ml_key).unwrap();
@@ -1360,7 +1472,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1381,7 +1493,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let mut hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1408,7 +1520,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let mut hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1435,13 +1547,13 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
         // Create different payload (different version)
         let modified_payload =
-            canonical_payload(&root, &companion_hash, 2, 1704067200, HashAlg::Blake3);
+            canonical_payload(&root, &companion_hash, 2, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let ed_pub = ed_key.verifying_key();
         let ml_pub = ml_key.verifying_key();
@@ -1463,7 +1575,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1489,7 +1601,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1515,7 +1627,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let mut hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1546,7 +1658,7 @@ mod tests {
 
         let root = [0x42; 32];
         let companion_hash = [0x43; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1704067200, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
 
         let mut hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
@@ -1586,7 +1698,7 @@ mod tests {
 
         let root = [0x11; 32];
         let companion_hash = [0x22; 32];
-        let payload = canonical_payload(&root, &companion_hash, 1, 1_700_000_000, HashAlg::Blake3);
+        let payload = canonical_payload(&root, &companion_hash, 1, 1_700_000_000, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
         // Write a file with the signature attached to a dataset.

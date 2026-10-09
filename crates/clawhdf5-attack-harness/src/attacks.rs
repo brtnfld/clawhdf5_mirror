@@ -984,6 +984,8 @@ pub fn t5_post_quantum_forgery() -> AttackResult {
         1,
         1_700_000_000,
         SignHashAlg::Blake3,
+        clawhdf5_sign::LeafFormat::Content,
+        &[0u8; 32],
     );
     let genuine_sig = sign_root(&honest_payload, &ed_key, &ml_key).unwrap();
     // Sanity: the genuine signature verifies before we attack anything.
@@ -1002,6 +1004,8 @@ pub fn t5_post_quantum_forgery() -> AttackResult {
         1,
         1_700_000_000,
         SignHashAlg::Blake3,
+        clawhdf5_sign::LeafFormat::Content,
+        &[0u8; 32],
     );
     let forged_ed25519_sig = ed_key.sign_payload(&tampered_payload);
     let forged_sig =
@@ -1108,25 +1112,27 @@ pub(crate) struct HybridRootVerifier {
 }
 
 impl SignedRootVerifier for HybridRootVerifier {
-    fn verify_signed_root(
-        &self,
-        root: &[u8; 32],
-        companion_hash: &[u8; 32],
-        alg: HashAlg,
-        version: u64,
-        timestamp: u64,
-    ) -> bool {
-        // clawhdf5-sign re-exports clawhdf5-format's HashAlg, so `alg` feeds
-        // canonical_payload directly — the payload binds every field.
-        let payload =
-            clawhdf5_sign::canonical_payload(root, companion_hash, version, timestamp, alg);
+    fn verify_signed_root(&self, attr: &MerkleAttr, version: u64, timestamp: u64) -> bool {
+        // clawhdf5-sign re-exports clawhdf5-format's HashAlg/LeafFormat, so the
+        // attribute's fields feed canonical_payload directly — the payload
+        // binds every field of the attribute plus version and timestamp.
+        let payload = clawhdf5_sign::canonical_payload(
+            &attr.root,
+            &attr.companion_hash,
+            version,
+            timestamp,
+            attr.algorithm,
+            attr.leaf_format,
+            &attr.grid_hash,
+        );
         clawhdf5_sign::verify_sig(&payload, &self.sig, &self.ed_pub, &self.ml_pub).is_ok()
     }
 }
 
-/// Sign the honest `(root, companion_hash, alg, version, timestamp)` with fresh
-/// hybrid keys and return a verifier bound to that signature. Shared by the
-/// signed-dataset attacks (T6c, T1f).
+/// Sign the honest attribute (`root`, `companion_hash`, `alg`, `leaf_format`,
+/// `grid_hash`) at `(version, timestamp)` with fresh hybrid keys and return a
+/// verifier bound to that signature. Shared by the signed-dataset attacks
+/// (T6c, T1f).
 pub(crate) fn sign_honest_root(attr: &MerkleAttr, version: u64, timestamp: u64) -> HybridRootVerifier {
     use clawhdf5_sign::{SigningKey, canonical_payload, mldsa::MlDsaSigningKey, sign_root};
     let ed_key = SigningKey::generate();
@@ -1137,6 +1143,8 @@ pub(crate) fn sign_honest_root(attr: &MerkleAttr, version: u64, timestamp: u64) 
         version,
         timestamp,
         attr.algorithm,
+        attr.leaf_format,
+        &attr.grid_hash,
     );
     let sig = sign_root(&payload, &ed_key, &ml_key).expect("honest signing succeeds");
     HybridRootVerifier {

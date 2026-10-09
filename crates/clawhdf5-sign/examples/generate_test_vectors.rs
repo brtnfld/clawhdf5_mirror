@@ -7,8 +7,8 @@
 //! Usage:
 //!   cargo run --example generate_test_vectors --features "ed25519,mldsa"
 
-use clawhdf5_sign::{HashAlg, canonical_payload, sign_root, verify_sig};
-use clawhdf5_sign::{HybridSignature, SigningKey, mldsa::MlDsaSigningKey};
+use clawhdf5_sign::{HashAlg, LeafFormat, canonical_payload, sign_root, verify_sig};
+use clawhdf5_sign::{SigningKey, mldsa::MlDsaSigningKey};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -31,6 +31,10 @@ struct PayloadFields {
     version: u64,
     timestamp: u64,
     algorithm: String,
+    /// Leaf-preimage format identifier (payload v1, byte 81).
+    leaf_format: String,
+    /// Chunk-grid binding hash (payload v1, bytes 82..114).
+    grid_hash_hex: String,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -56,8 +60,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let version = 1;
     let timestamp = 1704067200; // 2024-01-01 00:00:00 UTC
     let alg_id = HashAlg::Blake3;
+    let leaf_format = LeafFormat::Bound;
+    let grid_hash = [0x44; 32];
 
-    let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
+    let payload = canonical_payload(
+        &root,
+        &companion_hash,
+        version,
+        timestamp,
+        alg_id,
+        leaf_format,
+        &grid_hash,
+    );
 
     // Sign the payload
     let hybrid_sig = sign_root(&payload, &ed_key, &ml_key)?;
@@ -87,6 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version,
             timestamp,
             algorithm: "Blake3".to_string(),
+            leaf_format: "Bound".to_string(),
+            grid_hash_hex: to_hex(&grid_hash),
         },
     };
 

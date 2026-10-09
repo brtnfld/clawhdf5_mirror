@@ -195,21 +195,30 @@ fn stage1_build_and_write(
         }
     };
 
+    // Bind root + real companion_hash + grid_hash=0 (subset extraction is out
+    // of scope for this demo) into the merkle_root attribute -- deliberately
+    // NOT via `write_merkle_attr`, which always zeroes companion_hash (that
+    // helper is for the "no companion" case); we have a real one to bind.
+    // Built before signing because the signed payload covers every field of
+    // this attribute (root, companion_hash, algorithm, leaf_format, grid_hash).
+    let attr = MerkleAttr::from_tree_with_companion_and_grid(&tree, companion_hash, [0u8; 32]);
+
     let timestamp: u64 = 1_700_000_000;
-    let alg_id = clawhdf5_sign::HashAlg::Blake3;
-    let payload = canonical_payload(&root, &companion_hash, version, timestamp, alg_id);
+    let payload = canonical_payload(
+        &attr.root,
+        &attr.companion_hash,
+        version,
+        timestamp,
+        attr.algorithm,
+        attr.leaf_format,
+        &attr.grid_hash,
+    );
     let sig = sign_root(&payload, ed_key, ml_key).expect("hybrid signing should succeed");
 
     let mut all_ciphertext = Vec::with_capacity(CIPHERTEXT_LEN * NUM_CHUNKS);
     for ct in &ciphertexts {
         all_ciphertext.extend_from_slice(ct);
     }
-
-    // Bind root + real companion_hash + grid_hash=0 (subset extraction is out
-    // of scope for this demo) into the merkle_root attribute -- deliberately
-    // NOT via `write_merkle_attr`, which always zeroes companion_hash (that
-    // helper is for the "no companion" case); we have a real one to bind.
-    let attr = MerkleAttr::from_tree_with_companion_and_grid(&tree, companion_hash, [0u8; 32]);
 
     let ds = fw.create_dataset(DATASET_NAME);
     ds.with_u8_data(&all_ciphertext);
@@ -344,7 +353,9 @@ fn stage3_reopen_and_verify(
         &reopened.attr.companion_hash,
         written.version,
         written.timestamp,
-        clawhdf5_sign::HashAlg::Blake3,
+        reopened.attr.algorithm,
+        reopened.attr.leaf_format,
+        &reopened.attr.grid_hash,
     );
     verify_sig(&payload, &reopened.sig, ed_pub, ml_pub)
         .expect("the real hybrid signature read back from the file must verify");
@@ -395,7 +406,9 @@ fn stage4_tamper_detect(
         &reopened.attr.companion_hash,
         1,
         1_700_000_000,
-        clawhdf5_sign::HashAlg::Blake3,
+        reopened.attr.algorithm,
+        reopened.attr.leaf_format,
+        &reopened.attr.grid_hash,
     );
     let result = verify_sig(&forged_payload, &reopened.sig, ed_pub, ml_pub);
     assert!(
@@ -532,9 +545,14 @@ fn stage5_crash_consistency(base_dir: &Path, dek: &clawhdf5_filters::Dek) {
 // Stage 6
 // ============================================================================
 
+/// The journal record carries only `(signed_root, version, timestamp)`; the
+/// remaining signed fields (`companion_hash`, `algorithm`, `leaf_format`,
+/// `grid_hash`) are captured out-of-band from the attribute that was signed.
 struct RealVerifier<'a> {
     companion_hash: [u8; 32],
     alg_id: clawhdf5_sign::HashAlg,
+    leaf_format: clawhdf5_sign::LeafFormat,
+    grid_hash: [u8; 32],
     ed_pub: &'a VerifyingKey,
     ml_pub: &'a MlDsaVerifyingKey,
 }
@@ -550,6 +568,8 @@ impl SignatureVerifier for RealVerifier<'_> {
             record.version,
             record.timestamp,
             self.alg_id,
+            self.leaf_format,
+            &self.grid_hash,
         );
         verify_sig(&payload, &sig, self.ed_pub, self.ml_pub).is_ok()
     }
@@ -609,7 +629,9 @@ fn stage6_rollback(
     // verification (not a placeholder byte-string comparison).
     let verifier = RealVerifier {
         companion_hash: written.companion_hash,
-        alg_id: clawhdf5_sign::HashAlg::Blake3,
+        alg_id: reopened.attr.algorithm,
+        leaf_format: reopened.attr.leaf_format,
+        grid_hash: reopened.attr.grid_hash,
         ed_pub,
         ml_pub,
     };
