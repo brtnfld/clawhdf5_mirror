@@ -367,9 +367,14 @@ fn validate_and_load_impl(
     let created_at = extract_string_attr(&attrs, "created_at")?;
     let agent_id = extract_string_attr(&attrs, "agent_id")?;
     let embedder = extract_string_attr(&attrs, "embedder")?;
-    let embedding_dim = extract_i64_attr(&attrs, "embedding_dim")? as usize;
-    let chunk_size = extract_i64_attr(&attrs, "chunk_size")? as usize;
-    let overlap = extract_i64_attr(&attrs, "overlap")? as usize;
+    // These attributes are NOT covered by the content Merkle root (they say
+    // how to *parse* the content the root covers), so they are untrusted
+    // input. A crafted `embedding_dim` of 0 reached `slice::chunks(0)` below
+    // and panicked before any integrity check ran; a negative value became a
+    // huge usize. Reject anything that is not a sane count up front.
+    let embedding_dim = extract_count_attr(&attrs, "embedding_dim", 1)?;
+    let chunk_size = extract_count_attr(&attrs, "chunk_size", 0)?;
+    let overlap = extract_count_attr(&attrs, "overlap", 0)?;
 
     let config = MemoryConfig {
         path: std::path::PathBuf::new(), // will be set by caller
@@ -443,6 +448,27 @@ fn load_memory_group(
     let tags = read_string_dataset_from_group(&group, "tags")?;
     let tombstones = read_u8_dataset(&group, "tombstones")?;
 
+    // Every per-entry dataset must be exactly `n` long. The content root
+    // binds each entry's *values*, but a leaf is built from `X.get(i)` with a
+    // fixed default, so it cannot tell a missing trailing element from a
+    // present default one: a `/memory/tombstones` shortened from [n] to [1]
+    // hashed to the honest root, loaded under `open_strict`, and then
+    // panicked in `compact()` / `get_chunk()` (2026-10 red-team finding).
+    // Length agreement is a schema invariant the loader enforces before any
+    // consumer indexes these arrays. (`norms`/`activation_weights` keep their
+    // documented recompute/default fallback below; both are derived data.)
+    let expected_flat = n.checked_mul(embedding_dim).ok_or_else(|| {
+        MemoryError::Schema(format!(
+            "/memory: {n} entries x embedding_dim {embedding_dim} overflows"
+        ))
+    })?;
+    expect_len("/memory/embeddings", flat_embeddings.len(), expected_flat)?;
+    expect_len("/memory/source_channel", source_channels.len(), n)?;
+    expect_len("/memory/timestamps", timestamps.len(), n)?;
+    expect_len("/memory/session_ids", session_ids.len(), n)?;
+    expect_len("/memory/tags", tags.len(), n)?;
+    expect_len("/memory/tombstones", tombstones.len(), n)?;
+
     // Read norms if present, otherwise compute from embeddings
     let norms = match read_f32_dataset(&group, "norms") {
         Ok(v) if v.len() == n => v,
@@ -499,12 +525,21 @@ fn load_sessions_group(file: &clawhdf5::File) -> Result<SessionCache, MemoryErro
     let timestamps = read_f64_dataset(&group, "timestamps")?;
     let summaries = read_string_dataset_from_group(&group, "summaries")?;
 
+    // Same invariant as /memory: these are indexed by `ids.len()` below and
+    // run before the integrity check, so a short dataset was a panic on open.
+    let n = ids.len();
+    expect_len("/sessions/start_idxs", start_idxs.len(), n)?;
+    expect_len("/sessions/end_idxs", end_idxs.len(), n)?;
+    expect_len("/sessions/channels", channels.len(), n)?;
+    expect_len("/sessions/timestamps", timestamps.len(), n)?;
+    expect_len("/sessions/summaries", summaries.len(), n)?;
+
     let mut cache = SessionCache::new();
-    for i in 0..ids.len() {
+    for i in 0..n {
         cache.entries.push(crate::session::SessionEntry {
             id: ids[i].clone(),
-            start_idx: start_idxs[i] as u64,
-            end_idx: end_idxs[i] as u64,
+            start_idx: non_negative("/sessions/start_idxs", start_idxs[i])?,
+            end_idx: non_negative("/sessions/end_idxs", end_idxs[i])?,
             channel: channels[i].clone(),
             ts: timestamps[i],
         });
@@ -520,15 +555,30 @@ fn load_knowledge_group(file: &clawhdf5::File) -> Result<KnowledgeCache, MemoryE
         .map_err(|e| MemoryError::Schema(format!("missing /knowledge_graph group: {e}")))?;
 
     let entity_ids = read_i64_dataset(&group, "entity_ids")?;
-    let next_id = entity_ids.iter().max().map(|&m| m as u64 + 1).unwrap_or(0);
+    // Ids are written as `u64 as i64`, so an id >= 2^63 -- or a crafted
+    // negative value -- reads back negative, and the old `max + 1` here
+    // overflowed (debug panic; release wrapped next_id to 0 so new entities
+    // collided with existing ones). Reject negatives; checked arithmetic.
+    let mut next_id: u64 = 0;
+    for &raw in &entity_ids {
+        let id = non_negative("/knowledge_graph/entity_ids", raw)?;
+        let succ = id.checked_add(1).ok_or_else(|| {
+            MemoryError::Schema("/knowledge_graph/entity_ids: id overflow".into())
+        })?;
+        next_id = next_id.max(succ);
+    }
     let mut cache = KnowledgeCache::new_with_next_id(next_id);
 
     if !entity_ids.is_empty() {
         let entity_names = read_string_dataset_from_group(&group, "entity_names")?;
         let entity_types = read_string_dataset_from_group(&group, "entity_types")?;
         let emb_idxs = read_i64_dataset(&group, "entity_emb_idxs")?;
+        let n = entity_ids.len();
+        expect_len("/knowledge_graph/entity_names", entity_names.len(), n)?;
+        expect_len("/knowledge_graph/entity_types", entity_types.len(), n)?;
+        expect_len("/knowledge_graph/entity_emb_idxs", emb_idxs.len(), n)?;
 
-        for i in 0..entity_ids.len() {
+        for i in 0..n {
             cache.entities.push(crate::knowledge::Entity {
                 id: entity_ids[i] as u64,
                 name: entity_names[i].clone(),
@@ -545,11 +595,16 @@ fn load_knowledge_group(file: &clawhdf5::File) -> Result<KnowledgeCache, MemoryE
         let rel_types = read_string_dataset_from_group(&group, "relation_types")?;
         let rel_weights = read_f32_dataset(&group, "relation_weights")?;
         let rel_ts = read_f64_dataset(&group, "relation_ts")?;
+        let n = rel_srcs.len();
+        expect_len("/knowledge_graph/relation_tgts", rel_tgts.len(), n)?;
+        expect_len("/knowledge_graph/relation_types", rel_types.len(), n)?;
+        expect_len("/knowledge_graph/relation_weights", rel_weights.len(), n)?;
+        expect_len("/knowledge_graph/relation_ts", rel_ts.len(), n)?;
 
-        for i in 0..rel_srcs.len() {
+        for i in 0..n {
             cache.relations.push(crate::knowledge::Relation {
-                src: rel_srcs[i] as u64,
-                tgt: rel_tgts[i] as u64,
+                src: non_negative("/knowledge_graph/relation_srcs", rel_srcs[i])?,
+                tgt: non_negative("/knowledge_graph/relation_tgts", rel_tgts[i])?,
                 relation: rel_types[i].clone(),
                 weight: rel_weights[i],
                 ts: rel_ts[i],
@@ -562,11 +617,56 @@ fn load_knowledge_group(file: &clawhdf5::File) -> Result<KnowledgeCache, MemoryE
     if let Ok(alias_strings) = read_string_dataset_from_group(&group, "alias_strings")
         && let Ok(alias_entity_ids) = read_i64_dataset(&group, "alias_entity_ids")
     {
+        expect_len(
+            "/knowledge_graph/alias_entity_ids",
+            alias_entity_ids.len(),
+            alias_strings.len(),
+        )?;
         cache.alias_strings = alias_strings;
         cache.alias_entity_ids = alias_entity_ids;
     }
 
     Ok(cache)
+}
+
+/// Reject a per-entry dataset whose length disagrees with its driver count.
+///
+/// Everything the loader indexes in parallel runs *before* the content
+/// integrity check, and the integrity leaf encoding cannot distinguish a
+/// missing trailing element from a present default one, so a length mismatch
+/// must be a hard schema error rather than something either layer tolerates.
+fn expect_len(what: &str, found: usize, expected: usize) -> Result<(), MemoryError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(MemoryError::Schema(format!(
+            "{what}: expected {expected} elements, found {found}"
+        )))
+    }
+}
+
+/// Convert a stored `i64` that must be a non-negative count/id into `u64`,
+/// rejecting negatives instead of wrapping them to huge values.
+fn non_negative(what: &str, v: i64) -> Result<u64, MemoryError> {
+    u64::try_from(v)
+        .map_err(|_| MemoryError::Schema(format!("{what}: negative value {v} is not allowed")))
+}
+
+/// Read an integer `/meta` attribute that must be a count `>= min`.
+fn extract_count_attr(
+    attrs: &std::collections::HashMap<String, AttrValue>,
+    name: &str,
+    min: usize,
+) -> Result<usize, MemoryError> {
+    let raw = extract_i64_attr(attrs, name)?;
+    usize::try_from(raw)
+        .ok()
+        .filter(|&v| v >= min)
+        .ok_or_else(|| {
+            MemoryError::Schema(format!(
+                "attr {name} must be an integer >= {min}, got {raw}"
+            ))
+        })
 }
 
 // --- Helper functions ---

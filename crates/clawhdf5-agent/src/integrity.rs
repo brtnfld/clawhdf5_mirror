@@ -33,6 +33,15 @@
 //! carries a section tag byte so content can't be moved between sections
 //! undetected.
 //!
+//! **Parallel-array lengths are enforced by the loader, not by this root.** A
+//! per-entry leaf is built from `X.get(i)` with a fixed default, so the root
+//! cannot distinguish a missing trailing element from a present default one;
+//! a `/memory/tombstones` dataset shortened to one element hashed to the
+//! honest root and then panicked `compact()` (2026-10 red-team finding).
+//! `schema::validate_and_load` now rejects any per-entry dataset whose length
+//! disagrees with its entry count before this check runs, so by the time the
+//! root is compared every array the leaves draw on is full-length.
+//!
 //! **Threat model.** This is *unsigned* integrity: it detects tampering or
 //! corruption of an existing file, not an attacker who rebuilds the whole file
 //! (root included) from scratch — that requires the P2.1 hybrid signature,

@@ -293,7 +293,9 @@ impl HDF5Memory {
     /// Open an existing HDF5 memory file, requiring a valid content Merkle root
     /// (P2.4 Finding 1). Fails with [`MemoryError::Integrity`] if the file
     /// carries no `_merkle_root` (unprotected or stripped) or fails
-    /// verification. Use for stores that must always be integrity-protected.
+    /// verification, or if its `.h5.wal` sidecar is a legacy version-1 file
+    /// with no chain hash. Use for stores that must always be
+    /// integrity-protected.
     pub fn open_strict(path: &Path) -> Result<Self> {
         Self::open_inner(path, true)
     }
@@ -305,12 +307,24 @@ impl HDF5Memory {
             storage::read_from_disk(path)?
         };
 
-        // Replay WAL if present
+        // Replay WAL if present. The strict flag must reach the sidecar too:
+        // `open_strict` promises to fail closed when protection has been
+        // stripped, and rewriting the WAL header's version byte to 1 strips
+        // its chain hash exactly the way deleting `_merkle_root` strips the
+        // content root (2026-10 red-team finding).
         let wal_path = path.with_extension("h5.wal");
         let wal = if wal_path.exists() {
-            let entries = wal::WalFile::read_entries(&wal_path)?;
+            let entries = if strict {
+                wal::WalFile::read_entries_strict(&wal_path)?
+            } else {
+                wal::WalFile::read_entries(&wal_path)?
+            };
             wal::replay_into_cache(&entries, &mut cache);
-            Some(wal::WalFile::open(&wal_path)?)
+            Some(if strict {
+                wal::WalFile::open_strict(&wal_path)?
+            } else {
+                wal::WalFile::open(&wal_path)?
+            })
         } else if config.wal_enabled {
             Some(wal::WalFile::open(&wal_path)?)
         } else {

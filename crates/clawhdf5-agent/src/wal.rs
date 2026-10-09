@@ -40,8 +40,19 @@
 //! crate currently provides for the WAL.
 //!
 //! Version 1 files are still read (unauthenticated, for backward
-//! compatibility with WALs written before this change); every freshly created
-//! or truncated WAL is written as version 2.
+//! compatibility with WALs written before this change) by the default
+//! [`WalFile::open`] / [`WalFile::read_entries`]; every freshly created or
+//! truncated WAL is written as version 2. The strict variants
+//! ([`WalFile::open_strict`] / [`WalFile::read_entries_strict`], used by
+//! `HDF5Memory::open_strict`) refuse a version-1 file: rewriting the header's
+//! version byte to 1 and dropping the trailers strips the chain with less
+//! effort than recomputing it, which is exactly the stripping attack strict
+//! mode exists to close (2026-10 red-team finding).
+//!
+//! Two further parser rules (same finding): every length prefix is bounded by
+//! the bytes actually present in the file before anything is allocated, and
+//! in a version-2 file a present-but-unrecognized type byte, or a record of
+//! any type without its trailer, is a chain failure rather than tolerated.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -142,6 +153,18 @@ impl WalFile {
     /// [`MemoryError::Integrity`], refusing to append onto a WAL whose
     /// history can't be trusted.
     pub fn open(path: &Path) -> Result<Self, MemoryError> {
+        Self::open_with(path, false)
+    }
+
+    /// Like [`open`](Self::open), but refuse a legacy version-1 (unchained)
+    /// sidecar with [`MemoryError::Integrity`] instead of replaying and then
+    /// continuing to append unauthenticated entries to it. This is the WAL
+    /// half of `HDF5Memory::open_strict`'s fail-closed contract.
+    pub fn open_strict(path: &Path) -> Result<Self, MemoryError> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &Path, strict: bool) -> Result<Self, MemoryError> {
         if path.exists() {
             // Read existing header
             let mut f = OpenOptions::new()
@@ -161,6 +184,9 @@ impl WalFile {
                 return Err(MemoryError::Schema(format!(
                     "unsupported WAL version {version}"
                 )));
+            }
+            if strict && version == WAL_VERSION_V1 {
+                return Err(MemoryError::Integrity(strict_v1_message(path)));
             }
             let mut count_buf = [0u8; 4];
             f.read_exact(&mut count_buf)?;
@@ -289,6 +315,17 @@ impl WalFile {
     /// [`MemoryError::Integrity`] — see the module doc's documented limitation
     /// on what this chain hash does and doesn't defend against.
     pub fn read_entries(path: &Path) -> Result<Vec<WalEntry>, MemoryError> {
+        Self::read_entries_with(path, false)
+    }
+
+    /// Like [`read_entries`](Self::read_entries), but refuse a legacy
+    /// version-1 (unchained) sidecar with [`MemoryError::Integrity`]. See
+    /// [`open_strict`](Self::open_strict).
+    pub fn read_entries_strict(path: &Path) -> Result<Vec<WalEntry>, MemoryError> {
+        Self::read_entries_with(path, true)
+    }
+
+    fn read_entries_with(path: &Path, strict: bool) -> Result<Vec<WalEntry>, MemoryError> {
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -304,6 +341,9 @@ impl WalFile {
             return Err(MemoryError::Schema(format!(
                 "unsupported WAL version {version}"
             )));
+        }
+        if strict && version == WAL_VERSION_V1 {
+            return Err(MemoryError::Integrity(strict_v1_message(path)));
         }
         Ok(parse_entries(&mut f, version)?.0)
     }
@@ -371,6 +411,14 @@ fn parse_entries(
 ) -> Result<(Vec<WalEntry>, [u8; CHAIN_HASH_SIZE]), MemoryError> {
     let mut entries = Vec::new();
     let mut chain_tip = initial_chain();
+    // Every length prefix below is bounded by the bytes actually present in
+    // the file before anything is allocated. A u32 prefix used to size
+    // `vec![0u8; len]` / `Vec::with_capacity(count)` directly, so a 4-byte
+    // edit to the sidecar made every open attempt allocate 4-16 GiB before
+    // reading a single byte -- an uncatchable abort under a memory limit. A
+    // prefix larger than the remaining file is missing bytes, i.e. the
+    // truncation case, and is handled exactly like one.
+    let file_len = f.metadata()?.len();
 
     // A field read can fail two structurally different ways: an I/O error
     // (`read_exact` ran out of bytes -- genuine crash-mid-write truncation,
@@ -406,6 +454,18 @@ fn parse_entries(
             break;
         }
         let Some(entry_type) = WalEntryType::from_u8(type_buf[0]) else {
+            // The byte is present, not missing, so this is not truncation: a
+            // genuine writer only ever emits a known type byte first. For a
+            // chained file that is corruption or tampering and fails closed
+            // (previously it silently ended the replay, dropping every entry
+            // after it); v1 keeps its original fully-tolerant behavior.
+            if version == WAL_VERSION_V2 {
+                return Err(MemoryError::Integrity(format!(
+                    "WAL entry at offset {entry_start} has unknown type byte {:#04x} \
+                     (not truncated -- the byte is present but unrecognized)",
+                    type_buf[0]
+                )));
+            }
             break;
         };
 
@@ -417,11 +477,11 @@ fn parse_entries(
 
         let entry = match entry_type {
             WalEntryType::Save => {
-                let chunk = field!(read_len_prefixed_str(f), entry_start);
-                let embedding = field!(read_embedding(f), entry_start);
-                let source_channel = field!(read_len_prefixed_str(f), entry_start);
-                let session_id = field!(read_len_prefixed_str(f), entry_start);
-                let tags = field!(read_len_prefixed_str(f), entry_start);
+                let chunk = field!(read_len_prefixed_str(f, file_len), entry_start);
+                let embedding = field!(read_embedding(f, file_len), entry_start);
+                let source_channel = field!(read_len_prefixed_str(f, file_len), entry_start);
+                let session_id = field!(read_len_prefixed_str(f, file_len), entry_start);
+                let tags = field!(read_len_prefixed_str(f, file_len), entry_start);
                 WalEntry {
                     entry_type,
                     timestamp,
@@ -451,8 +511,24 @@ fn parse_entries(
                 }
             }
             WalEntryType::ActivationUpdate => {
-                // Reserved for future use; no additional fields, no cache effect.
-                continue;
+                // Reserved for future use; no additional fields, no cache
+                // effect (`replay_into_cache` ignores it). It still falls
+                // through to the chain-hash check below: an earlier `continue`
+                // here skipped the v2 trailer, so unchained 9-byte records
+                // could be spliced anywhere in a chained file without failing
+                // verification, and a writer that ever emitted one (which
+                // `write_entry_bytes` would trail) would desynchronize the
+                // chain for every entry after it.
+                WalEntry {
+                    entry_type,
+                    timestamp,
+                    chunk: String::new(),
+                    embedding: Vec::new(),
+                    source_channel: String::new(),
+                    session_id: String::new(),
+                    tags: String::new(),
+                    tombstone_index: None,
+                }
             }
         };
 
@@ -520,20 +596,47 @@ fn serialize_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
-fn read_len_prefixed_str(f: &mut File) -> Result<String, MemoryError> {
+/// The error strict mode raises for a legacy, unauthenticated sidecar.
+fn strict_v1_message(path: &Path) -> String {
+    format!(
+        "strict mode: WAL sidecar {} is version 1 (no chain hash); refusing to replay an \
+         unauthenticated sidecar -- flush and rotate it with a non-strict open first",
+        path.display()
+    )
+}
+
+/// Refuse to allocate for a length prefix that promises more bytes than the
+/// file still holds. Reported as an `UnexpectedEof` I/O error so
+/// `parse_entries` treats it exactly like crash truncation (the bytes are
+/// missing either way), which also means it is never a reason to keep a
+/// multi-gigabyte allocation alive.
+fn bounded_by_file(f: &mut File, file_len: u64, needed: u64) -> Result<(), MemoryError> {
+    let pos = f.stream_position()?;
+    if needed > file_len.saturating_sub(pos) {
+        return Err(MemoryError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "WAL length prefix exceeds the remaining file size",
+        )));
+    }
+    Ok(())
+}
+
+fn read_len_prefixed_str(f: &mut File, file_len: u64) -> Result<String, MemoryError> {
     let mut len_buf = [0u8; 4];
     f.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
+    let len = u32::from_le_bytes(len_buf);
+    bounded_by_file(f, file_len, u64::from(len))?;
+    let mut buf = vec![0u8; len as usize];
     f.read_exact(&mut buf)?;
     String::from_utf8(buf).map_err(|e| MemoryError::Schema(format!("invalid UTF-8 in WAL: {e}")))
 }
 
-fn read_embedding(f: &mut File) -> Result<Vec<f32>, MemoryError> {
+fn read_embedding(f: &mut File, file_len: u64) -> Result<Vec<f32>, MemoryError> {
     let mut len_buf = [0u8; 4];
     f.read_exact(&mut len_buf)?;
-    let count = u32::from_le_bytes(len_buf) as usize;
-    let mut vals = Vec::with_capacity(count);
+    let count = u32::from_le_bytes(len_buf);
+    bounded_by_file(f, file_len, u64::from(count) * 4)?;
+    let mut vals = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let mut val_buf = [0u8; 4];
         f.read_exact(&mut val_buf)?;

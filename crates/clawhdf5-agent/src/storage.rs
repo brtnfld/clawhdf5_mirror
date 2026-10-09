@@ -204,8 +204,23 @@ where
     // 2. Revert to a temp path so the live file is untouched until accepted.
     // The name includes the pid so two processes restoring the same file
     // cannot clobber each other's temp copy.
+    // `snapshot_ref` is an opaque string out of the journal, and the signed
+    // payload binds the record's root/version/timestamp, not this path, so
+    // treat it as untrusted: stage only a regular file (not a FIFO, device,
+    // or directory), and never leave the partial temp copy behind when the
+    // copy itself fails -- every later failure path below already cleans up.
+    let snapshot_meta = std::fs::metadata(&record.snapshot_ref).map_err(MemoryError::Io)?;
+    if !snapshot_meta.is_file() {
+        return Err(MemoryError::Provenance(format!(
+            "snapshot_ref {:?} for version {} is not a regular file",
+            record.snapshot_ref, record.version
+        )));
+    }
     let tmp_path = restore_tmp_path(live_path);
-    std::fs::copy(&record.snapshot_ref, &tmp_path).map_err(MemoryError::Io)?;
+    if let Err(e) = std::fs::copy(&record.snapshot_ref, &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(MemoryError::Io(e));
+    }
 
     // 3. Dataset gate at the temp path (caller loads + verify_restored_dataset).
     if let Err(e) = verify_restored(&tmp_path, record) {

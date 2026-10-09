@@ -11,8 +11,23 @@ struct Cli {
     #[arg(short, long, env = "CLAWHDF5_PATH")]
     path: PathBuf,
 
+    /// Fail closed if the file carries no integrity protection: reject a
+    /// missing or stripped `_merkle_root` and a legacy unauthenticated
+    /// version-1 WAL sidecar instead of loading them unverified.
+    #[arg(long, global = true, env = "CLAWHDF5_STRICT")]
+    strict: bool,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Open the memory file under the chosen integrity policy.
+fn open_memory(path: &std::path::Path, strict: bool) -> Result<HDF5Memory, clawhdf5_agent::MemoryError> {
+    if strict {
+        HDF5Memory::open_strict(path)
+    } else {
+        HDF5Memory::open(path)
+    }
 }
 
 #[derive(Subcommand)]
@@ -114,7 +129,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let entry: MemoryEntry = serde_json::from_str(&input)?;
-            let mut mem = HDF5Memory::open(&cli.path)?;
+            let mut mem = open_memory(&cli.path, cli.strict)?;
             let idx = mem.save(entry)?;
             let j = serde_json::json!({ "status": "saved", "index": idx, "count": mem.count() });
             println!("{}", serde_json::to_string(&j)?);
@@ -128,7 +143,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             keyword_weight,
         } => {
             let emb: Vec<f32> = serde_json::from_str(&embedding)?;
-            let mut mem = HDF5Memory::open(&cli.path)?;
+            let mut mem = open_memory(&cli.path, cli.strict)?;
             let results = mem.hybrid_search(&emb, &query, vector_weight, keyword_weight, top_k);
             let j: Vec<serde_json::Value> = results
                 .iter()
@@ -146,7 +161,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Recall { index } => {
-            let mem = HDF5Memory::open(&cli.path)?;
+            let mem = open_memory(&cli.path, cli.strict)?;
             match mem.get_chunk(index) {
                 Some(content) => {
                     let j = serde_json::json!({ "index": index, "chunk": content });
@@ -160,7 +175,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Stats => {
-            let mem = HDF5Memory::open(&cli.path)?;
+            let mem = open_memory(&cli.path, cli.strict)?;
             let cfg = mem.config();
             let j = serde_json::json!({
                 "path": cli.path.display().to_string(),
@@ -175,7 +190,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::FlushWal => {
-            let mut mem = HDF5Memory::open(&cli.path)?;
+            let mut mem = open_memory(&cli.path, cli.strict)?;
             let before = mem.wal_pending_count();
             mem.flush_wal()?;
             let j = serde_json::json!({
@@ -187,7 +202,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::AgentsMd { output } => {
-            let mem = HDF5Memory::open(&cli.path)?;
+            let mem = open_memory(&cli.path, cli.strict)?;
             let md = mem.generate_agents_md();
             match output {
                 Some(p) => {
@@ -199,7 +214,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Export => {
-            let mem = HDF5Memory::open(&cli.path)?;
+            let mem = open_memory(&cli.path, cli.strict)?;
             for i in 0..mem.count() {
                 if let Some(chunk) = mem.get_chunk(i) {
                     let j = serde_json::json!({ "index": i, "chunk": chunk });
