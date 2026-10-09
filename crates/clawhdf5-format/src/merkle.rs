@@ -130,6 +130,18 @@ pub enum MerkleError {
     /// and chunk grid (see `subset_proof::verify_subset`). This means the
     /// prover delivered a proof for a different region than was requested.
     SelectionMismatch,
+    /// The chunk grid is too large for the requested space-filling-curve
+    /// [`LeafOrder`](crate::subset_proof::LeafOrder): the interleaved index
+    /// would need more than 64 bits, so the curve would silently drop high
+    /// coordinate bits and map two distinct chunk coordinates onto one leaf.
+    /// A hyperslab covering both would then be "completely" served by a
+    /// single chunk (2026-10 red-team finding). The padded-leaf-count bound
+    /// does not imply the bit budget (dims `[2^20,1,1,1]` pass it yet need
+    /// 80 Hilbert bits), so it is checked explicitly and fails closed.
+    LeafOrderOverflow {
+        /// Bits the interleaved index would need.
+        needed_bits: u32,
+    },
     /// The dataset's persisted version is lower than the highest version this
     /// verifier has previously observed for the same file (threat T4, rollback).
     ///
@@ -273,6 +285,13 @@ impl core::fmt::Display for MerkleError {
                     "subset proof's chunk set does not match the requested selection"
                 )
             }
+            MerkleError::LeafOrderOverflow { needed_bits } => {
+                write!(
+                    f,
+                    "chunk grid needs {needed_bits} bits for the requested space-filling-curve \
+                     leaf order (max 64); coordinates would collide onto one leaf"
+                )
+            }
             MerkleError::MeshLevelTooCoarse { level, height } => {
                 write!(
                     f,
@@ -397,6 +416,9 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::NoncePending => VerifyResponse::Halt,
         MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
         MerkleError::SelectionMismatch => VerifyResponse::Halt,
+        // The grid cannot be addressed by the requested curve without index
+        // collisions; no proof over it can be complete, so fail closed.
+        MerkleError::LeafOrderOverflow { .. } => VerifyResponse::Halt,
         // The dataset says its leaves bind a version counter and the caller
         // did not supply one: we cannot recompute the committed preimage at
         // all, so this is an incomplete verification, not a passed one.

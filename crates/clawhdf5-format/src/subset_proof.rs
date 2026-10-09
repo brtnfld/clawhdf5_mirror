@@ -440,11 +440,28 @@ pub fn contiguous_layout(
         _ => return Err(unsupported(UnsupportedLayoutReason::NotContiguous)),
     };
 
+    // The three messages are independent fields of an untrusted header. The
+    // contract above tells callers to slice `file[data_addr..data_addr + nbytes]`
+    // and hand that buffer, with `dims`/`elem_size`, to the grid builders,
+    // which tile it assuming `len == product(dims) * elem_size`. A layout
+    // `size` that disagrees with the dataspace, or a range that wraps past
+    // u64::MAX, is therefore a crafted-file crash (slice panic in the caller
+    // or the builder) rather than a leaf-hash mismatch -- reject it here as
+    // malformed before any byte of data is touched (2026-10 red-team finding).
+    let elem_size = datatype.type_size();
+    let expected_nbytes = dataspace
+        .dimensions
+        .iter()
+        .fold(u128::from(elem_size), |acc, &d| acc.saturating_mul(u128::from(d)));
+    if expected_nbytes != u128::from(nbytes) || data_addr.checked_add(nbytes).is_none() {
+        return Err(unsupported(UnsupportedLayoutReason::MalformedHeader));
+    }
+
     Ok(ContiguousLayout {
         data_addr,
         nbytes,
         dims: dataspace.dimensions,
-        elem_size: datatype.type_size(),
+        elem_size,
     })
 }
 
@@ -582,8 +599,12 @@ pub fn morton_index(coords: &[u64]) -> u64 {
 /// tightens the bounding-box dilation.
 ///
 /// Coordinates must satisfy `coord < 2^bits` on every axis, and
-/// `bits * coords.len()` must not exceed 64; both hold for any chunk grid the
-/// padded-leaf-count check admits.
+/// `bits * coords.len()` must not exceed 64. The padded-leaf-count check does
+/// **not** imply the second condition for skewed grids (dims `[2^20,1,1,1]`
+/// pass it yet need 80 bits), so [`compute_expected_chunk_indices`] enforces
+/// it separately via [`check_order_bit_budget`] before mapping any coordinate;
+/// past the budget the interleave below silently drops high bits and two
+/// coordinates collide onto one leaf.
 #[must_use]
 pub fn hilbert_index(coords: &[u64], bits: u32) -> u64 {
     let n = coords.len();
@@ -670,6 +691,51 @@ fn coord_to_leaf_index(coord: &[u64], n_per_dim: &[u64], order: LeafOrder) -> u6
     }
 }
 
+/// Reject a grid whose chunk coordinates cannot be interleaved into 64 bits
+/// under `order` without collisions.
+///
+/// [`morton_index`] gives each axis `64 / rank` bits and drops the rest;
+/// [`hilbert_index`] needs `hilbert_bits(n_per_dim) * rank` bits. Past either
+/// budget two distinct chunk coordinates map onto one leaf index, so the
+/// "expected chunk set" a verifier derives for a hyperslab covering both is
+/// one index short and a proof delivering a single chunk for two logical
+/// regions passes as complete (R5b). The padded-leaf-count bound caps the
+/// *total* chunk count, not the per-axis extent, so it does not cover this.
+/// Row-major order is a plain mixed-radix index and has no such budget.
+pub(crate) fn check_order_bit_budget(n_per_dim: &[u64], order: LeafOrder) -> Result<(), MerkleError> {
+    let rank = n_per_dim.len();
+    if rank == 0 {
+        return Ok(());
+    }
+    let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
+    match order {
+        LeafOrder::RowMajor => Ok(()),
+        LeafOrder::Morton => {
+            // Each axis gets floor(64 / rank) bits; the largest coordinate on
+            // axis d is n_per_dim[d] - 1.
+            let per_axis = 64 / rank_u32.max(1);
+            let max_bits = n_per_dim
+                .iter()
+                .map(|&n| u64::BITS - n.saturating_sub(1).leading_zeros())
+                .max()
+                .unwrap_or(0);
+            if max_bits > per_axis {
+                return Err(MerkleError::LeafOrderOverflow {
+                    needed_bits: max_bits.saturating_mul(rank_u32),
+                });
+            }
+            Ok(())
+        }
+        LeafOrder::Hilbert => {
+            let needed = hilbert_bits(n_per_dim).saturating_mul(rank_u32);
+            if needed > 64 {
+                return Err(MerkleError::LeafOrderOverflow { needed_bits: needed });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Inclusive chunk-coordinate bounds `(lo, hi)` per dimension covering every
 /// chunk that could possibly overlap `sel`, or `None` if the selection touches
 /// no chunk in this grid. Derived from the selection's element-space bounding
@@ -706,7 +772,14 @@ fn selection_chunk_bounds(
                     return None; // empty on this axis ⇒ empty overall
                 }
                 lo.push(start[d]);
-                hi.push(start[d] + (count[d] - 1) * stride[d] + block[d]);
+                // Saturating: a selection near u64::MAX must clamp to "past
+                // the end of the grid", never wrap to a small value that
+                // would silently shrink the box.
+                hi.push(
+                    start[d]
+                        .saturating_add((count[d] - 1).saturating_mul(stride[d]))
+                        .saturating_add(block[d]),
+                );
             }
             (lo, hi)
         }
@@ -722,16 +795,23 @@ fn selection_chunk_bounds(
                     hi_incl[d] = hi_incl[d].max(pt[d]);
                 }
             }
-            (lo, hi_incl.iter().map(|&h| h + 1).collect())
+            (lo, hi_incl.iter().map(|&h| h.saturating_add(1)).collect())
         }
     };
 
     // Map the element box onto inclusive chunk-coordinate bounds, clamped to
     // the grid. Any axis whose box falls entirely outside the grid ⇒ no chunks.
+    // `n_per_dim * chunk_shape` is at most one chunk past `dims`, but with a
+    // chunk shape of nearly 2^64 it can wrap; saturate so a wrap can never
+    // turn "inside the grid" into "no chunks" (an empty expected set is what
+    // an omission attack needs the verifier to derive).
     let mut lo = Vec::with_capacity(ndim);
     let mut hi = Vec::with_capacity(ndim);
     for d in 0..ndim {
-        if chunk_shape[d] == 0 || el_hi_excl[d] == 0 || el_lo[d] >= n_per_dim[d] * chunk_shape[d] {
+        if chunk_shape[d] == 0
+            || el_hi_excl[d] == 0
+            || el_lo[d] >= n_per_dim[d].saturating_mul(chunk_shape[d])
+        {
             return None;
         }
         let lo_chunk = el_lo[d] / chunk_shape[d];
@@ -844,6 +924,9 @@ pub(crate) fn compute_expected_chunk_indices(
     checked_padded_leaf_count(grid)?;
 
     let n_per_dim = grid.n_chunks_per_dim();
+    // Before any coordinate is mapped: a curve that would collide two
+    // coordinates onto one leaf makes every "complete" set below one short.
+    check_order_bit_budget(&n_per_dim, order)?;
     let coords = chunk_coords_for_selection(sel, &n_per_dim, &grid.chunk_shape);
 
     let mut chunk_indices: Vec<usize> = coords
@@ -2911,5 +2994,147 @@ mod tests {
                 reason: UnsupportedLayoutReason::MalformedHeader
             }
         ));
+    }
+
+    /// 2026-10 red-team regression: the layout's `size`, the dataspace, and
+    /// the datatype are independent untrusted fields. A `size` that disagrees
+    /// with `product(dims) * elem_size`, or an address range that wraps,
+    /// used to pass straight through to callers that slice
+    /// `file[data_addr..data_addr + nbytes]` and tile the result by `dims`.
+    #[test]
+    fn test_contiguous_layout_rejects_size_dims_disagreement_and_wrap() {
+        use crate::message_type::MessageType;
+        use crate::object_header::{HeaderMessage, ObjectHeader};
+
+        fn msg(msg_type: MessageType, data: Vec<u8>) -> HeaderMessage {
+            HeaderMessage {
+                msg_type,
+                size: data.len(),
+                flags: 0,
+                creation_order: None,
+                data,
+            }
+        }
+        fn header(messages: Vec<HeaderMessage>) -> ObjectHeader {
+            ObjectHeader {
+                version: 2,
+                messages,
+                reference_count: None,
+                flags: 0,
+                access_time: None,
+                modification_time: None,
+                change_time: None,
+                birth_time: None,
+            }
+        }
+        // Dataspace v1, rank 1, extent 100; f64 datatype => 800 bytes.
+        let mut dataspace = vec![1u8, 1, 0, 0, 0, 0, 0, 0];
+        dataspace.extend_from_slice(&100u64.to_le_bytes());
+        let f64_dt = {
+            let mut d = vec![0x11u8, 0x20, 0x1f, 0x00];
+            d.extend_from_slice(&8u32.to_le_bytes());
+            d.extend_from_slice(&[0x00, 0x00, 0x34, 0x00, 0x00, 0x40, 0x0d, 0xff]);
+            d.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            d
+        };
+        let layout_msg = |addr: u64, size: u64| {
+            let mut d = vec![3u8, 1];
+            d.extend_from_slice(&addr.to_le_bytes());
+            d.extend_from_slice(&size.to_le_bytes());
+            d
+        };
+        let build = |addr: u64, size: u64| {
+            header(vec![
+                msg(MessageType::Dataspace, dataspace.clone()),
+                msg(MessageType::Datatype, f64_dt.clone()),
+                msg(MessageType::DataLayout, layout_msg(addr, size)),
+            ])
+        };
+
+        // Consistent: accepted, fields read back exactly.
+        let ok = contiguous_layout(&build(1024, 800), 8, 8).expect("consistent layout");
+        assert_eq!((ok.data_addr, ok.nbytes, ok.elem_size), (1024, 800, 8));
+        assert_eq!(ok.dims, vec![100]);
+
+        // `size` smaller than the dataspace implies: a caller would hand a
+        // 16-byte buffer to a builder that tiles 800 bytes.
+        assert!(matches!(
+            contiguous_layout(&build(1024, 16), 8, 8).unwrap_err(),
+            MerkleError::UnsupportedLayout {
+                reason: UnsupportedLayoutReason::MalformedHeader
+            }
+        ));
+        // `size` larger: the caller slices past the dataset.
+        assert!(matches!(
+            contiguous_layout(&build(1024, 1 << 40), 8, 8).unwrap_err(),
+            MerkleError::UnsupportedLayout {
+                reason: UnsupportedLayoutReason::MalformedHeader
+            }
+        ));
+        // Consistent size but the byte range wraps past u64::MAX.
+        assert!(matches!(
+            contiguous_layout(&build(u64::MAX - 8, 800), 8, 8).unwrap_err(),
+            MerkleError::UnsupportedLayout {
+                reason: UnsupportedLayoutReason::MalformedHeader
+            }
+        ));
+    }
+
+    /// 2026-10 red-team regression: Morton and Hilbert interleaving silently
+    /// drop high coordinate bits past a 64-bit budget the padded-leaf-count
+    /// bound does not enforce, so two chunk coordinates collide onto one leaf
+    /// and a hyperslab covering both derives an expected set one chunk short.
+    #[test]
+    fn test_leaf_order_bit_budget_is_enforced() {
+        let alg = HashAlg::Blake3;
+        let small = Selection::slice(&[0..1, 0..1, 0..1, 0..1]);
+
+        // Rank 4, one axis of 2^20 chunks: total 2^20 (depth 21, admitted),
+        // but Hilbert needs 20 * 4 = 80 bits.
+        let skewed4 = ChunkGridParams::new(
+            vec![1 << 20, 1, 1, 1],
+            vec![1, 1, 1, 1],
+            4,
+            LayoutClass::Chunked,
+            alg,
+        );
+        assert!(matches!(
+            compute_expected_chunk_indices(&skewed4, &small, LeafOrder::Hilbert),
+            Err(MerkleError::LeafOrderOverflow { needed_bits: 80 })
+        ));
+        // Morton gives each of 4 axes 16 bits; a 2^20 extent needs 20.
+        assert!(matches!(
+            compute_expected_chunk_indices(&skewed4, &small, LeafOrder::Morton),
+            Err(MerkleError::LeafOrderOverflow { .. })
+        ));
+        // Row-major is a mixed-radix index: unaffected.
+        assert_eq!(
+            compute_expected_chunk_indices(&skewed4, &small, LeafOrder::RowMajor).unwrap(),
+            vec![0]
+        );
+
+        // Rank 2, one axis of 2^33 chunks (depth 34, admitted): Morton gives
+        // 32 bits per axis, so coordinates 0 and 2^32 would collide.
+        let skewed2 = ChunkGridParams::new(vec![1 << 33, 1], vec![1, 1], 4, LayoutClass::Chunked, alg);
+        let small2 = Selection::slice(&[0..1, 0..1]);
+        assert!(matches!(
+            compute_expected_chunk_indices(&skewed2, &small2, LeafOrder::Morton),
+            Err(MerkleError::LeafOrderOverflow { .. })
+        ));
+        assert_eq!(
+            morton_index(&[0, 0]),
+            morton_index(&[1 << 32, 0]),
+            "the collision the budget check exists to prevent"
+        );
+
+        // A balanced grid well inside the budget is unaffected under all
+        // three orders.
+        let balanced = ChunkGridParams::new(vec![64, 64], vec![1, 1], 4, LayoutClass::Chunked, alg);
+        for order in [LeafOrder::RowMajor, LeafOrder::Morton, LeafOrder::Hilbert] {
+            assert_eq!(
+                compute_expected_chunk_indices(&balanced, &small2, order).unwrap(),
+                vec![0]
+            );
+        }
     }
 }
