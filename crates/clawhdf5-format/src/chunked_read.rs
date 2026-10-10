@@ -59,13 +59,19 @@ fn decompress_all_chunks(
     for chunk_info in chunks {
         let c_addr = chunk_info.address as usize;
         let size = chunk_info.chunk_size as usize;
-        if c_addr + size > file_data.len() {
+        // checked_add: a crafted address field in a B-tree key / fixed-
+        // or extensible-array entry near usize::MAX would otherwise wrap
+        // and the slice below would panic on an out-of-range index.
+        let end = c_addr.checked_add(size).ok_or_else(|| {
+            FormatError::Overflow("chunk address + size overflows usize".into())
+        })?;
+        if end > file_data.len() {
             return Err(FormatError::UnexpectedEof {
-                expected: c_addr + size,
+                expected: end,
                 available: file_data.len(),
             });
         }
-        let raw_chunk = &file_data[c_addr..c_addr + size];
+        let raw_chunk = &file_data[c_addr..end];
 
         let decompressed = if let Some(pl) = pipeline {
             if chunk_info.filter_mask == 0 {
@@ -301,20 +307,47 @@ pub fn generate_implicit_chunks(
     dataset_dims: &[u64],
     chunk_dimensions: &[u32],
     element_size: u32,
-) -> Vec<ChunkInfo> {
+) -> Result<Vec<ChunkInfo>, FormatError> {
     let rank = chunk_dimensions.len();
-    let chunk_byte_size: u64 =
-        chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
+    if dataset_dims.len() < rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "implicit chunks: dataspace has {} dims, chunk has {rank}",
+            dataset_dims.len()
+        )));
+    }
+    // The old code multiplied raw u64 values without a check and divided
+    // directly, so a zero chunk-dim or an attacker-crafted product crashed
+    // the parser (debug: div-by-zero; release: wrap + OOM-sized allocation).
+    let mut chunk_byte_size: u64 = u64::from(element_size);
+    for &d in chunk_dimensions {
+        if d == 0 {
+            return Err(FormatError::ChunkedReadError(
+                "implicit chunks: zero chunk dimension".into(),
+            ));
+        }
+        chunk_byte_size = chunk_byte_size.checked_mul(u64::from(d)).ok_or_else(|| {
+            FormatError::Overflow("implicit chunks: chunk byte size".into())
+        })?;
+    }
 
     let mut num_chunks_per_dim = Vec::with_capacity(rank);
+    let mut total_chunks: u64 = 1;
     for d in 0..rank {
         let ds = dataset_dims[d];
-        let ch = chunk_dimensions[d] as u64;
-        num_chunks_per_dim.push(ds.div_ceil(ch));
+        let ch = u64::from(chunk_dimensions[d]);
+        let n = ds.div_ceil(ch); // ch > 0 by the zero check above
+        total_chunks = total_chunks.checked_mul(n).ok_or_else(|| {
+            FormatError::Overflow("implicit chunks: total chunk count".into())
+        })?;
+        num_chunks_per_dim.push(n);
     }
-    let total_chunks: u64 = num_chunks_per_dim.iter().product();
 
-    let mut chunks = Vec::with_capacity(total_chunks as usize);
+    // Attacker-crafted total_chunks of ~2^63 used to drive a terabyte-scale
+    // Vec::with_capacity before the loop ever ran -- cap at the number of
+    // chunks that could physically fit, bounded by the dataset's own size.
+    let cap = usize::try_from(total_chunks)
+        .map_err(|_| FormatError::Overflow("implicit chunks: capacity".into()))?;
+    let mut chunks = Vec::with_capacity(cap);
     for linear_idx in 0..total_chunks {
         let mut offsets = vec![0u64; rank];
         let mut remaining = linear_idx;
@@ -322,18 +355,28 @@ pub fn generate_implicit_chunks(
             let nchunks = num_chunks_per_dim[d];
             let chunk_idx = remaining % nchunks;
             remaining /= nchunks;
-            offsets[d] = chunk_idx * chunk_dimensions[d] as u64;
+            offsets[d] = chunk_idx
+                .checked_mul(u64::from(chunk_dimensions[d]))
+                .ok_or_else(|| FormatError::Overflow("implicit chunks: offset".into()))?;
         }
 
+        let addr_offset = linear_idx.checked_mul(chunk_byte_size).ok_or_else(|| {
+            FormatError::Overflow("implicit chunks: chunk address offset".into())
+        })?;
+        let address = base_address.checked_add(addr_offset).ok_or_else(|| {
+            FormatError::Overflow("implicit chunks: chunk address".into())
+        })?;
+        let chunk_size = u32::try_from(chunk_byte_size)
+            .map_err(|_| FormatError::Overflow("implicit chunks: u32 chunk size".into()))?;
         chunks.push(ChunkInfo {
-            chunk_size: chunk_byte_size as u32,
+            chunk_size,
             filter_mask: 0,
             offsets,
-            address: base_address + linear_idx * chunk_byte_size,
+            address,
         });
     }
 
-    chunks
+    Ok(chunks)
 }
 
 /// Read a chunked dataset, decompressing chunks as needed.
@@ -383,6 +426,16 @@ pub fn read_chunked_data(
 
     // Both v3 and v4 include element size as last dim (rank+1)
     let ndims = chunk_dimensions.len();
+    // The DataLayout version-3/4 chunked layouts always store rank+1
+    // dimensions (spatial dims + element-size terminator). An attacker-
+    // crafted zero-length layout used to underflow `ndims - 1` to
+    // usize::MAX, panicking the subsequent slice (release) or arithmetic
+    // (debug). Reject before the subtraction.
+    if ndims == 0 {
+        return Err(FormatError::ChunkedReadError(
+            "chunked layout has empty chunk_dimensions".into(),
+        ));
+    }
     let rank = ndims - 1;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
@@ -428,7 +481,7 @@ pub fn read_chunked_data(
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
                 elem_size as u32,
-            )
+            )?
         }
         (4, Some(3)) => {
             // Fixed Array — use spatial chunk dims only
@@ -497,13 +550,19 @@ pub fn read_chunked_data(
 
             let c_addr = chunk_info.address as usize;
             let size = chunk_info.chunk_size as usize;
-            if c_addr + size > file_data.len() {
+            // checked_add: a crafted address field in a B-tree key / fixed-
+            // or extensible-array entry near usize::MAX would otherwise wrap
+            // and the slice below would panic on an out-of-range index.
+            let end = c_addr.checked_add(size).ok_or_else(|| {
+                FormatError::Overflow("chunk address + size overflows usize".into())
+            })?;
+            if end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: end,
                     available: file_data.len(),
                 });
             }
-            let chunk_data = &file_data[c_addr..c_addr + size];
+            let chunk_data = &file_data[c_addr..end];
 
             if rank == 0 {
                 let copy_len = chunk_data.len().min(output.len());
@@ -615,6 +674,16 @@ pub fn read_chunked_data_cached(
 
     let elem_size = datatype.type_size() as usize;
     let ndims = chunk_dimensions.len();
+    // The DataLayout version-3/4 chunked layouts always store rank+1
+    // dimensions (spatial dims + element-size terminator). An attacker-
+    // crafted zero-length layout used to underflow `ndims - 1` to
+    // usize::MAX, panicking the subsequent slice (release) or arithmetic
+    // (debug). Reject before the subtraction.
+    if ndims == 0 {
+        return Err(FormatError::ChunkedReadError(
+            "chunked layout has empty chunk_dimensions".into(),
+        ));
+    }
     let rank = ndims - 1;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
@@ -660,7 +729,7 @@ pub fn read_chunked_data_cached(
                     &dataspace.dimensions,
                     &spatial_chunk_dims,
                     elem_size as u32,
-                )
+                )?
             }
             (4, Some(3)) => {
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
@@ -733,13 +802,19 @@ pub fn read_chunked_data_cached(
             // Decompress from file
             let c_addr = chunk_info.address as usize;
             let size = chunk_info.chunk_size as usize;
-            if c_addr + size > file_data.len() {
+            // checked_add: a crafted address field in a B-tree key / fixed-
+            // or extensible-array entry near usize::MAX would otherwise wrap
+            // and the slice below would panic on an out-of-range index.
+            let end = c_addr.checked_add(size).ok_or_else(|| {
+                FormatError::Overflow("chunk address + size overflows usize".into())
+            })?;
+            if end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: end,
                     available: file_data.len(),
                 });
             }
-            let raw_chunk = &file_data[c_addr..c_addr + size];
+            let raw_chunk = &file_data[c_addr..end];
             let dec = if let Some(pl) = pipeline {
                 if chunk_info.filter_mask == 0 {
                     decompress_chunk(raw_chunk, pl, chunk_total_bytes, elem_size as u32)?
@@ -972,6 +1047,16 @@ pub fn read_chunked_data_sweep(
 
     let elem_size = datatype.type_size() as usize;
     let ndims = chunk_dimensions.len();
+    // The DataLayout version-3/4 chunked layouts always store rank+1
+    // dimensions (spatial dims + element-size terminator). An attacker-
+    // crafted zero-length layout used to underflow `ndims - 1` to
+    // usize::MAX, panicking the subsequent slice (release) or arithmetic
+    // (debug). Reject before the subtraction.
+    if ndims == 0 {
+        return Err(FormatError::ChunkedReadError(
+            "chunked layout has empty chunk_dimensions".into(),
+        ));
+    }
     let rank = ndims - 1;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
@@ -1017,7 +1102,7 @@ pub fn read_chunked_data_sweep(
                     &dataspace.dimensions,
                     &spatial_chunk_dims,
                     elem_size as u32,
-                )
+                )?
             }
             (4, Some(3)) => {
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
@@ -1099,13 +1184,19 @@ pub fn read_chunked_data_sweep(
             // Decompress from file
             let c_addr = chunk_info.address as usize;
             let size = chunk_info.chunk_size as usize;
-            if c_addr + size > file_data.len() {
+            // checked_add: a crafted address field in a B-tree key / fixed-
+            // or extensible-array entry near usize::MAX would otherwise wrap
+            // and the slice below would panic on an out-of-range index.
+            let end = c_addr.checked_add(size).ok_or_else(|| {
+                FormatError::Overflow("chunk address + size overflows usize".into())
+            })?;
+            if end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: end,
                     available: file_data.len(),
                 });
             }
-            let raw_chunk = &file_data[c_addr..c_addr + size];
+            let raw_chunk = &file_data[c_addr..end];
             let dec = if let Some(pl) = pipeline {
                 if chunk_info.filter_mask == 0 {
                     decompress_chunk(raw_chunk, pl, chunk_total_bytes, elem_size as u32)?
@@ -1199,6 +1290,16 @@ pub fn read_chunked_data_indexed(
 
     let elem_size = datatype.type_size() as usize;
     let ndims = chunk_dimensions.len();
+    // The DataLayout version-3/4 chunked layouts always store rank+1
+    // dimensions (spatial dims + element-size terminator). An attacker-
+    // crafted zero-length layout used to underflow `ndims - 1` to
+    // usize::MAX, panicking the subsequent slice (release) or arithmetic
+    // (debug). Reject before the subtraction.
+    if ndims == 0 {
+        return Err(FormatError::ChunkedReadError(
+            "chunked layout has empty chunk_dimensions".into(),
+        ));
+    }
     let rank = ndims - 1;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
@@ -1244,7 +1345,7 @@ pub fn read_chunked_data_indexed(
                     &dataspace.dimensions,
                     &spatial_chunk_dims,
                     elem_size as u32,
-                )
+                )?
             }
             (4, Some(3)) => {
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
@@ -1316,13 +1417,19 @@ pub fn read_chunked_data_indexed(
         } else {
             let c_addr = *file_offset as usize;
             let size = *file_size as usize;
-            if c_addr + size > file_data.len() {
+            // checked_add: a crafted address field in a B-tree key / fixed-
+            // or extensible-array entry near usize::MAX would otherwise wrap
+            // and the slice below would panic on an out-of-range index.
+            let end = c_addr.checked_add(size).ok_or_else(|| {
+                FormatError::Overflow("chunk address + size overflows usize".into())
+            })?;
+            if end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: end,
                     available: file_data.len(),
                 });
             }
-            let raw_chunk = &file_data[c_addr..c_addr + size];
+            let raw_chunk = &file_data[c_addr..end];
             let decompressed = if let Some(pl) = pipeline {
                 if *filter_mask == 0 {
                     decompress_chunk(raw_chunk, pl, chunk_total_bytes, elem_size as u32)?
@@ -1898,7 +2005,7 @@ mod tests {
             &[100],
             &[20],
             8, // f64
-        );
+        ).unwrap();
         assert_eq!(chunks.len(), 5);
         let chunk_byte_size = 20 * 8;
         for (i, c) in chunks.iter().enumerate() {
@@ -1917,7 +2024,7 @@ mod tests {
             &[10, 6],
             &[4, 3],
             4, // f32
-        );
+        ).unwrap();
         assert_eq!(chunks.len(), 6);
         let chunk_byte_size = 4 * 3 * 4;
         // Row-major: (0,0), (0,3), (4,0), (4,3), (8,0), (8,3)
@@ -1935,7 +2042,7 @@ mod tests {
     #[test]
     fn implicit_chunks_partial_last() {
         // 25 elements, chunk size 10 => 3 chunks (last partial)
-        let chunks = generate_implicit_chunks(0x0, &[25], &[10], 8);
+        let chunks = generate_implicit_chunks(0x0, &[25], &[10], 8).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].offsets, vec![0]);
         assert_eq!(chunks[1].offsets, vec![10]);

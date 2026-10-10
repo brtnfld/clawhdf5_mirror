@@ -356,7 +356,7 @@ pub fn read_raw_data_selection(
                             dims,
                             chunk_dimensions,
                             elem_size as u32,
-                        )
+                        )?
                     }
                     _ => {
                         if let Some(_addr) = btree_address {

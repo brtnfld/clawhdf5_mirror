@@ -261,6 +261,18 @@ fn parse_leaf_records(
     Ok(records)
 }
 
+/// Maximum effective depth for a B-tree v2 traversal (malformed/adversarial
+/// data protection).
+///
+/// `depth` is a `u16` read directly from the file header, so a crafted file
+/// could set it to 65535. The old code trusted that value and recursed one
+/// level per unit (with each child reaffirming the same u16 in a crafted
+/// cycle), stack-overflowing the process on open — exactly the bug class
+/// `MAX_BTREE_DEPTH` was added to `btree_v1`/`chunked_read` to close in the
+/// July 2026 engagement. Real HDF5 B-tree v2 depths are 2-3 in practice;
+/// `64` matches the sibling parsers and leaves a generous safety margin.
+const MAX_BTREE_V2_DEPTH: u16 = 64;
+
 /// Recursively collect records from an internal node.
 #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn collect_internal_records(
@@ -275,6 +287,9 @@ fn collect_internal_records(
     max_leaf_nrec: u64,
     out: &mut Vec<BTreeV2Record>,
 ) -> Result<(), FormatError> {
+    if depth > MAX_BTREE_V2_DEPTH {
+        return Err(FormatError::NestingDepthExceeded);
+    }
     // signature(4) + version(1) + type(1) = 6
     ensure_len(file_data, offset, 6)?;
     if &file_data[offset..offset + 4] != b"BTIN" {

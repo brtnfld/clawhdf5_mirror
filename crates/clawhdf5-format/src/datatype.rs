@@ -209,6 +209,29 @@ impl Datatype {
     ///
     /// Returns `(Datatype, bytes_consumed)` for recursive parsing.
     pub fn parse(data: &[u8]) -> Result<(Datatype, usize), FormatError> {
+        Self::parse_with_depth(data, 0)
+    }
+
+    /// Maximum recursion depth for nested datatype parsing (adversarial
+    /// data protection). Real HDF5 datatypes nest 2-3 levels in practice
+    /// (compound-of-array-of-float); 32 is a 10x safety margin. The parser
+    /// is called on every object header message of class `Datatype`, so an
+    /// unbounded parse was reachable from any public `open` or `shape`
+    /// (2026-10 red-team finding: a crafted compound/VL/array/enum chain
+    /// stack-overflowed the parser and SIGABRTed the process on open).
+    const MAX_NEST: usize = 32;
+
+    fn parse_with_depth(
+        data: &[u8],
+        depth: usize,
+    ) -> Result<(Datatype, usize), FormatError> {
+        if depth > Self::MAX_NEST {
+            return Err(FormatError::NestingDepthExceeded);
+        }
+        Self::parse_body(data, depth)
+    }
+
+    fn parse_body(data: &[u8], depth: usize) -> Result<(Datatype, usize), FormatError> {
         // Minimum header: 4 bytes (class_and_version + 3 bytes bit field) + 4 bytes size = 8
         ensure_len(data, 0, 8)?;
 
@@ -358,7 +381,7 @@ impl Datatype {
                         pos += name_len;
                         let byte_offset = read_uint(data, pos, ob)?;
                         pos += ob;
-                        let (member_dt, consumed) = Datatype::parse(&data[pos..])?;
+                        let (member_dt, consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                         pos += consumed;
                         members.push(CompoundMember {
                             name,
@@ -384,7 +407,7 @@ impl Datatype {
                         // dimensionality(1) + reserved(3) + dim_perm(4) + 4 dim slots(16) = 24
                         ensure_len(data, pos, 24)?;
                         pos += 24;
-                        let (member_dt, consumed) = Datatype::parse(&data[pos..])?;
+                        let (member_dt, consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                         pos += consumed;
                         members.push(CompoundMember {
                             name,
@@ -415,7 +438,7 @@ impl Datatype {
                 // Enumeration
                 let num_members = (bf0 as u16) | ((bf1 as u16) << 8);
                 // Parse base type
-                let (base_type, base_consumed) = Datatype::parse(&data[pos..])?;
+                let (base_type, base_consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                 pos += base_consumed;
                 let base_size = base_type.type_size();
                 let mut members = Vec::with_capacity(num_members as usize);
@@ -468,7 +491,7 @@ impl Datatype {
                 } else {
                     None
                 };
-                let (base_type, consumed) = Datatype::parse(&data[pos..])?;
+                let (base_type, consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                 pos += consumed;
                 Ok((
                     Datatype::VariableLength {
@@ -494,7 +517,7 @@ impl Datatype {
                     }
                     // skip permutation indices
                     pos += ndims * 4;
-                    let (base_type, consumed) = Datatype::parse(&data[pos..])?;
+                    let (base_type, consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                     pos += consumed;
                     Ok((
                         Datatype::Array {
@@ -515,7 +538,7 @@ impl Datatype {
                         dimensions.push(LittleEndian::read_u32(&data[pos..pos + 4]));
                         pos += 4;
                     }
-                    let (base_type, consumed) = Datatype::parse(&data[pos..])?;
+                    let (base_type, consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                     pos += consumed;
                     Ok((
                         Datatype::Array {
@@ -545,7 +568,7 @@ impl Datatype {
                     pos += name_len;
                     let byte_offset = read_uint(data, pos, ob)?;
                     pos += ob;
-                    let (member_dt, consumed) = Datatype::parse(&data[pos..])?;
+                    let (member_dt, consumed) = Datatype::parse_with_depth(&data[pos..], depth + 1)?;
                     pos += consumed;
                     members.push(CompoundMember {
                         name,
