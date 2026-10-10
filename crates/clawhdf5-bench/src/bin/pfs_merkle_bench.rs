@@ -43,7 +43,9 @@
 //! Common flags: `--alg sha256|blake3|k12`, `--leaf-bytes 1M` or
 //! `--dims 1000x1000x1000 --elem 4 [--target 1M]` (the prefix grid),
 //! `--bytes N` (use only the first N bytes), `--o-direct`, `--threads T`
-//! (rayon threads per rank), `--trials 5 --warmup 1`, `--check`.
+//! (rayon threads per rank), `--trials 5 --warmup 1`, `--check`,
+//! `--warm-server` (skip dropping the Lustre servers' cache before each trial;
+//! the default drops it, since O_DIRECT bypasses only the client cache).
 //! The rank count must be a power of two.
 
 #[cfg(feature = "pfs")]
@@ -487,15 +489,23 @@ mod pfs {
         /// Drop this file's pages on every node before a cold trial. Spawning
         /// `lfs ladvise` from every rank would be its own load test, so one
         /// rank per node does it for the node.
-        fn evict(&self, paths: &[&Path]) {
+        /// Returns whether every node's eviction calls reported success.
+        /// On Lustre this includes `lfs ladvise -a dontneed`, which asks the
+        /// *servers* to drop the file's pages -- the cache O_DIRECT does not
+        /// bypass, and the one a repeated read of the same prefix otherwise
+        /// measures instead of the disks.
+        fn evict(&self, paths: &[&Path]) -> bool {
+            let mut ok = true;
             if self.node_leader {
                 for p in paths {
                     if p.exists() {
-                        evict_cache(p);
+                        ok &= evict_cache(p);
                     }
                 }
             }
-            self.barrier();
+            let mut all = 0u64;
+            self.world.all_reduce_into(&u64::from(!ok), &mut all, SystemOperation::sum());
+            all == 0
         }
     }
 
@@ -553,6 +563,9 @@ mod pfs {
         /// The companion's own stripe count: E2's hotspot variable.
         comp_stripe: String,
         o_direct: bool,
+        /// Per trial: "cold" if server caches were dropped before it,
+        /// "warm" if not (--warm-server, or the drop failed).
+        server_cache: &'static str,
     }
 
     fn provenance(data: &Path, companion: &Path, o_direct: bool) -> Prov {
@@ -570,6 +583,7 @@ mod pfs {
             stripe_size: if lustre { lfs_field(data, "-S").unwrap_or_default() } else { String::new() },
             comp_stripe,
             o_direct,
+            server_cache: "cold",
         }
     }
 
@@ -592,6 +606,7 @@ mod pfs {
             std::env::var("BENCH_CLAWHDF5_SHA").unwrap_or_else(|_| "unknown".into()),
             std::env::var("BENCH_S2D2_SHA").unwrap_or_else(|_| "unknown".into())
         );
+        println!("# server_cache_requested={}", if args.has("--warm-server") { "warm" } else { "cold" });
         println!(
             "# storage_class={} stripe_count={} stripe_size={} companion_stripe_count={} o_direct={}",
             prov.storage_class,
@@ -613,11 +628,11 @@ mod pfs {
     }
 
     const PREFIX_COLS: &str = "mode,strategy,alg,nodes,ranks,threads,file_bytes,leaf,n_leaves,\
-                               o_direct,storage_class,stripe_count,stripe_size,companion_stripe_count,trial";
+                               o_direct,storage_class,stripe_count,stripe_size,companion_stripe_count,server_cache,trial";
 
     fn prefix(ctx: &Ctx, mode: &str, strategy: &str, alg: &str, lay: &Layout, prov: &Prov, t: usize) -> String {
         format!(
-            "{mode},{strategy},{alg},{},{},{},{},{},{},{},{},{},{},{},{t}",
+            "{mode},{strategy},{alg},{},{},{},{},{},{},{},{},{},{},{},{},{t}",
             ctx.nodes,
             ctx.size,
             ctx.threads,
@@ -628,7 +643,8 @@ mod pfs {
             prov.storage_class,
             prov.stripe_count,
             prov.stripe_size,
-            prov.comp_stripe
+            prov.comp_stripe,
+            prov.server_cache
         )
     }
 
@@ -777,7 +793,8 @@ mod pfs {
             die("flat mode supports sha256 and blake3");
         }
         let lay = layout_from_args(ctx, args, data)?;
-        let prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
+        let mut prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
+        let warm_server = args.has("--warm-server");
         if ctx.root() {
             print_header_comments(ctx, args, Some(&lay), &prov);
             println!(
@@ -802,9 +819,13 @@ mod pfs {
         let (warm, n) = trials(args);
         let mut last_root: Option<H> = None;
         for t in 0..warm + n {
-            if !o_direct {
-                ctx.evict(&[data, &companion]);
-            }
+            // Client caches matter only for buffered reads, but server caches
+            // matter for O_DIRECT too: drop both unless --warm-server.
+            prov.server_cache = if !warm_server || !o_direct {
+                if ctx.evict(&[data, &companion]) && !warm_server { "cold" } else { "warm" }
+            } else {
+                "warm"
+            };
             let file = open_maybe_direct(data, o_direct)?;
             let comp = if matches!(strategy.as_str(), "gather" | "distributed") {
                 Some(OpenOptions::new().write(true).open(&companion)?)
@@ -976,6 +997,7 @@ mod pfs {
             stripe_size: String::new(),
             comp_stripe: String::new(),
             o_direct,
+            server_cache: "cold",
         }
     }
 
@@ -1054,7 +1076,8 @@ mod pfs {
             die("--k exceeds the leaf count");
         }
         let cache_top = cache_top.min(lay.d + 1);
-        let prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
+        let mut prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
+        let warm_server = args.has("--warm-server");
         if ctx.root() {
             print_header_comments(ctx, args, Some(&lay), &prov);
             println!(
@@ -1066,9 +1089,13 @@ mod pfs {
         let strategy = format!("{select}-k{k}-top{cache_top}");
         let (warm, n) = trials(args);
         for t in 0..warm + n {
-            if !o_direct {
-                ctx.evict(&[data, &companion]);
-            }
+            // Client caches matter only for buffered reads, but server caches
+            // matter for O_DIRECT too: drop both unless --warm-server.
+            prov.server_cache = if !warm_server || !o_direct {
+                if ctx.evict(&[data, &companion]) && !warm_server { "cold" } else { "warm" }
+            } else {
+                "warm"
+            };
             let file = open_maybe_direct(data, o_direct)?;
             let comp = File::open(&companion)?;
             let mut root = [0u8; 32];
@@ -1233,7 +1260,8 @@ mod pfs {
         if std::fs::metadata(&companion)?.len() != lay.companion_bytes() {
             die("companion size does not match this layout; rebuild it with --mode build");
         }
-        let prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
+        let mut prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
+        let warm_server = args.has("--warm-server");
         if ctx.root() {
             print_header_comments(ctx, args, Some(&lay), &prov);
             println!(
@@ -1249,9 +1277,13 @@ mod pfs {
 
         let (warm, n) = trials(args);
         for t in 0..warm + n {
-            if !o_direct {
-                ctx.evict(&[data, &companion]);
-            }
+            // Client caches matter only for buffered reads, but server caches
+            // matter for O_DIRECT too: drop both unless --warm-server.
+            prov.server_cache = if !warm_server || !o_direct {
+                if ctx.evict(&[data, &companion]) && !warm_server { "cold" } else { "warm" }
+            } else {
+                "warm"
+            };
             let dfile = dopts.open(data)?;
             let comp = OpenOptions::new().read(true).write(true).open(&companion)?;
 
