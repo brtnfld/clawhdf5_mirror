@@ -45,7 +45,10 @@
 //! `--bytes N` (use only the first N bytes), `--o-direct`, `--threads T`
 //! (rayon threads per rank), `--trials 5 --warmup 1`, `--check`,
 //! `--warm-server` (skip dropping the Lustre servers' cache before each trial;
-//! the default drops it, since O_DIRECT bypasses only the client cache).
+//! the default asks for it, since O_DIRECT bypasses only the client cache),
+//! `--offset B --offset-step S` (read/flat/build: trial t uses the region at
+//! B + t*S, so no trial rereads data; Orion keeps repeatedly read data in
+//! server memory whatever ladvise says).
 //! The rank count must be a power of two.
 
 #[cfg(feature = "pfs")]
@@ -174,6 +177,11 @@ mod pfs {
         s: u64,
         /// log2(s): levels in a rank's subtree above its leaves.
         sub: u32,
+        /// File offset of the dataset's first byte. Nonzero with --offset,
+        /// and advanced per trial by --offset-step so that no trial rereads
+        /// bytes an earlier one read (Orion's servers cache repeatedly read
+        /// data, and lfs ladvise dontneed does not evict it).
+        base: u64,
     }
 
     impl Layout {
@@ -207,14 +215,16 @@ mod pfs {
                 k: ranks.trailing_zeros(),
                 s,
                 sub: s.trailing_zeros(),
+                base: 0,
             })
         }
 
         fn leaf_range(&self, i: u64) -> Range<u64> {
             match &self.geom {
-                Geom::Fixed(l) => i * l..((i + 1) * l).min(self.file_bytes),
+                Geom::Fixed(l) => self.base + i * l..self.base + ((i + 1) * l).min(self.file_bytes),
                 Geom::Grid { grid, dims, elem } => {
-                    verification_grid::leaf_byte_range(grid, dims, *elem, i)
+                    let r = verification_grid::leaf_byte_range(grid, dims, *elem, i);
+                    self.base + r.start..self.base + r.end
                 }
             }
         }
@@ -726,7 +736,33 @@ mod pfs {
             }
             Geom::Fixed(_) => file_bytes,
         };
-        Layout::new(file_bytes, geom, ctx.size).map_err(std::io::Error::other)
+        let mut lay = Layout::new(file_bytes, geom, ctx.size).map_err(std::io::Error::other)?;
+        let (offset, step) = region(args);
+        let (w, n) = trials(args);
+        let last = offset + step * (w + n).saturating_sub(1) as u64;
+        let have = std::fs::metadata(data)?.len();
+        if last + lay.file_bytes > have {
+            die(&format!(
+                "--offset {offset} + {} trials x --offset-step {step} + {} bytes exceeds the file ({have})",
+                w + n,
+                lay.file_bytes
+            ));
+        }
+        lay.base = offset;
+        Ok(lay)
+    }
+
+    /// `--offset` (first trial's region) and `--offset-step` (advance per
+    /// trial, warm-ups included). Both are byte counts and must keep O_DIRECT
+    /// alignment, so they are rounded to whole MiB.
+    fn region(args: &Args) -> (u64, u64) {
+        let mib = 1u64 << 20;
+        let o = args.num("--offset", "0");
+        let st = args.num("--offset-step", "0");
+        if o % mib != 0 || st % mib != 0 {
+            die("--offset and --offset-step must be whole MiB");
+        }
+        (o, st)
     }
 
     fn trials(args: &Args) -> (usize, usize) {
@@ -792,7 +828,8 @@ mod pfs {
         if mode == "flat" && alg == HashAlg::K12 {
             die("flat mode supports sha256 and blake3");
         }
-        let lay = layout_from_args(ctx, args, data)?;
+        let mut lay = layout_from_args(ctx, args, data)?;
+        let (offset0, step) = region(args);
         let mut prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
         let warm_server = args.has("--warm-server");
         if ctx.root() {
@@ -826,6 +863,11 @@ mod pfs {
             } else {
                 "warm"
             };
+            // Fresh-region mode: each trial reads bytes no earlier trial read.
+            lay.base = offset0 + t as u64 * step;
+            if step > 0 {
+                prov.server_cache = "fresh";
+            }
             let file = open_maybe_direct(data, o_direct)?;
             let comp = if matches!(strategy.as_str(), "gather" | "distributed") {
                 Some(OpenOptions::new().write(true).open(&companion)?)
@@ -839,7 +881,7 @@ mod pfs {
             let (leaves, st) = if mode == "flat" {
                 if ctx.root() {
                     let spans: Vec<Range<u64>> = (0..lay.file_bytes.div_ceil(budget))
-                        .map(|i| i * budget..((i + 1) * budget).min(lay.file_bytes))
+                        .map(|i| lay.base + i * budget..lay.base + ((i + 1) * budget).min(lay.file_bytes))
                         .collect();
                     let mut sha = <sha2::Sha256 as sha2::Digest>::new();
                     let mut b3 = blake3::Hasher::new();
@@ -1072,6 +1114,11 @@ mod pfs {
         }
         let cache_top = args.num("--cache-top", "0") as u32;
         let lay = layout_from_args(ctx, args, data)?;
+        let (offset0, step) = region(args);
+        let _ = offset0;
+        if step > 0 {
+            die("--offset-step applies to read/flat/build only: verify and update need the companion of one fixed region");
+        }
         if k > lay.n_leaves {
             die("--k exceeds the leaf count");
         }
@@ -1250,6 +1297,11 @@ mod pfs {
         let updates = args.num("--updates", "64") as usize;
         let fsync = args.has("--fsync");
         let lay = layout_from_args(ctx, args, data)?;
+        let (offset0, step) = region(args);
+        let _ = offset0;
+        if step > 0 {
+            die("--offset-step applies to read/flat/build only: verify and update need the companion of one fixed region");
+        }
         if o_direct {
             let aligned = matches!(lay.geom, Geom::Fixed(l) if l % ALIGN as u64 == 0)
                 && lay.file_bytes % ALIGN as u64 == 0;
