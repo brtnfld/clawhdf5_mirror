@@ -17,7 +17,9 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::merkle::{GRID_PREFIX, HASH_SIZE, HashAlg, MerkleError, MerkleTree, constant_time_eq};
+use crate::merkle::{
+    GRID_PREFIX, HASH_SIZE, HashAlg, LeafFormat, MerkleError, MerkleTree, constant_time_eq, hash_chunk_bound,
+};
 use crate::selection::Selection;
 use crate::verification_grid::{self, LayoutClass};
 
@@ -548,6 +550,40 @@ pub struct ChunkData<'a> {
     pub data: &'a [u8],
 }
 
+/// How the verifier recomputes a delivered chunk's leaf hash: the dataset's
+/// [`LeafFormat`], which the caller reads from the signed `MerkleAttr`, plus
+/// what that format binds beyond the chunk's bytes.
+#[derive(Debug, Clone, Copy)]
+pub enum LeafBinding<'a> {
+    /// [`LeafFormat::Content`]: `H(0x00 || data)`.
+    Content,
+    /// [`LeafFormat::Bound`]: `H(0x00 || len(k) || k || len(data) || data || v_k)`,
+    /// where `k` is the chunk's row-major linear index in the chunk grid
+    /// (whatever [`LeafOrder`] places it in the tree) and `versions[i]` is the
+    /// version counter of the `i`-th delivered chunk. Versions come from the
+    /// same untrusted storage as the chunks: a wrong or rolled-back one
+    /// changes the leaf and fails the path to the signed root.
+    Bound {
+        /// Per-chunk version counters, parallel to the delivered chunks.
+        versions: &'a [u64],
+    },
+}
+
+impl<'a> LeafBinding<'a> {
+    /// The binding a dataset committed under `format` requires.
+    ///
+    /// # Errors
+    ///
+    /// [`MerkleError::MissingChunkVersions`] if `format` binds versions and
+    /// `versions` is `None`: defaulting them would accept a rolled-back chunk.
+    pub fn for_format(format: LeafFormat, versions: Option<&'a [u64]>) -> Result<Self, MerkleError> {
+        match format {
+            LeafFormat::Content => Ok(Self::Content),
+            LeafFormat::Bound => Ok(Self::Bound { versions: versions.ok_or(MerkleError::MissingChunkVersions)? }),
+        }
+    }
+}
+
 /// A proof that a set of delivered chunks is a complete, correct subset of
 /// a signed parent dataset (§"Verifiable Subset Extraction").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -918,6 +954,18 @@ pub(crate) fn compute_expected_chunk_indices(
     sel: &Selection,
     order: LeafOrder,
 ) -> Result<Vec<usize>, MerkleError> {
+    Ok(compute_expected_chunks(grid, sel, order)?.into_iter().map(|(leaf, _)| leaf).collect())
+}
+
+/// [`compute_expected_chunk_indices`], with each chunk's row-major linear
+/// index in the chunk grid alongside its leaf index under `order`: the leaf
+/// index places the chunk in the tree, the linear index is the `k` a
+/// [`LeafFormat::Bound`] leaf binds. Sorted and deduplicated by leaf index.
+pub(crate) fn compute_expected_chunks(
+    grid: &ChunkGridParams,
+    sel: &Selection,
+    order: LeafOrder,
+) -> Result<Vec<(usize, u64)>, MerkleError> {
     if let Some(rank) = sel.rank().filter(|&r| r != grid.dims.len()) {
         return Err(MerkleError::HyperslabOutOfBounds { idx: rank });
     }
@@ -929,13 +977,13 @@ pub(crate) fn compute_expected_chunk_indices(
     check_order_bit_budget(&n_per_dim, order)?;
     let coords = chunk_coords_for_selection(sel, &n_per_dim, &grid.chunk_shape);
 
-    let mut chunk_indices: Vec<usize> = coords
+    let mut chunks: Vec<(usize, u64)> = coords
         .iter()
-        .map(|c| coord_to_leaf_index(c, &n_per_dim, order) as usize)
+        .map(|c| (coord_to_leaf_index(c, &n_per_dim, order) as usize, row_major_index(c, &n_per_dim)))
         .collect();
-    chunk_indices.sort_unstable();
-    chunk_indices.dedup();
-    Ok(chunk_indices)
+    chunks.sort_unstable();
+    chunks.dedup_by_key(|&mut (leaf, _)| leaf);
+    Ok(chunks)
 }
 
 /// Extract a [`SubsetProof`] covering hyperslab `sel` from `tree`.
@@ -1164,6 +1212,10 @@ pub fn verify_subset(
 ///
 /// As [`verify_subset`]. A proof built under the other construction fails with
 /// [`MerkleError::CompanionTampered`], since the node it needs is absent.
+///
+/// Like [`verify_subset`], this recomputes [`LeafFormat::Content`] leaves; a
+/// dataset committed under [`LeafFormat::Bound`] is verified with
+/// [`verify_subset_leaves`].
 #[allow(clippy::too_many_arguments)]
 pub fn verify_subset_with(
     root: &[u8; HASH_SIZE],
@@ -1175,6 +1227,46 @@ pub fn verify_subset_with(
     sel: &Selection,
     order: LeafOrder,
     construction: ProofConstruction,
+) -> Result<bool, MerkleError> {
+    verify_subset_leaves(
+        root,
+        alg,
+        chunks,
+        proof,
+        expected_grid,
+        trusted_grid_hash,
+        sel,
+        order,
+        construction,
+        LeafBinding::Content,
+    )
+}
+
+/// [`verify_subset_with`] for a dataset under either [`LeafFormat`].
+///
+/// `leaves` must come from the dataset's signed `MerkleAttr::leaf_format`
+/// (see [`LeafBinding::for_format`]), never from the proof. Every check of
+/// [`verify_subset`] applies; the only difference is how each delivered chunk
+/// is hashed to its leaf. Under [`LeafBinding::Bound`] a chunk delivered at the
+/// wrong position, or with a version other than the committed one, fails the
+/// path to the root.
+///
+/// # Errors
+///
+/// As [`verify_subset`], and [`MerkleError::MissingChunkVersions`] if
+/// `leaves` binds versions but does not supply one per delivered chunk.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_subset_leaves(
+    root: &[u8; HASH_SIZE],
+    alg: HashAlg,
+    chunks: &[ChunkData<'_>],
+    proof: &SubsetProof,
+    expected_grid: &ChunkGridParams,
+    trusted_grid_hash: &[u8; HASH_SIZE],
+    sel: &Selection,
+    order: LeafOrder,
+    construction: ProofConstruction,
+    leaves: LeafBinding<'_>,
 ) -> Result<bool, MerkleError> {
     // Authenticate expected_grid's parameters against the caller's
     // cryptographically-anchored grid hash *before* trusting anything else
@@ -1214,9 +1306,16 @@ pub fn verify_subset_with(
     // from `expected_grid`/`sel` (trusted) rather than `proof.grid_params`
     // (untrusted) is what prevents a prover from presenting a proof for a
     // different — but internally self-consistent — region.
-    let expected_indices = compute_expected_chunk_indices(expected_grid, sel, order)?;
-    if proof.chunk_indices != expected_indices {
+    let expected = compute_expected_chunks(expected_grid, sel, order)?;
+    if proof.chunk_indices.len() != expected.len()
+        || proof.chunk_indices.iter().zip(&expected).any(|(&got, &(want, _))| got != want)
+    {
         return Err(MerkleError::SelectionMismatch);
+    }
+    if let LeafBinding::Bound { versions } = leaves
+        && versions.len() != chunks.len()
+    {
+        return Err(MerkleError::MissingChunkVersions);
     }
 
     // Recompute the coverage certificate over the delivered index set;
@@ -1236,7 +1335,12 @@ pub fn verify_subset_with(
     // payload is rejected without touching the witness set.
     let mut computed_leaves: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(chunks.len());
     for (i, (chunk, &leaf_idx)) in chunks.iter().zip(proof.chunk_indices.iter()).enumerate() {
-        let computed_leaf_hash = alg.hash_leaf(chunk.data);
+        let computed_leaf_hash = match leaves {
+            LeafBinding::Content => alg.hash_leaf(chunk.data),
+            // `expected[i]` is this chunk's (leaf, linear) pair: the lists
+            // were checked equal, in order, above.
+            LeafBinding::Bound { versions } => hash_chunk_bound(expected[i].1, chunk.data, versions[i], alg),
+        };
         if !constant_time_eq(&computed_leaf_hash, &proof.leaf_hashes[i]) {
             return Err(MerkleError::HashMismatch {
                 chunk_idx: leaf_idx,
@@ -3136,5 +3240,135 @@ mod tests {
                 vec![0]
             );
         }
+    }
+}
+
+/// Subset verification of datasets committed under [`LeafFormat::Bound`]:
+/// the leaf binds the chunk's row-major index `k` and version `v_k`, while
+/// the leaf *order* (row-major or a space-filling curve) places it in the tree.
+#[cfg(test)]
+mod bound_leaf_tests {
+    use super::*;
+
+    const ALG: HashAlg = HashAlg::Blake3;
+
+    /// A 4x4 grid of single-element chunks, committed with bound leaves under
+    /// `order`. Returns the tree, the grid, each chunk's bytes and version
+    /// indexed by row-major `k`, and the map from leaf index to `k`.
+    #[allow(clippy::type_complexity)]
+    fn bound_tree(order: LeafOrder) -> (MerkleTree, ChunkGridParams, Vec<Vec<u8>>, Vec<u64>, Vec<u64>) {
+        let grid = ChunkGridParams::new(vec![4, 4], vec![1, 1], 4, LayoutClass::Chunked, ALG);
+        let n_per_dim = grid.n_chunks_per_dim();
+        // Equal lengths, so only k and v_k tell chunks apart in the preimage.
+        let data: Vec<Vec<u8>> = (0..16u64).map(|k| format!("c{k:02}").into_bytes()).collect();
+        let versions: Vec<u64> = (0..16u64).map(|k| 1 + k % 3).collect();
+        let mut leaves = vec![[0u8; HASH_SIZE]; 16];
+        let mut leaf_to_k = vec![0u64; 16];
+        for k in 0..16u64 {
+            let coord = [k / 4, k % 4];
+            let leaf = leaf_index_for_coord(&coord, &n_per_dim, order) as usize;
+            leaves[leaf] = hash_chunk_bound(k, &data[k as usize], versions[k as usize], ALG);
+            leaf_to_k[leaf] = k;
+        }
+        (MerkleTree::from_leaf_hashes(&leaves, ALG), grid, data, versions, leaf_to_k)
+    }
+
+    fn sel() -> Selection {
+        Selection::slice(&[1..3, 1..3])
+    }
+
+    /// Edits the delivered chunks' (bytes, versions) before verification.
+    type Tamper = dyn Fn(&mut Vec<Vec<u8>>, &mut Vec<u64>);
+
+    /// Verify the delivered set, letting `tamper` edit each chunk's
+    /// (bytes, version) by delivery position before verification.
+    fn run(
+        order: LeafOrder,
+        construction: ProofConstruction,
+        binding: &dyn Fn(&[u64]) -> LeafBinding<'_>,
+        tamper: &Tamper,
+    ) -> Result<bool, MerkleError> {
+        let (tree, grid, data, versions, leaf_to_k) = bound_tree(order);
+        let proof = extract_subset_with(&tree, &grid, &sel(), order, construction).unwrap();
+        let mut bytes: Vec<Vec<u8>> =
+            proof.chunk_indices.iter().map(|&l| data[leaf_to_k[l] as usize].clone()).collect();
+        let mut vers: Vec<u64> = proof.chunk_indices.iter().map(|&l| versions[leaf_to_k[l] as usize]).collect();
+        tamper(&mut bytes, &mut vers);
+        let delivered: Vec<ChunkData<'_>> = proof
+            .chunk_indices
+            .iter()
+            .zip(&bytes)
+            .map(|(&index, b)| ChunkData { index, data: b })
+            .collect();
+        verify_subset_leaves(
+            tree.root(),
+            ALG,
+            &delivered,
+            &proof,
+            &grid,
+            &grid.grid_hash,
+            &sel(),
+            order,
+            construction,
+            binding(&vers),
+        )
+    }
+
+    const ORDERS: [LeafOrder; 2] = [LeafOrder::RowMajor, LeafOrder::Morton];
+    const CONSTRUCTIONS: [ProofConstruction; 2] = [ProofConstruction::NaiveDedup, ProofConstruction::CanonicalPruned];
+
+    fn bound(v: &[u64]) -> LeafBinding<'_> {
+        LeafBinding::Bound { versions: v }
+    }
+
+    #[test]
+    fn bound_subset_verifies_under_every_order_and_construction() {
+        for order in ORDERS {
+            for c in CONSTRUCTIONS {
+                assert!(run(order, c, &bound, &|_, _| {}).unwrap(), "{order:?} {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn content_binding_rejects_a_bound_dataset() {
+        // The pre-fix behaviour: recomputing H(0x00 || data) for a dataset
+        // committed with bound leaves matches no leaf.
+        for order in ORDERS {
+            let r = run(order, ProofConstruction::CanonicalPruned, &|_| LeafBinding::Content, &|_, _| {});
+            assert!(matches!(r, Err(MerkleError::HashMismatch { .. })), "{order:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn rolled_back_version_is_rejected() {
+        for order in ORDERS {
+            let r = run(order, ProofConstruction::CanonicalPruned, &bound, &|_, v| v[1] -= 1);
+            assert!(matches!(r, Err(MerkleError::HashMismatch { .. })), "{order:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn swapped_chunk_bytes_are_rejected() {
+        // Equal-length chunks given equal versions, so only the bound k (and
+        // the leaf position) distinguishes them.
+        for order in ORDERS {
+            let r = run(order, ProofConstruction::CanonicalPruned, &bound, &|b, v| {
+                b.swap(0, 3);
+                v[3] = v[0];
+            });
+            assert!(r.is_err(), "{order:?}: swapped chunks verified");
+        }
+    }
+
+    #[test]
+    fn missing_versions_are_an_error_not_a_default() {
+        fn short(v: &[u64]) -> LeafBinding<'_> {
+            LeafBinding::Bound { versions: &v[..v.len() - 1] }
+        }
+        let r = run(LeafOrder::Morton, ProofConstruction::CanonicalPruned, &short, &|_, _| {});
+        assert!(matches!(r, Err(MerkleError::MissingChunkVersions)), "{r:?}");
+        assert!(matches!(LeafBinding::for_format(LeafFormat::Bound, None), Err(MerkleError::MissingChunkVersions)));
+        assert!(matches!(LeafBinding::for_format(LeafFormat::Content, None), Ok(LeafBinding::Content)));
     }
 }

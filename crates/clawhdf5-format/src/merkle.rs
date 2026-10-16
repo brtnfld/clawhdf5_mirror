@@ -597,12 +597,13 @@ impl HashAlg {
     /// what prevent **boundary-shifting** once compression makes chunk lengths
     /// vary.
     ///
-    /// Callers hashing a chunk *of a dataset* on a verification path must use
-    /// the bound form; this method is correct only where there is no dataset
-    /// context to bind (hash benchmarks, core-tree unit tests). See the
-    /// `TODO(P2.4)` on `clawhdf5_filters::compute_leaf_hash` — `verify_chunk`
-    /// / `verify_dataset` still recompute this unbound form, so they cannot
-    /// yet verify a dataset written through the bound filter pipeline.
+    /// Callers hashing a chunk *of a dataset* on a verification path must
+    /// dispatch on the dataset's [`LeafFormat`]; this method is the
+    /// [`LeafFormat::Content`] case, and alone is correct only where there is
+    /// no dataset context to bind (hash benchmarks, core-tree unit tests).
+    /// `verify_chunk`/`verify_dataset` dispatch through
+    /// [`Dataset::leaf_hash_for`], and subset verification through
+    /// `subset_proof::LeafBinding`.
     #[inline]
     pub fn hash_leaf(&self, data: &[u8]) -> [u8; HASH_SIZE] {
         hash_chunk(data, *self)
