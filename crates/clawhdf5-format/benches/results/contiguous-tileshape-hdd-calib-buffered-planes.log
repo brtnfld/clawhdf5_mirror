@@ -1,0 +1,83 @@
+### 2026-10-16T17:12:06Z localhost.localdomain class=hdd dir=/home/brtnfld_2025/brtnfld/p28c-hdd
+### device: /dev/sda1 ext4 /home/brtnfld_2025
+### clawhdf5 14a8fa7+planes
+==> 1x250x1000/plane_mid
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 177 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.014s, after evict 1.543s, ratio 112.00x
+### cache eviction verified
+building tree for 1x250x1000...
+  built in 24.5s
+  1x250x1000/plane_mid: 18.5s for 1 trials
+    47s
+==> 1x250x1000/plane_fast
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.013s, after evict 1.531s, ratio 117.77x
+### cache eviction verified
+building tree for 1x250x1000...
+  built in 21.5s
+  1x250x1000/plane_fast: 23.3s for 1 trials
+    50s
+==> 4x64x1000/plane_mid
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.014s, after evict 1.504s, ratio 106.16x
+### cache eviction verified
+building tree for 4x64x1000...
+  built in 21.4s
+  4x64x1000/plane_mid: 5.9s for 1 trials
+    32s
+==> 4x64x1000/plane_fast
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.014s, after evict 1.518s, ratio 109.84x
+### cache eviction verified
+building tree for 4x64x1000...
+  built in 21.4s
+  4x64x1000/plane_fast: 46.2s for 1 trials
+    72s
+==> 16x16x1000/plane_mid
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.014s, after evict 1.515s, ratio 110.03x
+### cache eviction verified
+building tree for 16x16x1000...
+  built in 21.4s
+  16x16x1000/plane_mid: 5.9s for 1 trials
+    32s
+==> 16x16x1000/plane_fast
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 178 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.014s, after evict 1.564s, ratio 113.25x
+### cache eviction verified
+building tree for 16x16x1000...
+  built in 21.4s
+  16x16x1000/plane_fast: 51.9s for 1 trials
+    78s
+==> 64x64x64/plane_mid
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.013s, after evict 1.509s, ratio 114.53x
+### cache eviction verified
+building tree for 64x64x64...
+  built in 21.5s
+  64x64x64/plane_mid: 7.9s for 1 trials
+    34s
+==> 64x64x64/plane_fast
+reusing dataset at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.014s, after evict 1.524s, ratio 109.28x
+### cache eviction verified
+building tree for 64x64x64...
+  built in 21.5s
+  64x64x64/plane_fast: 47.9s for 1 trials
+    74s

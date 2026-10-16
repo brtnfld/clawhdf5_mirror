@@ -1,0 +1,88 @@
+### 2026-10-16T17:04:23Z localhost.localdomain class=nvme dir=/home/brtnfld/p28c-nvme
+### device: /dev/nvme0n1p4 ext4 /home
+### clawhdf5 14a8fa7+planes
+==> 1x250x1000/plane_mid
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8038 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.013s, after evict 0.034s, ratio 2.64x
+### cache eviction verified
+building tree for 1x250x1000...
+  built in 3.6s
+  1x250x1000/plane_mid: 20.6s for 30 trials
+    24s
+==> 1x250x1000/plane_fast
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8553 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.012s, after evict 0.033s, ratio 2.73x
+### cache eviction verified
+building tree for 1x250x1000...
+  built in 3.6s
+  1x250x1000/plane_fast: 48.5s for 30 trials
+    53s
+==> 4x64x1000/plane_mid
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8526 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.012s, after evict 0.033s, ratio 2.84x
+### cache eviction verified
+building tree for 4x64x1000...
+  built in 3.6s
+  4x64x1000/plane_mid: 8.1s for 30 trials
+    11s
+==> 4x64x1000/plane_fast
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8445 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.013s, after evict 0.033s, ratio 2.58x
+### cache eviction verified
+building tree for 4x64x1000...
+  built in 3.6s
+  4x64x1000/plane_fast: 61.5s for 30 trials
+    66s
+==> 16x16x1000/plane_mid
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8495 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.012s, after evict 0.035s, ratio 2.86x
+### cache eviction verified
+building tree for 16x16x1000...
+  built in 3.6s
+  16x16x1000/plane_mid: 4.4s for 30 trials
+    8s
+==> 16x16x1000/plane_fast
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8213 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.013s, after evict 0.034s, ratio 2.68x
+### cache eviction verified
+building tree for 16x16x1000...
+  built in 3.6s
+  16x16x1000/plane_fast: 62.0s for 30 trials
+    65s
+==> 64x64x64/plane_mid
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8323 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.012s, after evict 0.033s, ratio 2.76x
+### cache eviction verified
+building tree for 64x64x64...
+  built in 4.8s
+  64x64x64/plane_mid: 21.6s for 30 trials
+    27s
+==> 64x64x64/plane_fast
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8445 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.012s, after evict 0.033s, ratio 2.77x
+### cache eviction verified
+building tree for 64x64x64...
+  built in 4.7s
+  64x64x64/plane_fast: 37.3s for 30 trials
+    42s
+reusing dataset at /home/brtnfld/p28c-nvme/clawbench-contiguous-1000cubed.f32
+sequential read bandwidth: 8275 MB/s (buffered)
+class=nvme B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.011s, after evict 0.033s, ratio 2.99x
+### cache eviction verified
