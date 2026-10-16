@@ -77,6 +77,25 @@ fn selections() -> Vec<(&'static str, Selection)> {
     ]
 }
 
+/// The other two plane orientations, opt-in through `--selection` so that a
+/// default run measures exactly the three selections above. A plane across
+/// the middle axis touches one prefix-grid leaf per slowest index; a plane
+/// across the fastest axis has elements in every prefix-grid leaf, which is
+/// the prefix grid's worst case.
+fn extra_selections() -> Vec<(&'static str, Selection)> {
+    vec![
+        ("plane_mid", Selection::slice(&[0..1000, 100..101, 0..1000])),
+        ("plane_fast", Selection::slice(&[0..1000, 0..1000, 100..101])),
+    ]
+}
+
+/// `selections()`, plus the opt-in ones when `only_sel` names one of them.
+fn selections_for(only_sel: &str) -> Vec<(&'static str, Selection)> {
+    let mut v = selections();
+    v.extend(extra_selections().into_iter().filter(|(l, _)| *l == only_sel));
+    v
+}
+
 #[path = "common/storage_io.rs"]
 mod storage_io;
 use storage_io::*;
@@ -669,7 +688,7 @@ fn main() -> std::io::Result<()> {
                 LayoutClass::Contiguous,
                 HashAlg::Blake3,
             );
-            for (sel_label, sel) in selections() {
+            for (sel_label, sel) in selections_for(&only_sel) {
                 if !only_sel.is_empty() && only_sel != sel_label {
                     continue;
                 }
@@ -828,7 +847,7 @@ fn main() -> std::io::Result<()> {
             HashAlg::Blake3,
         );
 
-        for (sel_label, sel) in selections() {
+        for (sel_label, sel) in selections_for(&only_sel) {
             if !only_sel.is_empty() && only_sel != sel_label {
                 continue;
             }
