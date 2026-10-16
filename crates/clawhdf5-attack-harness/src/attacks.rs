@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 
 use clawhdf5_filters::{compute_leaf_hash, encrypt_chunk};
 use clawhdf5_format::merkle::{
-    Dataset, HashAlg, MerkleAttr, MerkleError, MerkleTree, SignedRootVerifier,
+    Dataset, HashAlg, LeafFormat, MerkleAttr, MerkleError, MerkleTree, SignedRootVerifier,
     VersionObservationStore, verify_chunk, verify_dataset, verify_root, verify_signed_root,
 };
 use clawhdf5_format::merkle_journal::{ProvenanceJournal, ProvenanceRecord};
@@ -46,7 +46,8 @@ use clawhdf5_format::merkle_recovery::{
 };
 use clawhdf5_format::selection::Selection;
 use clawhdf5_format::subset_proof::{
-    ChunkData, ChunkGridParams, LeafOrder, extract_subset, verify_subset,
+    ChunkData, ChunkGridParams, LeafBinding, LeafOrder, ProofConstruction, extract_subset,
+    extract_subset_with, verify_subset, verify_subset_leaves,
 };
 use clawhdf5_format::verification_grid::LayoutClass;
 
@@ -866,75 +867,120 @@ pub fn t4a_whole_file_rollback() -> AttackResult {
     }
 }
 
-/// T4b — selective per-chunk rollback: one chunk and its version counter are
-/// both restored to a prior, individually-valid state. This targets the
-/// version-counter binding into the leaf hash (`compute_leaf_hash`), not the
-/// dataset-level counter.
+/// T4b — selective per-chunk rollback: one chunk's ciphertext and its version
+/// counter are restored together to a prior, individually-valid state (it
+/// decrypts cleanly under its own nonce). Only the version bound into the leaf
+/// preimage can catch it: the committed leaf for that chunk binds the current
+/// version.
 ///
-/// **Documented limitation (harness-honesty red-team finding).** An earlier
-/// version of this attack asserted only `rolled_back_leaf != committed_leaf` —
-/// true for essentially any two distinct `(ciphertext, version)` inputs to any
-/// working hash function, regardless of whether any real detection mechanism
-/// exists. That assertion is a tautology, not a test of the system: it would
-/// pass identically even if `compute_leaf_hash` were never consulted by
-/// anything. The underlying fact is real and stays disclosed here —
-/// `compute_leaf_hash`'s version-bound formula is not yet wired into
-/// `clawhdf5-format`'s public `verify_chunk`/`verify_dataset` (see the
-/// `TODO(P2.4)` on `compute_leaf_hash` in
-/// `clawhdf5-filters/src/filter_pipeline.rs`) — but since no `verify_*` API
-/// actually checks this binding, a selective per-chunk rollback is genuinely
-/// undetected by anything in this workspace today, and this is now reported
-/// as such rather than credited via a check that can't fail.
+/// The dataset is committed the way the filter pipeline commits it -- leaves
+/// from `compute_leaf_hash(k, ciphertext, v_k)`, attribute recording
+/// `LeafFormat::Bound` -- and the rolled-back state goes through all three
+/// real verifiers: `verify_chunk` on the chunk, `verify_dataset`, and subset
+/// verification of a selection containing it (`verify_subset_leaves` with
+/// `LeafBinding::Bound`). It counts as detected only if every one of them
+/// rejects the rollback **and** accepts the untampered state, so a verifier
+/// that rejected everything could not score a detection.
+///
+/// History: this attack first reported detected=yes from a hash-inequality
+/// tautology, then -- honestly -- undetected while no verify_* API consulted
+/// the bound preimage (P2.4 red-team report). verify_chunk/verify_dataset
+/// gained it through `Dataset::leaf_hash_for`, and subset verification through
+/// `LeafBinding`.
 pub fn t4b_selective_chunk_rollback() -> AttackResult {
+    const N: u64 = 4;
+    const TARGET: u64 = 2;
     let dek = clawhdf5_filters::mock_dek();
+    let plain = |k: u64, v: u64| format!("chunk {k} at version {v}").into_bytes();
 
-    // Chunk 2 written at version 1, then overwritten at version 2.
-    let old_plaintext = b"pre-rollback state";
-    let new_plaintext = b"post-rollback state, committed";
-    let old_ciphertext = encrypt_chunk(&dek, 2, 1, old_plaintext).unwrap();
-    let new_ciphertext = encrypt_chunk(&dek, 2, 2, new_plaintext).unwrap();
-
-    // The committed tree's leaf binds (chunk_idx, ciphertext, version) for
-    // the CURRENT (version-2) state. Kept only so the CSV/log can show what a
-    // real verifier's committed value would have been; it is NOT compared
-    // against anything a caller would treat as a pass/fail signal below.
-    let _committed_leaf = compute_leaf_hash(2, &new_ciphertext, 2);
-
-    let start_time = Instant::now();
-    // Raw storage-level attack: roll chunk 2's on-disk ciphertext back to its
-    // version-1 bytes, together with its version counter (both mutually
-    // consistent, decrypt fine under the version-1 nonce — this isn't
-    // garbage data, it's a stale-but-valid prior state).
-    let _rolled_back_leaf = compute_leaf_hash(2, &old_ciphertext, 1);
-    let latency = start_time.elapsed();
-
-    // Sanity: the rolled-back ciphertext really does decrypt under its own
-    // (chunk_idx, version) — this is a *valid old state*, not corruption.
+    // Current state: every chunk at version 2. The target's version-1 state
+    // is what the attacker restores.
+    let versions = vec![2u64; N as usize];
+    let current: Vec<Vec<u8>> = (0..N).map(|k| encrypt_chunk(&dek, k, 2, &plain(k, 2)).unwrap()).collect();
+    let old_ciphertext = encrypt_chunk(&dek, TARGET, 1, &plain(TARGET, 1)).unwrap();
+    // A valid old state, not corruption.
     debug_assert_eq!(
-        clawhdf5_filters::decrypt_chunk(&dek, 2, 1, &old_ciphertext).unwrap(),
-        old_plaintext
+        clawhdf5_filters::decrypt_chunk(&dek, TARGET, 1, &old_ciphertext).unwrap(),
+        plain(TARGET, 1)
     );
 
-    // No verify_* API in this workspace checks compute_leaf_hash's
-    // version binding today (see the doc comment above), so there is no real
-    // mechanism to route this attack through: genuinely undetected.
+    // Commit as the filter pipeline does: bound leaves, Bound recorded.
+    let leaves: Vec<[u8; 32]> =
+        (0..N).map(|k| compute_leaf_hash(k, &current[k as usize], versions[k as usize])).collect();
+    let tree = MerkleTree::from_leaf_hashes(&leaves, HashAlg::Blake3);
+    let mut nodes = Vec::with_capacity(tree.nodes().len() * 32);
+    for n in tree.nodes() {
+        nodes.extend_from_slice(n);
+    }
+    let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash(&nodes)).with_leaf_format(LeafFormat::Bound);
+    let grid = ChunkGridParams::new(vec![N], vec![1], 1, LayoutClass::Chunked, HashAlg::Blake3);
+    let sel = Selection::slice(&[1..N]); // chunks 1..N-1, containing TARGET
+    let construction = ProofConstruction::CanonicalPruned;
+    let proof = extract_subset_with(&tree, &grid, &sel, LeafOrder::RowMajor, construction).unwrap();
+
+    // Each verifier's verdict on a (chunks, versions) state: true = accepted.
+    let verdicts = |chunks: &[Vec<u8>], vers: &[u64]| -> [bool; 3] {
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let d = Dataset::from_owned(attr.clone(), nodes.clone(), refs).with_versions(vers.to_vec());
+        let chunk_ok = matches!(verify_chunk(&d, TARGET as usize), Ok(true));
+        let dataset_ok = matches!(verify_dataset(&d), Ok(true));
+        let delivered: Vec<ChunkData<'_>> =
+            proof.chunk_indices.iter().map(|&i| ChunkData { index: i, data: &chunks[i] }).collect();
+        let delivered_versions: Vec<u64> = proof.chunk_indices.iter().map(|&i| vers[i]).collect();
+        let subset_ok = matches!(
+            verify_subset_leaves(
+                tree.root(),
+                HashAlg::Blake3,
+                &delivered,
+                &proof,
+                &grid,
+                &grid.grid_hash,
+                &sel,
+                LeafOrder::RowMajor,
+                construction,
+                LeafBinding::Bound { versions: &delivered_versions },
+            ),
+            Ok(true)
+        );
+        [chunk_ok, dataset_ok, subset_ok]
+    };
+
+    let honest = verdicts(&current, &versions);
+
+    // Raw storage-level attack: chunk TARGET's ciphertext and version counter
+    // rolled back together.
+    let mut rolled = current.clone();
+    rolled[TARGET as usize] = old_ciphertext;
+    let mut rolled_versions = versions.clone();
+    rolled_versions[TARGET as usize] = 1;
+
+    let start_time = Instant::now();
+    let attacked = verdicts(&rolled, &rolled_versions);
+    let latency = start_time.elapsed();
+
+    let accepts_honest = honest.iter().all(|&ok| ok);
+    let rejects_all = attacked.iter().all(|&ok| !ok);
     AttackResult {
         threat_class: "T4",
         attack_id: "T4b",
         dataset: "n/a",
-        detected: false,
-        verifier_fn: "n/a (compute_leaf_hash not wired into any verify_* API)",
+        detected: accepts_honest && rejects_all,
+        verifier_fn: "verify_chunk + verify_dataset + verify_subset_leaves (LeafFormat::Bound)",
         latency,
-        root_cause: Some(
-            "compute_leaf_hash's version-bound formula (binding chunk_idx, ciphertext, and \
-             version into the leaf hash) is not consulted by clawhdf5-format's public \
-             verify_chunk/verify_dataset -- see the TODO(P2.4) on compute_leaf_hash in \
-             clawhdf5-filters/src/filter_pipeline.rs. A selective per-chunk rollback (restoring \
-             one chunk's ciphertext and version counter together to a prior, individually-valid \
-             state) is therefore genuinely undetected by any real verifier in this workspace \
-             today; a prior version of this attack incorrectly reported detected=yes based on a \
-             tautological hash-inequality check that didn't exercise any real mechanism.",
-        ),
+        root_cause: if !accepts_honest {
+            Some(
+                "a verifier rejected the untampered bound-leaf dataset, so rejecting the rollback \
+                 proves nothing: the bound preimage (compute_leaf_hash) and the verifier's \
+                 recomputation (hash_chunk_bound) disagree on that path.",
+            )
+        } else if !rejects_all {
+            Some(
+                "a verifier accepted the rolled-back chunk: the version bound into the leaf \
+                 preimage is not being checked on that path.",
+            )
+        } else {
+            None
+        },
     }
 }
 

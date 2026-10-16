@@ -1,12 +1,12 @@
 control_id,dataset,verifier_fn,trials,false_positives,latency_ms
 C1,NOAA-GOES18 (synthetic),verify_root,1,0,0.0006
 C2,NOAA-GOES18 (synthetic),verify_dataset,1,0,0.0149
-C3,NOAA-GOES18 (synthetic),verify_chunk,16,0,0.0240
-C4,NOAA-GOES18 (synthetic),verify_subset,1,0,0.0254
+C3,NOAA-GOES18 (synthetic),verify_chunk,16,0,0.0243
+C4,NOAA-GOES18 (synthetic),verify_subset,1,0,0.0249
 C5,NOAA-GOES18 (synthetic),verify_subset,1,0,0.0126
 C1,EQSIM (synthetic),verify_root,1,0,0.0002
-C2,EQSIM (synthetic),verify_dataset,1,0,0.0172
-C3,EQSIM (synthetic),verify_chunk,4,0,0.0180
-C4,EQSIM (synthetic),verify_subset,1,0,0.0185
+C2,EQSIM (synthetic),verify_dataset,1,0,0.0173
+C3,EQSIM (synthetic),verify_chunk,4,0,0.0182
+C4,EQSIM (synthetic),verify_subset,1,0,0.0186
 C5,EQSIM (synthetic),verify_subset,1,0,0.0094
-C6,n/a,verify_signed_root,1,0,0.1266
+C6,n/a,verify_signed_root,1,0,0.1252
