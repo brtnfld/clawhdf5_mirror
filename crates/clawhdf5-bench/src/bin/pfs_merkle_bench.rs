@@ -361,6 +361,7 @@ mod pfs {
         budget: u64,
         alg: HashAlg,
         hash: bool,
+        synth: bool,
     ) -> std::io::Result<(Vec<H>, StreamStats)> {
         let batches = leaf_batches(lay, leaves.clone(), budget);
         let spans: Vec<Range<u64>> = batches
@@ -368,7 +369,7 @@ mod pfs {
             .map(|b| lay.leaf_range(b.start).start..lay.leaf_range(b.end - 1).end)
             .collect();
         let mut out: Vec<H> = Vec::with_capacity((leaves.end - leaves.start) as usize);
-        let st = stream_spans(file, &spans, |idx, bytes| {
+        let mut consume = |idx: usize, bytes: &[u8]| {
             if !hash {
                 return;
             }
@@ -383,8 +384,51 @@ mod pfs {
             let mut part: Vec<H> = Vec::new();
             slices.par_iter().map(|s| alg.hash_leaf(s)).collect_into_vec(&mut part);
             out.extend_from_slice(&part);
-        })?;
+        };
+        if synth {
+            // Regenerate what `run_gen` wrote instead of reading it, so the
+            // companion for a region can be built without the servers ever
+            // seeing that region (see `synth_span`).
+            let t = Instant::now();
+            let mut bytes = 0u64;
+            for (idx, span) in spans.iter().enumerate() {
+                let buf = synth_span(span.clone());
+                bytes += buf.len() as u64;
+                consume(idx, &buf);
+            }
+            let st = StreamStats { io_wait: 0.0, work: t.elapsed().as_secs_f64(), bytes };
+            return Ok((out, st));
+        }
+        let st = stream_spans(file, &spans, &mut consume)?;
         Ok((out, st))
+    }
+
+    /// `run_gen`'s block size: every 64 MiB block starting at a multiple of it
+    /// is the `XorShift` stream seeded with the block's offset.
+    const GEN_BLOCK: u64 = 64 << 20;
+
+    /// The bytes `run_gen` wrote at `span`, regenerated in memory.
+    ///
+    /// `run_gen` gives rank `r` the range starting at `r * per`, `per` being
+    /// the file size over the rank count rounded up to a MiB, and seeds each
+    /// 64 MiB block by its offset. With a power-of-two rank count, as every
+    /// generation in our campaigns used, `per` is a multiple of `GEN_BLOCK`,
+    /// so block boundaries fall on multiples of it and the content is a
+    /// function of the offset alone. A file generated otherwise would give a
+    /// companion that matches nothing, and `verify` would report every
+    /// selection as a failure rather than pass silently.
+    fn synth_span(span: Range<u64>) -> Vec<u8> {
+        let mut out = Vec::with_capacity((span.end - span.start) as usize);
+        let mut buf = vec![0u8; GEN_BLOCK as usize];
+        let mut blk = span.start / GEN_BLOCK * GEN_BLOCK;
+        while blk < span.end {
+            XorShift::new(blk ^ 0x5eed).fill(&mut buf);
+            let lo = (span.start.max(blk) - blk) as usize;
+            let hi = (span.end.min(blk + GEN_BLOCK) - blk) as usize;
+            out.extend_from_slice(&buf[lo..hi]);
+            blk += GEN_BLOCK;
+        }
+        out
     }
 
     // ===== tree pieces =====
@@ -561,6 +605,85 @@ mod pfs {
                 let v = self.next().to_le_bytes();
                 c.copy_from_slice(&v[..c.len()]);
             }
+        }
+    }
+
+    // ===== root signature (verify) =====
+
+    /// The root-signature material a reader receives with a dataset: the
+    /// canonical payload binding the root, the hybrid Ed25519 + ML-DSA-65
+    /// signature, and both public keys, concatenated. Rank 0 signs and
+    /// broadcasts it untimed; every rank then verifies it inside the timed
+    /// region, as a reader opening the dataset would before trusting any
+    /// proof. Built without `pfs-sign`, the blob is empty and the check is
+    /// skipped (reported as NaN).
+    #[cfg(feature = "pfs-sign")]
+    mod rootsig {
+        use clawhdf5_sign::mldsa::{MlDsaSigningKey, MlDsaVerifyingKey};
+        use clawhdf5_sign::{
+            CANONICAL_PAYLOAD_SIZE, HashAlg, HybridSignature, LeafFormat, SigningKey, VerifyingKey,
+            canonical_payload, sign_root, verify_sig,
+        };
+        const ED_PUB: usize = 32;
+        const ML_PUB: usize = 1952;
+        pub const LEN: usize = CANONICAL_PAYLOAD_SIZE + HybridSignature::SERIALIZED_SIZE + ED_PUB + ML_PUB;
+
+        pub fn sign(root: &[u8; 32], alg: HashAlg) -> Vec<u8> {
+            let ed = SigningKey::generate();
+            let ml = MlDsaSigningKey::generate();
+            let payload = canonical_payload(root, &[0u8; 32], 1, 0, alg, LeafFormat::Content, &[0u8; 32]);
+            let sig = sign_root(&payload, &ed, &ml).expect("hybrid signing");
+            let mut blob = Vec::with_capacity(LEN);
+            blob.extend_from_slice(&payload);
+            blob.extend_from_slice(&sig.to_bytes());
+            blob.extend_from_slice(&ed.verifying_key().to_bytes());
+            blob.extend_from_slice(ml.verifying_key().to_bytes());
+            assert_eq!(blob.len(), LEN);
+            blob
+        }
+
+        /// Parse the blob, verify the hybrid signature, and check that the
+        /// signed payload carries `root`.
+        pub fn verify(blob: &[u8], root: &[u8; 32]) -> bool {
+            let (payload, rest) = blob.split_at(CANONICAL_PAYLOAD_SIZE);
+            let (sig, rest) = rest.split_at(HybridSignature::SERIALIZED_SIZE);
+            let (ed, ml) = rest.split_at(ED_PUB);
+            let (Ok(sig), Ok(ed), Ok(ml)) = (
+                HybridSignature::from_bytes(sig),
+                VerifyingKey::from_bytes(ed.try_into().expect("32-byte key")),
+                MlDsaVerifyingKey::from_bytes(ml),
+            ) else {
+                return false;
+            };
+            verify_sig(payload, &sig, &ed, &ml).is_ok() && &payload[..32] == root
+        }
+    }
+
+    /// Rank 0 signs `root`; every rank returns the broadcast blob.
+    fn root_signature(ctx: &Ctx, root: &H, alg: HashAlg) -> Vec<u8> {
+        #[cfg(feature = "pfs-sign")]
+        {
+            let mut blob = if ctx.root() { rootsig::sign(root, alg) } else { vec![0u8; rootsig::LEN] };
+            ctx.world.process_at_rank(0).broadcast_into(&mut blob[..]);
+            blob
+        }
+        #[cfg(not(feature = "pfs-sign"))]
+        {
+            let _ = (ctx, root, alg);
+            Vec::new()
+        }
+    }
+
+    /// Verify the blob against `root`; `None` when built without `pfs-sign`.
+    fn check_root_signature(blob: &[u8], root: &H) -> Option<bool> {
+        #[cfg(feature = "pfs-sign")]
+        {
+            Some(rootsig::verify(blob, root))
+        }
+        #[cfg(not(feature = "pfs-sign"))]
+        {
+            let _ = (blob, root);
+            None
         }
     }
 
@@ -832,6 +955,14 @@ mod pfs {
         let (offset0, step) = region(args);
         let mut prov = if ctx.root() { provenance(data, &companion, o_direct) } else { provenance_stub(o_direct) };
         let warm_server = args.has("--warm-server");
+        // --synthesize: build the companion from regenerated data (see
+        // `synth_span`) instead of reading it, so a later `verify` on the same
+        // region reads bytes the servers have never served. Timings of such a
+        // build measure hashing only and are recorded as server_cache=synth.
+        let synth = args.has("--synthesize");
+        if synth && mode != "build" {
+            die("--synthesize applies to build only");
+        }
         if ctx.root() {
             print_header_comments(ctx, args, Some(&lay), &prov);
             println!(
@@ -868,6 +999,9 @@ mod pfs {
             if step > 0 {
                 prov.server_cache = "fresh";
             }
+            if synth {
+                prov.server_cache = "synth";
+            }
             let file = open_maybe_direct(data, o_direct)?;
             let comp = if matches!(strategy.as_str(), "gather" | "distributed") {
                 Some(OpenOptions::new().write(true).open(&companion)?)
@@ -896,7 +1030,7 @@ mod pfs {
                     (Vec::new(), StreamStats { io_wait: 0.0, work: 0.0, bytes: 0 })
                 }
             } else {
-                hash_leaves(&file, &lay, lay.block(ctx.rank), budget, alg, mode == "build")?
+                hash_leaves(&file, &lay, lay.block(ctx.rank), budget, alg, mode == "build", synth)?
             };
             let ta = t0.elapsed().as_secs_f64();
             ctx.barrier();
@@ -1113,6 +1247,9 @@ mod pfs {
             die("--select must be random or local");
         }
         let cache_top = args.num("--cache-top", "0") as u32;
+        // --seed varies the random selections between conditions that share a
+        // region, so one condition does not reread what another just read.
+        let seed = args.num("--seed", "0");
         let lay = layout_from_args(ctx, args, data)?;
         let (offset0, step) = region(args);
         let _ = offset0;
@@ -1130,7 +1267,7 @@ mod pfs {
             println!(
                 "{PREFIX_COLS},wall_ms,ops,ops_per_s,verified_mbps,lat_p50_ms,lat_p95_ms,lat_p99_ms,\
                  data_read_mean_ms,hash_mean_ms,proof_mean_ms,proof_reads_per_op,cache_top,k_leaves,\
-                 select,failures"
+                 select,failures,sig_verify_mean_ms"
             );
         }
         let strategy = format!("{select}-k{k}-top{cache_top}");
@@ -1143,6 +1280,11 @@ mod pfs {
             } else {
                 "warm"
             };
+            // --fresh-region: the caller guarantees the region was never read
+            // (its companion synthesized, see `synth_span`); label it so.
+            if args.has("--fresh-region") {
+                prov.server_cache = "fresh";
+            }
             let file = open_maybe_direct(data, o_direct)?;
             let comp = File::open(&companion)?;
             let mut root = [0u8; 32];
@@ -1150,12 +1292,17 @@ mod pfs {
                 comp.read_exact_at(&mut root, 0)?;
             }
             ctx.world.process_at_rank(0).broadcast_into(&mut root[..]);
+            let sig_blob = root_signature(ctx, &root, alg);
             let max_span = (k * lay.leaf_bytes_max()) as usize + 2 * ALIGN;
             let mut buf = AlignedBuf::new(max_span);
-            let mut rng = XorShift::new((t as u64) << 32 | ctx.rank);
+            let mut rng = XorShift::new(((t as u64) << 32 | ctx.rank) ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
             ctx.barrier();
             let t0 = Instant::now();
+            // A reader authenticates the root once, before trusting any proof.
+            let ts = Instant::now();
+            let sig_ok = check_root_signature(&sig_blob, &root);
+            let sig_ms = if sig_ok.is_some() { ts.elapsed().as_secs_f64() * 1e3 } else { f64::NAN };
             // Levels above `cache_top` are fetched once per rank, as a client
             // that keeps the top of the tree resident would. They sit
             // contiguously at the head of the companion.
@@ -1181,7 +1328,7 @@ mod pfs {
             let mut reads = 0u64;
             let mut done = 0u64;
             let mut useful = 0u64;
-            let mut failures = 0u64;
+            let mut failures = u64::from(sig_ok == Some(false));
             for _ in 0..ops {
                 let a = match select.as_str() {
                     "local" => {
@@ -1253,6 +1400,7 @@ mod pfs {
             let rd_all = ctx.gather_f64(if done > 0 { rd / d * 1e3 } else { f64::NAN });
             let hs_all = ctx.gather_f64(if done > 0 { hs / d * 1e3 } else { f64::NAN });
             let pf_all = ctx.gather_f64(if done > 0 { pf / d * 1e3 } else { f64::NAN });
+            let sig_all = ctx.gather_f64(sig_ms);
             let done = ctx.sum_u64(done);
             let useful = ctx.sum_u64(useful);
             let reads = ctx.sum_u64(reads);
@@ -1260,7 +1408,7 @@ mod pfs {
             let fin = |v: &[f64]| mean(&v.iter().copied().filter(|x| x.is_finite()).collect::<Vec<_>>());
             if ctx.root() && t >= warm {
                 println!(
-                    "{},{:.1},{done},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{cache_top},{k},{select},{failures}",
+                    "{},{:.1},{done},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{cache_top},{k},{select},{failures},{:.3}",
                     prefix(ctx, "verify", &strategy, alg_name(alg), &lay, &prov, t - warm),
                     wall * 1e3,
                     done as f64 / wall,
@@ -1271,7 +1419,8 @@ mod pfs {
                     fin(&rd_all),
                     fin(&hs_all),
                     fin(&pf_all),
-                    reads as f64 / done.max(1) as f64
+                    reads as f64 / done.max(1) as f64,
+                    fin(&sig_all)
                 );
             }
             if failures > 0 && ctx.root() {
