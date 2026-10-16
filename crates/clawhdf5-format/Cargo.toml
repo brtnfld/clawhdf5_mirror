@@ -99,6 +99,10 @@ harness = false
 required-features = ["merkle", "blake3"]
 
 [[example]]
+name = "strided_interface"
+required-features = ["merkle", "blake3"]
+
+[[example]]
 name = "gen_merkle_vectors"
 required-features = ["merkle"]
 
