@@ -229,8 +229,14 @@ mod pfs {
             }
         }
 
+        /// Length of the largest leaf (leaf 0: fixed leaves are equal but for a
+        /// shorter last one, and prefix-grid cells are equal). A length, not
+        /// an offset: `leaf_range` is absolute, so with a nonzero `base`
+        /// (--offset) its `end` is terabytes into the file, and buffers sized
+        /// from it asked for k times that and aborted.
         fn leaf_bytes_max(&self) -> u64 {
-            self.leaf_range(0).end
+            let r = self.leaf_range(0);
+            r.end - r.start
         }
 
         /// Real (non-padding) leaves owned by rank `r`; empty when the
