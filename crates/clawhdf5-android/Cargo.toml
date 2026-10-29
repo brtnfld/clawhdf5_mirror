@@ -9,4 +9,12 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-clawhdf5-agent = { path = "../clawhdf5-agent", default-features = false }
+# `integrity` is the agent's content Merkle root (write it, verify it on
+# read). The bridge used to build with every default feature off, so Android
+# stores carried no root and were never verified, and a strict open could
+# never succeed (2026-10 red-team finding). The heavier defaults (hnsw, half)
+# stay off.
+clawhdf5-agent = { path = "../clawhdf5-agent", default-features = false, features = ["integrity"] }
+
+[dev-dependencies]
+tempfile = "3"
