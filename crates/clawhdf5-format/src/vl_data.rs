@@ -5,10 +5,69 @@
 //! `sequence_length(4 LE) + collection_address(offset_size LE) + object_index(4 LE)`.
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, btree_map::Entry},
+    string::String,
+    vec::Vec,
+};
+#[cfg(feature = "std")]
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use crate::error::FormatError;
 use crate::global_heap::GlobalHeapCollection;
+
+/// Global heap collections parsed during one VL read, indexed by object id.
+///
+/// The readers used to re-parse the whole collection for every element and
+/// then find the object by a linear scan. N references into one S-byte
+/// collection therefore cost N x S, and both are attacker-sized: a file of F
+/// bytes holds about F/16 references and a collection of about F bytes, so a
+/// 100 MB file meant hours of CPU on read (2026-10 red-team finding; ~40 us
+/// per reference into a 1 MiB collection measured before the fix). Honest
+/// VL datasets, whose strings normally share one collection, paid the same
+/// quadratic cost. Each collection is now parsed once per call and looked up
+/// through a map. The first object with a given index wins, matching the old
+/// `GlobalHeapCollection::get_object` scan.
+struct CollectionCache {
+    parsed: BTreeMap<u64, (GlobalHeapCollection, BTreeMap<u16, usize>)>,
+}
+
+impl CollectionCache {
+    fn new() -> Self {
+        Self {
+            parsed: BTreeMap::new(),
+        }
+    }
+
+    fn object(
+        &mut self,
+        file_data: &[u8],
+        vl: &VlElement,
+        length_size: u8,
+    ) -> Result<&[u8], FormatError> {
+        let (coll, index) = match self.parsed.entry(vl.collection_address) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let coll = GlobalHeapCollection::parse(
+                    file_data,
+                    vl.collection_address as usize,
+                    length_size,
+                )?;
+                let mut index = BTreeMap::new();
+                for (pos, obj) in coll.objects.iter().enumerate() {
+                    index.entry(obj.index).or_insert(pos);
+                }
+                e.insert((coll, index))
+            }
+        };
+        let not_found = FormatError::GlobalHeapObjectNotFound {
+            collection_address: vl.collection_address,
+            index: vl.object_index as u16,
+        };
+        let pos = *index.get(&(vl.object_index as u16)).ok_or(not_found)?;
+        Ok(&coll.objects[pos].data)
+    }
+}
 
 /// A parsed variable-length element reference (global heap ID).
 #[derive(Debug, Clone)]
@@ -119,6 +178,7 @@ pub fn read_vl_strings(
 ) -> Result<Vec<String>, FormatError> {
     let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
     let mut result = Vec::with_capacity(refs.len());
+    let mut cache = CollectionCache::new();
 
     for vl in &refs {
         if vl.length == 0 && is_undefined_address(vl.collection_address, offset_size) {
@@ -130,18 +190,11 @@ pub fn read_vl_strings(
             continue;
         }
 
-        let coll =
-            GlobalHeapCollection::parse(file_data, vl.collection_address as usize, length_size)?;
-        let obj = coll.get_object(vl.object_index as u16).ok_or(
-            FormatError::GlobalHeapObjectNotFound {
-                collection_address: vl.collection_address,
-                index: vl.object_index as u16,
-            },
-        )?;
+        let data = cache.object(file_data, vl, length_size)?;
 
         // The object data is the raw string bytes
-        let len = (vl.length as usize).min(obj.data.len());
-        let s = String::from_utf8_lossy(&obj.data[..len]).into_owned();
+        let len = (vl.length as usize).min(data.len());
+        let s = String::from_utf8_lossy(&data[..len]).into_owned();
         result.push(s);
     }
 
@@ -158,6 +211,7 @@ pub fn read_vl_bytes(
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
     let mut result = Vec::with_capacity(refs.len());
+    let mut cache = CollectionCache::new();
 
     for vl in &refs {
         if vl.length == 0
@@ -168,17 +222,9 @@ pub fn read_vl_bytes(
             continue;
         }
 
-        let coll =
-            GlobalHeapCollection::parse(file_data, vl.collection_address as usize, length_size)?;
-        let obj = coll.get_object(vl.object_index as u16).ok_or(
-            FormatError::GlobalHeapObjectNotFound {
-                collection_address: vl.collection_address,
-                index: vl.object_index as u16,
-            },
-        )?;
-
-        let len = (vl.length as usize).min(obj.data.len());
-        result.push(obj.data[..len].to_vec());
+        let data = cache.object(file_data, vl, length_size)?;
+        let len = (vl.length as usize).min(data.len());
+        result.push(data[..len].to_vec());
     }
 
     Ok(result)
