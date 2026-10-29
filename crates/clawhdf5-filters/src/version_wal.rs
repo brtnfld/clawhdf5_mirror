@@ -518,10 +518,58 @@ impl<W: Read + Write + Seek> VersionWal<W> {
         Ok(uncommitted)
     }
 
-    /// Clear all committed records from the WAL.
+    /// The highest version ever journaled for each chunk, over **every**
+    /// record — pending and committed.
     ///
-    /// This compacts the WAL by removing all committed records and keeping
-    /// only pending ones. Should be called periodically to prevent WAL growth.
+    /// This, not [`recover`](Self::recover)'s pending-only list, is what a
+    /// reopened writer must seed its version store from. A committed record's
+    /// version was used to derive a nonce exactly as a pending one's was, so
+    /// forgetting it lets the next write to that chunk re-derive the same
+    /// `(DEK, chunk_idx, version)` nonce: keystream reuse on two different
+    /// plaintexts (2026-10 red-team finding; see
+    /// [`EncryptedChunkWriter::recover`](crate::chacha20_filter::EncryptedChunkWriter::recover)).
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::CorruptRecord`] if a non-empty slot fails its CRC check —
+    /// fail-closed for the same reason as [`recover`](Self::recover): the
+    /// unreadable slot may hold the very high-water mark that matters.
+    pub fn high_water_marks(&mut self) -> Result<HashMap<u64, u64>, WalError> {
+        let mut marks: HashMap<u64, u64> = HashMap::new();
+        for i in 0..self.record_count {
+            let offset = WAL_HEADER_SIZE + i * WAL_RECORD_SIZE;
+            self.writer.seek(SeekFrom::Start(offset as u64))?;
+            let mut buf = [0u8; WAL_RECORD_SIZE];
+            if self.writer.read_exact(&mut buf).is_err() {
+                break;
+            }
+            if buf == [0u8; WAL_RECORD_SIZE] {
+                continue;
+            }
+            let record =
+                WalRecord::from_bytes(&buf).map_err(|_| WalError::CorruptRecord { index: i })?;
+            if record.status == WalRecordStatus::Empty {
+                continue;
+            }
+            let entry = marks.entry(record.chunk_idx).or_insert(0);
+            if record.version > *entry {
+                *entry = record.version;
+            }
+        }
+        Ok(marks)
+    }
+
+    /// Compact the WAL: keep every pending record and, for each chunk, only
+    /// its highest committed record.
+    ///
+    /// Compaction used to drop committed records entirely. Those records are
+    /// the only durable copy of a chunk's version high-water mark in this
+    /// prototype (the design keeps per-chunk versions in the companion dataset;
+    /// see the C integration spec's known gap on version-counter storage), so
+    /// dropping them reset every committed chunk's counter for the next
+    /// session and made the next write reuse a nonce (2026-10 red-team
+    /// finding). Keeping one record per written chunk bounds the WAL by the
+    /// number of chunks ever written rather than by the number of writes.
     ///
     /// # Limitation
     ///
@@ -535,6 +583,7 @@ impl<W: Read + Write + Seek> VersionWal<W> {
     pub fn compact(&mut self) -> Result<(), WalError> {
         let old_count = self.record_count;
         let mut pending_records = Vec::new();
+        let mut latest_committed: HashMap<u64, WalRecord> = HashMap::new();
 
         // Collect all pending records. Zeroed slots are freed space from a
         // previous compaction; any other CRC-invalid slot means the log is
@@ -555,12 +604,27 @@ impl<W: Read + Write + Seek> VersionWal<W> {
 
             let record =
                 WalRecord::from_bytes(&buf).map_err(|_| WalError::CorruptRecord { index: i })?;
-            if record.status == WalRecordStatus::Pending {
-                pending_records.push(record);
+            match record.status {
+                WalRecordStatus::Pending => pending_records.push(record),
+                WalRecordStatus::Committed => {
+                    let keep = latest_committed
+                        .get(&record.chunk_idx)
+                        .is_none_or(|kept: &WalRecord| record.version > kept.version);
+                    if keep {
+                        latest_committed.insert(record.chunk_idx, record);
+                    }
+                }
+                WalRecordStatus::Empty => {}
             }
         }
+        // Deterministic order: committed high-water marks by chunk index,
+        // then the pending records in their original order.
+        let mut committed: Vec<WalRecord> = latest_committed.into_values().collect();
+        committed.sort_by_key(|r| r.chunk_idx);
+        committed.extend(pending_records);
+        let pending_records = committed;
 
-        // Rewrite WAL with only pending records at the front.
+        // Rewrite WAL with the retained records at the front.
         self.writer.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
         for record in &pending_records {
             self.writer.write_all(&record.to_bytes())?;

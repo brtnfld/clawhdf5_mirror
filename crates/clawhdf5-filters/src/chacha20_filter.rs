@@ -605,7 +605,18 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
     ///
     /// Either way the `(DEK, chunk_idx, version)` nonce can never be reused — closing the
     /// crash-window nonce-reuse hole that would otherwise exist if the store started at 0
-    /// while the WAL still held a pending version.
+    /// while the WAL still held a pending version, and the reopen hole for chunks whose
+    /// writes had already committed.
+    ///
+    /// # Limitation: the WAL is not authenticated
+    ///
+    /// Records carry a CRC, not a MAC. An attacker who can rewrite the WAL (or any
+    /// counter state persisted next to the file) can roll a chunk's high-water mark
+    /// back and make the next honest write reuse a nonce. Counter-based nonces are
+    /// only as safe as the integrity of the counter store; the design's answer is to
+    /// keep per-chunk versions in the signed companion dataset, which this prototype
+    /// does not yet do. Deployments facing a storage-level attacker should prefer the
+    /// random-nonce mode the design describes for that reason.
     ///
     /// Returns the list of `(chunk_idx, version, plaintext_hash)` triples that were
     /// pending. For each triple the caller **must** call
@@ -617,16 +628,18 @@ impl<W: Read + Write + Seek> EncryptedChunkWriter<W> {
     /// dataset to `version` and call [`commit`](Self::commit) to finalize the
     /// record.
     pub fn recover(&mut self) -> Result<Vec<(u64, u64, [u8; 32])>, EncryptedWriteError> {
-        let uncommitted = self.wal.recover()?;
-
-        // Seed the version store so journaled versions are treated as already consumed.
-        // Without this, next_version() could hand back a version that was already used
-        // to derive a nonce before the crash -> catastrophic keystream reuse.
-        for &(chunk_idx, version, _) in &uncommitted {
+        // Seed the version store from EVERY journaled version, committed as
+        // well as pending: each one was used to derive a nonce. This used to
+        // seed only the pending records, so a writer reopened after a clean
+        // commit (the documented `new` + `recover` protocol) started every
+        // committed chunk's counter at 1 again and reused its nonce on the
+        // next write -- a two-time pad, C1 ^ C2 == P1 ^ P2, reproduced with
+        // and without compaction (2026-10 red-team finding).
+        for (chunk_idx, version) in self.wal.high_water_marks()? {
             self.versions.seed(chunk_idx, version);
         }
 
-        Ok(uncommitted)
+        Ok(self.wal.recover()?)
     }
 
     /// Get a reference to the version counter store.
