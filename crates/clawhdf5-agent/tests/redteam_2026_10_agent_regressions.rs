@@ -334,3 +334,42 @@ fn unknown_type_byte_in_v2_wal_fails_closed() {
     write_bytes(&wal_path, &bytes);
     assert!(matches!(WalFile::read_entries(&wal_path), Err(MemoryError::Integrity(_))));
 }
+
+// ---------------------------------------------------------------------------
+// Strict constructors on every public open path (follow-up round)
+// ---------------------------------------------------------------------------
+
+/// The OpenClaw backend (the integration point for other agents) and the
+/// async wrapper had no strict constructor, so their users could not get the
+/// stripped-root / WAL-downgrade protection. An empty store is written with
+/// no content root, which stands in for an unprotected or stripped file.
+#[test]
+fn openclaw_backend_open_strict_rejects_an_unprotected_store() {
+    use clawhdf5_agent::openclaw::ClawhdfBackend;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oc.h5");
+    drop(ClawhdfBackend::create(&path, DIM).unwrap());
+    assert!(ClawhdfBackend::open(&path).is_ok(), "default open stays fail-open");
+    let err = match ClawhdfBackend::open_strict(&path) {
+        Err(e) => e,
+        Ok(_) => panic!("open_strict accepted a store with no content root"),
+    };
+    assert!(err.contains("integrity"), "unexpected error: {err}");
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn async_open_strict_rejects_an_unprotected_store() {
+    use clawhdf5_agent::async_memory::AsyncHDF5Memory;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("async.h5");
+    drop(HDF5Memory::create(config(path.clone(), DIM)).unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        assert!(AsyncHDF5Memory::open(&path).await.is_ok());
+        assert!(matches!(
+            AsyncHDF5Memory::open_strict(&path).await,
+            Err(MemoryError::Integrity(_))
+        ));
+    });
+}

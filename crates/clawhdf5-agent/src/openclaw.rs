@@ -350,9 +350,29 @@ impl ClawhdfBackend {
     }
 
     /// Open an existing HDF5 memory store.
+    ///
+    /// Fail-open on a missing integrity root, like [`HDF5Memory::open`]; use
+    /// [`open_strict`](Self::open_strict) for a store that must always be
+    /// integrity-protected.
     pub fn open(path: &Path) -> Result<Self, String> {
         let memory = HDF5Memory::open(path).map_err(|e| e.to_string())?;
+        Ok(Self::from_memory(path, memory))
+    }
 
+    /// Open an existing HDF5 memory store, failing closed when the file has
+    /// no content Merkle root or its WAL sidecar is unauthenticated (see
+    /// [`HDF5Memory::open_strict`]).
+    ///
+    /// This backend is the integration point other agents (ZeroClaw) use, and
+    /// it previously had no strict constructor at all, so an integrator could
+    /// not obtain the stripped-root and WAL-downgrade protection the rest of
+    /// the crate offers (2026-10 red-team finding).
+    pub fn open_strict(path: &Path) -> Result<Self, String> {
+        let memory = HDF5Memory::open_strict(path).map_err(|e| e.to_string())?;
+        Ok(Self::from_memory(path, memory))
+    }
+
+    fn from_memory(path: &Path, memory: HDF5Memory) -> Self {
         // Rebuild path_map from cached source channels.
         let mut path_map: HashMap<String, String> = HashMap::new();
         for ch in &memory.cache.source_channels {
@@ -361,13 +381,13 @@ impl ClawhdfBackend {
             path_map.entry(key).or_insert_with(|| ch.clone());
         }
 
-        Ok(Self {
+        Self {
             hdf5_path: path.to_path_buf(),
             memory,
             path_map,
             rerank_config: ReRankConfig::default(),
             confidence_config: ConfidenceConfig::default(),
-        })
+        }
     }
 
     /// Open the store if it exists, otherwise create it.

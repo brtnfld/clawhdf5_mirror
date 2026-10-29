@@ -8,18 +8,21 @@ use std::collections::HashMap;
 pub use crate::consolidation::MemorySource;
 
 // ---------------------------------------------------------------------------
-// Hash helper (std-only FNV-1a 64-bit)
+// Content digest (SHA-256)
 // ---------------------------------------------------------------------------
 
-fn fnv1a_64(text: &str) -> u64 {
-    const OFFSET: u64 = 14_695_981_039_346_656_037;
-    const PRIME: u64 = 1_099_511_628_211;
-    let mut hash = OFFSET;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
+/// SHA-256 of the chunk text.
+///
+/// This used to be FNV-1a 64-bit, a non-cryptographic hash: colliding
+/// inputs for it can be computed directly, so `verify_integrity` would have
+/// accepted forged content under this module's own stated purpose ("so the
+/// system can detect tampering"). A collision-resistant digest is what that
+/// claim needs (2026-10 red-team finding). It is still unkeyed: it detects
+/// modification of the text, not an attacker who can also rewrite the
+/// stored record.
+fn content_digest(text: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).into()
 }
 
 // ---------------------------------------------------------------------------
@@ -51,8 +54,8 @@ pub struct MemoryProvenance {
     pub created_by: String,
     /// Unix timestamp (seconds) of creation.
     pub created_at: f64,
-    /// FNV-1a 64-bit hash of the chunk text for integrity checking.
-    pub content_hash: u64,
+    /// SHA-256 of the chunk text, for integrity checking.
+    pub content_hash: [u8; 32],
     pub session_id: String,
     pub verified: bool,
 }
@@ -72,7 +75,7 @@ impl MemoryProvenance {
             source,
             created_by: created_by.into(),
             created_at,
-            content_hash: fnv1a_64(chunk),
+            content_hash: content_digest(chunk),
             session_id: session_id.into(),
             verified: false,
         }
@@ -116,7 +119,7 @@ impl ProvenanceStore {
     /// Returns `true` if the content matches (integrity intact).
     pub fn verify_integrity(&self, record_id: u64, current_chunk: &str) -> bool {
         match self.records.get(&record_id) {
-            Some(p) => p.content_hash == fnv1a_64(current_chunk),
+            Some(p) => p.content_hash == content_digest(current_chunk),
             None => false,
         }
     }
@@ -230,22 +233,38 @@ mod tests {
         1_700_000_000.0
     }
 
-    // --- fnv1a_64 ---
+    // --- content_digest ---
+
+    /// 2026-10 red-team regression: the digest must be SHA-256. FNV-1a 64
+    /// (the previous hash) has a 64-bit output, so a generic birthday search
+    /// finds colliding chunk texts in about 2^32 evaluations -- seconds -- and
+    /// `verify_integrity` would have accepted the forged one.
+    #[test]
+    fn content_digest_is_sha256() {
+        assert_eq!(
+            content_digest("hello"),
+            [
+                0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa3, 0x0e, 0x26, 0xe8, 0x3b, 0x2a, 0xc5,
+                0xb9, 0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e, 0x73, 0x04,
+                0x33, 0x62, 0x93, 0x8b, 0x98, 0x24,
+            ]
+        );
+    }
 
     #[test]
     fn hash_deterministic() {
-        assert_eq!(fnv1a_64("hello"), fnv1a_64("hello"));
+        assert_eq!(content_digest("hello"), content_digest("hello"));
     }
 
     #[test]
     fn hash_different_inputs() {
-        assert_ne!(fnv1a_64("hello"), fnv1a_64("world"));
+        assert_ne!(content_digest("hello"), content_digest("world"));
     }
 
     #[test]
     fn hash_empty() {
         // Should not panic
-        let _ = fnv1a_64("");
+        let _ = content_digest("");
     }
 
     // --- MemorySource Display ---
@@ -264,7 +283,7 @@ mod tests {
     #[test]
     fn provenance_new_hashes_chunk() {
         let p = MemoryProvenance::new(1, MemorySource::User, "agent-1", ts(), "hello", "s1");
-        assert_eq!(p.content_hash, fnv1a_64("hello"));
+        assert_eq!(p.content_hash, content_digest("hello"));
         assert!(!p.verified);
     }
 

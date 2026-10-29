@@ -145,6 +145,27 @@ impl AsyncHDF5Memory {
         Ok(Self::wrap_with(mem, async_config))
     }
 
+    /// Open an existing HDF5 memory file, failing closed when it carries no
+    /// content Merkle root or its WAL sidecar is unauthenticated (see
+    /// [`HDF5Memory::open_strict`]). Added alongside the CLI's `--strict` so
+    /// every public way to open a store can request the guarantee (2026-10
+    /// red-team finding).
+    pub async fn open_strict(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_strict_with(path, AsyncConfig::default()).await
+    }
+
+    /// [`open_strict`](Self::open_strict) with a custom async config.
+    pub async fn open_strict_with(
+        path: impl AsRef<Path>,
+        async_config: AsyncConfig,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mem = spawn_blocking(move || HDF5Memory::open_strict(&path))
+            .await
+            .map_err(join_err)??;
+        Ok(Self::wrap_with(mem, async_config))
+    }
+
     /// Wrap a sync `HDF5Memory` with default async config.
     pub fn wrap(mem: HDF5Memory) -> Self {
         Self::wrap_with(mem, AsyncConfig::default())
