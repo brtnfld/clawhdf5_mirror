@@ -37,6 +37,10 @@ pub struct ExtensibleArrayHeader {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
+    // Every block address and position in this parser comes from the file;
+    // plain `a + b > len` overflowed in debug and wrapped past the check in
+    // release, panicking the slice that follows (2026-10 red-team finding,
+    // the July 2026 checked_add fix's bug class in a parser it did not reach).
     if pos.checked_add(s).is_none_or(|end| end > data.len()) {
         return Err(FormatError::UnexpectedEof {
             expected: pos.saturating_add(s),
@@ -65,7 +69,7 @@ fn is_undefined_addr(addr: u64, offset_size: u8) -> bool {
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
     let s = size as usize;
-    if pos + s > data.len() {
+    if pos.checked_add(s).is_none_or(|end| end > data.len()) {
         return false;
     }
     data[pos..pos + s].iter().all(|&b| b == 0xFF)
@@ -98,9 +102,9 @@ impl ExtensibleArrayHeader {
         //   6 stats fields (each length_size) + index_block_address(offset_size) + checksum(4)
         let min_size =
             4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + offset_size as usize + 4;
-        if offset + min_size > file_data.len() {
+        if offset.checked_add(min_size).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + min_size,
+                expected: offset.saturating_add(min_size),
                 available: file_data.len(),
             });
         }
@@ -175,9 +179,9 @@ fn read_element(
 
     if client_id == 0 {
         // Non-filtered: just address
-        if pos + os > data.len() {
+        if pos.checked_add(os).is_none_or(|end| end > data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + os,
+                expected: pos.saturating_add(os),
                 available: data.len(),
             });
         }
@@ -275,9 +279,9 @@ fn read_data_block_elements(
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     // AEDB: signature(4) + version(1) + client_id(1) + header_address(offset_size)
     let db_header_size = 4 + 1 + 1 + offset_size as usize;
-    if db_offset + db_header_size > file_data.len() {
+    if db_offset.checked_add(db_header_size).is_none_or(|end| end > file_data.len()) {
         return Err(FormatError::UnexpectedEof {
-            expected: db_offset + db_header_size,
+            expected: db_offset.saturating_add(db_header_size),
             available: file_data.len(),
         });
     }
@@ -330,9 +334,9 @@ fn read_data_block_elements(
         // Page bitmap: ceil(npages / 8) bytes
         let bitmap_size = npages.div_ceil(8);
         // Read bitmap
-        if pos + bitmap_size > file_data.len() {
+        if pos.checked_add(bitmap_size).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + bitmap_size,
+                expected: pos.saturating_add(bitmap_size),
                 available: file_data.len(),
             });
         }
@@ -409,6 +413,12 @@ pub fn read_extensible_array_chunks(
     let rank = chunk_dimensions.len();
     let os = offset_size as usize;
 
+    if dataset_dims.len() < rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "dataspace has {} dims, chunk layout has {rank}",
+            dataset_dims.len()
+        )));
+    }
     let mut num_chunks_per_dim = Vec::with_capacity(rank);
     for d in 0..rank {
         let ch_dim = chunk_dimensions[d] as u64;
@@ -421,15 +431,19 @@ pub fn read_extensible_array_chunks(
         num_chunks_per_dim.push(ds_dim.div_ceil(ch_dim));
     }
 
-    let chunk_byte_size: u64 =
-        chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
+    // Checked: chunk dims and the element size are untrusted, and the plain
+    // product overflowed (debug panic, release wrap) before this was fixed.
+    let chunk_byte_size: u64 = chunk_dimensions
+        .iter()
+        .try_fold(u64::from(element_size), |acc, &d| acc.checked_mul(u64::from(d)))
+        .ok_or_else(|| FormatError::Overflow("chunk byte size".into()))?;
 
     // Parse index block (AEIB)
     let ib_offset = header.index_block_address as usize;
     let ib_header_size = 4 + 1 + 1 + offset_size as usize; // sig + ver + client + hdr_addr
-    if ib_offset + ib_header_size > file_data.len() {
+    if ib_offset.checked_add(ib_header_size).is_none_or(|end| end > file_data.len()) {
         return Err(FormatError::UnexpectedEof {
-            expected: ib_offset + ib_header_size,
+            expected: ib_offset.saturating_add(ib_header_size),
             available: file_data.len(),
         });
     }
@@ -482,23 +496,39 @@ pub fn read_extensible_array_chunks(
 
     // The first sblk_min super block levels have their data blocks listed directly
     // in the index block. Compute their sizes.
-    let mut n_direct_dblks = 0usize;
-    let mut dblk_sizes: Vec<usize> = Vec::new();
+    //
+    // `sblk_min` is a u8 from the file, and level `l` contributes `2^l` direct
+    // data blocks, so the count is `2^sblk_min - 1`. The old loop pushed one
+    // entry per block before reading anything: `super_blk_min_nelmts = 40` in a
+    // 4 KiB file pushed toward 2^40 entries and aborted the process when the
+    // vector's growth failed (2026-10 red-team finding). Every direct block's
+    // address occupies `offset_size` bytes of this index block, so a count the
+    // file cannot hold is malformed and is rejected before anything is
+    // allocated; the size arithmetic is checked for the same reason.
+    let n_direct_dblks = 1usize
+        .checked_shl(u32::try_from(sblk_min).unwrap_or(u32::MAX))
+        .map(|n| n - 1)
+        .filter(|&n| {
+            n.checked_mul(os)
+                .is_some_and(|bytes| bytes <= file_data.len().saturating_sub(pos))
+        })
+        .ok_or_else(|| {
+            FormatError::Overflow(format!(
+                "extensible array: {sblk_min} direct super-block levels cannot fit in the index block"
+            ))
+        })?;
+    let mut dblk_sizes: Vec<usize> = Vec::with_capacity(n_direct_dblks);
     {
         let mut nelmts = min_dblk;
         for sb_level in 0..sblk_min {
-            if sb_level >= usize::BITS as usize {
-                return Err(FormatError::Overflow(
-                    "sb_level exceeds usize bit width".into(),
-                ));
-            }
-            let ndblks = 1usize << sb_level;
+            let ndblks = 1usize << sb_level; // sb_level < sblk_min, bounded above
             for _ in 0..ndblks {
                 dblk_sizes.push(nelmts);
-                n_direct_dblks += 1;
             }
             if sb_level > 0 {
-                nelmts *= 2;
+                nelmts = nelmts.checked_mul(2).ok_or_else(|| {
+                    FormatError::Overflow("extensible array: data block size".into())
+                })?;
             }
         }
     }
@@ -506,7 +536,7 @@ pub fn read_extensible_array_chunks(
     // Read direct data block addresses from index block
     let mut dblk_addrs: Vec<u64> = Vec::with_capacity(n_direct_dblks);
     for _ in 0..n_direct_dblks {
-        if pos + os > file_data.len() {
+        if pos.checked_add(os).is_none_or(|end| end > file_data.len()) {
             break;
         }
         let addr = read_offset(file_data, pos, offset_size)?;
@@ -540,7 +570,10 @@ pub fn read_extensible_array_chunks(
     }
 
     // Remaining elements are in super blocks
-    let total_in_ib_and_direct: usize = n_inline + dblk_sizes.iter().sum::<usize>();
+    let total_in_ib_and_direct: usize = dblk_sizes
+        .iter()
+        .try_fold(n_inline, |acc, &n| acc.checked_add(n))
+        .ok_or_else(|| FormatError::Overflow("extensible array: direct element count".into()))?;
     if total_elements <= total_in_ib_and_direct {
         return Ok(chunks);
     }
@@ -552,10 +585,11 @@ pub fn read_extensible_array_chunks(
     {
         let mut covered = 0usize;
         let mut sb_level = sblk_min;
+        let sb_overflow = || FormatError::Overflow("extensible array: super block size".into());
         let mut nelmts_per_dblk = min_dblk;
         for lev in 0..sblk_min {
             if lev > 0 {
-                nelmts_per_dblk *= 2;
+                nelmts_per_dblk = nelmts_per_dblk.checked_mul(2).ok_or_else(sb_overflow)?;
             }
         }
 
@@ -566,17 +600,17 @@ pub fn read_extensible_array_chunks(
                 ));
             }
             let ndblks = 1usize << sb_level;
-            nelmts_per_dblk *= 2;
-            let total_in_sb = ndblks * nelmts_per_dblk;
+            nelmts_per_dblk = nelmts_per_dblk.checked_mul(2).ok_or_else(sb_overflow)?;
+            let total_in_sb = ndblks.checked_mul(nelmts_per_dblk).ok_or_else(sb_overflow)?;
             sb_infos.push((ndblks, nelmts_per_dblk));
-            covered += total_in_sb;
+            covered = covered.checked_add(total_in_sb).ok_or_else(sb_overflow)?;
             sb_level += 1;
         }
     }
 
     // Read super block addresses from index block
     for _ in 0..sb_infos.len() {
-        if pos + os > file_data.len() {
+        if pos.checked_add(os).is_none_or(|end| end > file_data.len()) {
             break;
         }
         let addr = read_offset(file_data, pos, offset_size)?;
@@ -628,9 +662,9 @@ fn read_super_block(
 
     // AESB: signature(4) + version(1) + client_id(1) + header_address(offset_size)
     let sb_header_size = 4 + 1 + 1 + os;
-    if sb_offset + sb_header_size > file_data.len() {
+    if sb_offset.checked_add(sb_header_size).is_none_or(|end| end > file_data.len()) {
         return Err(FormatError::UnexpectedEof {
-            expected: sb_offset + sb_header_size,
+            expected: sb_offset.saturating_add(sb_header_size),
             available: file_data.len(),
         });
     }
@@ -646,9 +680,9 @@ fn read_super_block(
     // Read data block addresses
     let mut dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
     for _ in 0..ndblks {
-        if pos + os > file_data.len() {
+        if pos.checked_add(os).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + os,
+                expected: pos.saturating_add(os),
                 available: file_data.len(),
             });
         }

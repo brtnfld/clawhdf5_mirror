@@ -1,7 +1,11 @@
 //! HDF5 Object Header parsing (v1 and v2).
 
 #[cfg(not(feature = "std"))]
+use alloc::collections::BTreeSet;
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::collections::BTreeSet;
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -124,6 +128,11 @@ impl ObjectHeader {
         ensure_len(data, msg_start, header_data_size)?;
 
         let mut messages = Vec::new();
+        // Continuation blocks this header has already parsed. A block reached
+        // twice is malformed: real files chain continuations without sharing,
+        // and sharing is what turned a 1.2 KB header into 8 million parsed
+        // messages (2026-10 red-team finding; see `parse_v1_continuation`).
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
         let mut pos = msg_start;
         let msg_end =
             msg_start
@@ -183,6 +192,7 @@ impl ObjectHeader {
                         offset_size,
                         length_size,
                         32, // max continuation depth
+                        &mut visited,
                     )?;
                     messages.extend(cont_msgs);
                 }
@@ -201,6 +211,17 @@ impl ObjectHeader {
         })
     }
 
+    /// Parse one v1 continuation block, recursing into any continuations it
+    /// contains.
+    ///
+    /// `depth_remaining` alone did not bound the work: a block may hold several
+    /// continuation messages, so blocks that each point twice at the next
+    /// level form a DAG whose path count doubles per level. Thirty 48-byte
+    /// blocks (a 1.6 KB file) meant about 2^31 parsed messages, exhausting
+    /// memory long before the depth limit was reached. `visited` makes every
+    /// block parse at most once per header, which bounds the total work by the
+    /// file size (2026-10 red-team finding).
+    #[allow(clippy::too_many_arguments)]
     fn parse_v1_continuation(
         data: &[u8],
         offset: usize,
@@ -208,8 +229,12 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         depth_remaining: u16,
+        visited: &mut BTreeSet<usize>,
     ) -> Result<Vec<HeaderMessage>, FormatError> {
         if depth_remaining == 0 {
+            return Err(FormatError::NestingDepthExceeded);
+        }
+        if !visited.insert(offset) {
             return Err(FormatError::NestingDepthExceeded);
         }
         ensure_len(data, offset, length)?;
@@ -264,6 +289,7 @@ impl ObjectHeader {
                         offset_size,
                         length_size,
                         depth_remaining - 1,
+                        visited,
                     )?;
                     messages.extend(cont_msgs);
                 }
@@ -361,13 +387,20 @@ impl ObjectHeader {
             &mut continuations,
         )?;
 
-        // Follow continuations (limit to prevent cycles in malformed data)
+        // Follow continuations (limit to prevent cycles in malformed data).
+        // The 256 budget alone still let one block be re-parsed up to 256
+        // times, re-copying its messages each time; each OCHK block is now
+        // parsed at most once (2026-10 red-team finding, same as v1).
         let mut cont_remaining = 256u16;
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
         while let Some((cont_offset, cont_length)) = continuations.pop() {
             if cont_remaining == 0 {
                 return Err(FormatError::NestingDepthExceeded);
             }
             cont_remaining -= 1;
+            if !visited.insert(cont_offset) {
+                return Err(FormatError::NestingDepthExceeded);
+            }
             Self::parse_v2_continuation(
                 data,
                 cont_offset,

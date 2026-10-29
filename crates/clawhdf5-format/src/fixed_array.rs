@@ -26,6 +26,10 @@ pub struct FixedArrayHeader {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
+    // Every block address and position in this parser comes from the file;
+    // plain `a + b > len` overflowed in debug and wrapped past the check in
+    // release, panicking the slice that follows (2026-10 red-team finding,
+    // the July 2026 checked_add fix's bug class in a parser it did not reach).
     if pos.checked_add(s).is_none_or(|end| end > data.len()) {
         return Err(FormatError::UnexpectedEof {
             expected: pos.saturating_add(s),
@@ -49,7 +53,7 @@ fn read_length(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
     let s = size as usize;
-    if pos + s > data.len() {
+    if pos.checked_add(s).is_none_or(|end| end > data.len()) {
         return false;
     }
     data[pos..pos + s].iter().all(|&b| b == 0xFF)
@@ -66,9 +70,9 @@ impl FixedArrayHeader {
         // FAHD signature(4) + version(1) + client_id(1) + element_size(1) +
         // max_nelmts_bits(1) + num_elements(length_size) + data_block_addr(offset_size) + checksum(4)
         let min_size = 4 + 1 + 1 + 1 + 1 + length_size as usize + offset_size as usize + 4;
-        if offset + min_size > file_data.len() {
+        if offset.checked_add(min_size).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + min_size,
+                expected: offset.saturating_add(min_size),
                 available: file_data.len(),
             });
         }
@@ -126,9 +130,9 @@ pub fn read_fixed_array_chunks(
 
     // Parse data block header: FADB(4) + version(1) + client_id(1) + header_address(offset_size)
     let db_header_size = 4 + 1 + 1 + offset_size as usize;
-    if db_offset + db_header_size > file_data.len() {
+    if db_offset.checked_add(db_header_size).is_none_or(|end| end > file_data.len()) {
         return Err(FormatError::UnexpectedEof {
-            expected: db_offset + db_header_size,
+            expected: db_offset.saturating_add(db_header_size),
             available: file_data.len(),
         });
     }
@@ -170,6 +174,12 @@ pub fn read_fixed_array_chunks(
 
     // Compute chunk offsets based on index.
     // Chunks are stored in row-major order within the dataset space.
+    if dataset_dims.len() < rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "dataspace has {} dims, chunk layout has {rank}",
+            dataset_dims.len()
+        )));
+    }
     let mut num_chunks_per_dim = Vec::with_capacity(rank);
     for d_idx in 0..rank {
         let ch_dim = chunk_dimensions[d_idx] as u64;
@@ -182,8 +192,12 @@ pub fn read_fixed_array_chunks(
         num_chunks_per_dim.push(ds_dim.div_ceil(ch_dim));
     }
 
-    let chunk_byte_size: u64 =
-        chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
+    // Checked: chunk dims and the element size are untrusted, and the plain
+    // product overflowed (debug panic, release wrap) before this was fixed.
+    let chunk_byte_size: u64 = chunk_dimensions
+        .iter()
+        .try_fold(u64::from(element_size), |acc, &d| acc.checked_mul(u64::from(d)))
+        .ok_or_else(|| FormatError::Overflow("chunk byte size".into()))?;
 
     let mut chunks = Vec::new();
     let push_element =
@@ -238,16 +252,21 @@ pub fn read_fixed_array_chunks(
     let npages = num_elements.div_ceil(page_nelmts);
     let bitmap_size = npages.div_ceil(8);
     let bitmap_start = elements_start;
-    // prefix(db_header_size) + bitmap + checksum(4)
-    let pages_start = db_offset + db_header_size + bitmap_size + 4;
+    // prefix(db_header_size) + bitmap + checksum(4). Checked: `bitmap_size`
+    // derives from the file's element count.
+    let pages_start = db_offset
+        .checked_add(db_header_size)
+        .and_then(|v| v.checked_add(bitmap_size))
+        .and_then(|v| v.checked_add(4))
+        .ok_or_else(stride_overflow)?;
     let page_stride = page_nelmts
         .checked_mul(elem_stride)
         .and_then(|x| x.checked_add(4))
         .ok_or_else(stride_overflow)?;
 
-    if bitmap_start + bitmap_size > file_data.len() {
+    if bitmap_start.checked_add(bitmap_size).is_none_or(|end| end > file_data.len()) {
         return Err(FormatError::UnexpectedEof {
-            expected: bitmap_start + bitmap_size,
+            expected: bitmap_start.saturating_add(bitmap_size),
             available: file_data.len(),
         });
     }
@@ -290,9 +309,9 @@ fn parse_fa_element(
     let os = offset_size as usize;
     if client_id == 0 {
         // Non-filtered: element is just the chunk address.
-        if abs + os > file_data.len() {
+        if abs.checked_add(os).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: abs + os,
+                expected: abs.saturating_add(os),
                 available: file_data.len(),
             });
         }
@@ -310,9 +329,9 @@ fn parse_fa_element(
             ));
         }
         let chunk_size_bytes = es - os - 4;
-        if abs + es > file_data.len() {
+        if abs.checked_add(es).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: abs + es,
+                expected: abs.saturating_add(es),
                 available: file_data.len(),
             });
         }

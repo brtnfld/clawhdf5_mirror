@@ -6,6 +6,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec, vec::Vec};
 
+#[cfg(not(feature = "std"))]
+use alloc::format;
 use crate::error::FormatError;
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_PCODEC,
