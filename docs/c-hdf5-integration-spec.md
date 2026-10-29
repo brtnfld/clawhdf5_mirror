@@ -216,12 +216,17 @@ out-of-band source (e.g. the provenance journal's own record, which does
 carry one, `merkle_journal.rs`). This document proposes closing *that*
 gap, not the attribute's existence:
 
-- **Primary path**: extend the existing bare `merkle_sig` attribute to
+- **Primary path (implemented in the prototype, 2026-10)**: `merkle_sig` is
   `AlgID(1) || version(8, BE) || timestamp(8, BE) || HybridSignature(3374)`
-  = 3391 bytes — a superset of what `write_sig_attr`/`read_sig_attr`
-  already produce/consume, so the C port (and a corresponding small Rust
-  change) can add the three-field prefix without redesigning the existing
-  function pair, only widening their output format. Plus a `merkle_pubkey`
+  = 3391 bytes (`SIG_ATTR_SIZE`; `SignedRootMeta` is the 17-byte prefix).
+  `write_sig_attr`/`read_sig_attr` produce and consume this layout, and
+  `verify_sig_attr` rebuilds the v1 payload from `merkle_root` plus the
+  prefix and applies the strict-AND check — the single call a reader uses to
+  verify a file from its own contents and the trusted keys. The `AlgID` byte
+  is informational and must equal `merkle_root`'s algorithm
+  (`SignError::AlgorithmMismatch` otherwise); the signed payload binds the
+  attribute's value, so a disagreement is never resolved by trusting either
+  copy. A bare 3374-byte pre-v1 attribute is rejected on read. Plus a `merkle_pubkey`
   attribute (Ed25519 32 bytes + ML-DSA-65 ~1952 bytes ≈ 1984 bytes).
   Combined with the per-dataset `merkle_root` attribute (129 bytes) this
   stays comfortably under the paper's provisional 32 KB fallback threshold
@@ -602,6 +607,18 @@ property-list flag. Reasoning:
 
 ### 4.3 Recovery behavior
 
+**Journal truncation (2026-10 red-team finding).** The provenance journal is
+an unsigned attribute, so an attacker with file access can delete its
+newest records and leave an older, validly signed state as the apparent
+"last known good"; the stateless `RestoreTarget::LastKnownGood` restores it
+without complaint (threat T4 routed through recovery). A verifier that keeps
+a `VersionObservationStore` must restore with
+`RestoreTarget::LastKnownGoodAtLeast(highest_observed)`, which refuses
+(`RestoreError::JournalTruncated`) when the journal's best verifying record
+is older than a version the verifier has already seen verify. A C port
+should expose the same floor parameter on its restore entry point and
+default it to the observation store's high-water mark.
+
 On open, if the companion dataset's recomputed hash doesn't match
 `merkle_root.companion_hash` (or a chunk's leaf doesn't match its stored
 value), the file is in a post-crash-or-tamper inconsistent state.
@@ -843,16 +860,12 @@ called out inline at its point of relevance above, this is the summary:
    partly *because* it is "what's implemented and tested today"; that
    framing should be read with this durability caveat attached; a C
    implementation must close the `fsync` gap, not just port the WAL as-is.
-4. **Hybrid signature attachment**: `merkle_sig` already exists as a bare
-   `HybridSignature`-bytes attribute in the current prototype
-   (`clawhdf5-sign/src/lib.rs:439-486`, `write_sig_attr`/`read_sig_attr`,
-   with a passing round-trip test) — an earlier draft of this document
-   claimed otherwise and has been corrected in §1.5. The real, narrower
-   gap is that verifying against the full canonical payload `R` needs a
-   `timestamp` field that has no existing attribute home; §1.5 proposes
-   widening `merkle_sig` to a 3391-byte `AlgID||version||timestamp||sig`
-   layout that is a strict superset of the existing bare format, not a
-   redesign of the existing function pair.
+4. **Hybrid signature attachment**: closed. `merkle_sig` carries the
+   3391-byte `AlgID||version||timestamp||sig` layout of §1.5 and
+   `verify_sig_attr` verifies a file from its own contents. The remaining
+   prototype-side gap is that no production *writer* (`clawhdf5-agent`)
+   signs anything; the secure demo is still the only producer of a signed
+   file.
 5. **Leaf hash formula**: the two formulas of §6.2 are now both
    first-class in the prototype, selected per dataset by the `leaf_format`
    attribute byte (§1.2, commit 87f6b08) and bound into the signed payload

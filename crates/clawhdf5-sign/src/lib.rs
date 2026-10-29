@@ -68,6 +68,22 @@ pub enum SignError {
 
     /// The `merkle_sig` attribute is absent from the dataset.
     AttributeMissing,
+
+    /// The `merkle_sig` attribute's algorithm byte disagrees with the
+    /// `merkle_root` attribute's. The signed payload binds the attribute's
+    /// algorithm, so this is a tampered or mis-written file, never something
+    /// to resolve by trusting one of the two.
+    AlgorithmMismatch {
+        /// Algorithm id carried by `merkle_root`.
+        attribute: u8,
+        /// Algorithm id carried by `merkle_sig`.
+        signature: u8,
+    },
+
+    /// An Ed25519 public key of small order was offered as a verifying key.
+    /// Such a key validates a signature over almost any message, so it is
+    /// refused at construction rather than only at verification time.
+    WeakKey,
 }
 
 impl core::fmt::Display for SignError {
@@ -78,6 +94,11 @@ impl core::fmt::Display for SignError {
             SignError::InvalidRoot => write!(f, "missing or invalid Merkle root"),
             SignError::SigningFailed => write!(f, "signing operation failed"),
             SignError::AttributeMissing => write!(f, "merkle_sig attribute absent from dataset"),
+            SignError::AlgorithmMismatch { attribute, signature } => write!(
+                f,
+                "merkle_sig algorithm id {signature:#04x} disagrees with merkle_root's {attribute:#04x}"
+            ),
+            SignError::WeakKey => write!(f, "Ed25519 public key has small order (weak key)"),
         }
     }
 }
@@ -498,51 +519,175 @@ pub fn verify_sig(
 /// likewise named without its spec-document leading underscore.
 pub const SIG_ATTR_NAME: &str = "merkle_sig";
 
-/// Write a [`HybridSignature`] to a dataset as the `merkle_sig` attribute.
+/// Size of the packed `merkle_sig` attribute (attribute format v1):
 ///
-/// Serializes the signature with [`HybridSignature::to_bytes`] (1-byte
-/// version tag + concatenated Ed25519 and ML-DSA-65 signatures) and attaches
-/// it as an opaque byte-array attribute on the dataset builder.
+/// ```text
+/// alg_id(1) || version(8, BE) || timestamp(8, BE) || HybridSignature(3374)
+/// ```
+///
+/// = 3391 bytes, the "primary path" layout of the C integration spec §1.5.
+pub const SIG_ATTR_SIZE: usize = 1 + 8 + 8 + HybridSignature::SERIALIZED_SIZE;
+
+/// The signed-payload fields that live in neither the `merkle_root` attribute
+/// nor the signature itself, carried in `merkle_sig` so that a stored
+/// signature can be verified from the file alone.
+///
+/// Before this layout existed (2026-10 red-team finding), `merkle_sig` held
+/// the bare signature bytes and nothing in the file carried the `timestamp`
+/// (or, for a dataset without a `merkle_version` attribute, the `version`)
+/// that [`canonical_payload`] binds. A verifier therefore could not rebuild
+/// the payload from disk: every caller that "verified a file" was actually
+/// re-using the version and timestamp it still held in memory from writing
+/// it, which is not a verification of the file at all.
+///
+/// `alg_id` duplicates `MerkleAttr::algorithm`. It is informational — the
+/// spec puts it first in the layout for the C port's benefit — and
+/// [`verify_sig_attr`] requires it to match the attribute's value. The signed
+/// payload binds the attribute's algorithm, so a disagreement is a tampered
+/// or mis-written file, never something to resolve by trusting either copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedRootMeta {
+    /// Hash algorithm the root was computed with (equals `MerkleAttr::algorithm`).
+    pub alg_id: HashAlg,
+    /// Dataset-level version counter bound into the signature.
+    pub version: u64,
+    /// Unix timestamp (seconds) bound into the signature.
+    pub timestamp: u64,
+}
+
+impl SignedRootMeta {
+    /// Serialized size of the metadata prefix (`alg_id || version || timestamp`).
+    pub const SERIALIZED_SIZE: usize = 1 + 8 + 8;
+
+    fn pack(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut out = [0u8; Self::SERIALIZED_SIZE];
+        out[0] = self.alg_id.to_id();
+        out[1..9].copy_from_slice(&self.version.to_be_bytes());
+        out[9..17].copy_from_slice(&self.timestamp.to_be_bytes());
+        out
+    }
+
+    fn unpack(data: &[u8; Self::SERIALIZED_SIZE]) -> Result<Self, SignError> {
+        let alg_id = HashAlg::from_id(data[0]).ok_or(SignError::InvalidSignature)?;
+        let version = u64::from_be_bytes(data[1..9].try_into().map_err(|_| SignError::InvalidSignature)?);
+        let timestamp =
+            u64::from_be_bytes(data[9..17].try_into().map_err(|_| SignError::InvalidSignature)?);
+        Ok(Self {
+            alg_id,
+            version,
+            timestamp,
+        })
+    }
+}
+
+/// Write a [`HybridSignature`] and its [`SignedRootMeta`] to a dataset as the
+/// `merkle_sig` attribute (layout: [`SIG_ATTR_SIZE`]).
 ///
 /// # Example
 ///
 /// ```ignore
-/// use clawhdf5_sign::{canonical_payload, sign_root, write_sig_attr, HashAlg};
+/// use clawhdf5_sign::{canonical_payload, sign_root, write_sig_attr, SignedRootMeta};
 /// use clawhdf5_format::file_writer::FileWriter;
 ///
-/// let payload = canonical_payload(&root, &companion_hash, 1, timestamp, HashAlg::Blake3, LeafFormat::Content, &[0u8; 32]);
+/// let meta = SignedRootMeta { alg_id: attr.algorithm, version: 1, timestamp };
+/// let payload = canonical_payload(
+///     &attr.root, &attr.companion_hash, meta.version, meta.timestamp,
+///     attr.algorithm, attr.leaf_format, &attr.grid_hash,
+/// );
 /// let sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 ///
 /// let mut fw = FileWriter::new();
 /// let ds = fw.create_dataset("data");
 /// ds.with_u8_data(&data);
-/// write_sig_attr(ds, &sig);
+/// write_sig_attr(ds, &meta, &sig);
 /// ```
 #[cfg(feature = "std")]
 pub fn write_sig_attr(
     dataset: &mut clawhdf5_format::type_builders::DatasetBuilder,
+    meta: &SignedRootMeta,
     sig: &HybridSignature,
 ) {
+    let mut bytes = Vec::with_capacity(SIG_ATTR_SIZE);
+    bytes.extend_from_slice(&meta.pack());
+    bytes.extend_from_slice(&sig.to_bytes());
+    debug_assert_eq!(bytes.len(), SIG_ATTR_SIZE);
     dataset.set_attr(
         SIG_ATTR_NAME,
-        clawhdf5_format::type_builders::AttrValue::Bytes(sig.to_bytes().to_vec()),
+        clawhdf5_format::type_builders::AttrValue::Bytes(bytes),
     );
 }
 
-/// Read a [`HybridSignature`] back from a dataset's parsed attributes.
+/// Read the [`SignedRootMeta`] and [`HybridSignature`] back from a dataset's
+/// parsed attributes.
+///
+/// A bare 3374-byte attribute written before attribute format v1 (signature
+/// bytes only, no `alg_id`/`version`/`timestamp` prefix) is rejected with
+/// [`SignError::InvalidSignature`]: it could never be verified from the file
+/// alone, and the signature format it carried (v0) is rejected by
+/// [`HybridSignature::from_bytes`] in any case.
 ///
 /// # Errors
 ///
-/// Returns `SignError::AttributeMissing` if no `merkle_sig` attribute is
-/// present, or `SignError::InvalidSignature` if the attribute is present but
-/// malformed (wrong length or unrecognized version tag).
+/// Returns [`SignError::AttributeMissing`] if no `merkle_sig` attribute is
+/// present, or [`SignError::InvalidSignature`] if the attribute is present but
+/// malformed (wrong length, unknown algorithm id, or unrecognized signature
+/// version tag).
 #[cfg(feature = "std")]
 pub fn read_sig_attr(
     attrs: &[clawhdf5_format::attribute::AttributeMessage],
-) -> Result<HybridSignature, SignError> {
+) -> Result<(SignedRootMeta, HybridSignature), SignError> {
     let attr = clawhdf5_format::attribute::find_attribute(attrs, SIG_ATTR_NAME)
         .ok_or(SignError::AttributeMissing)?;
-    HybridSignature::from_bytes(&attr.raw_data)
+    let data = &attr.raw_data;
+    if data.len() != SIG_ATTR_SIZE {
+        return Err(SignError::InvalidSignature);
+    }
+    let (meta_bytes, sig_bytes) = data.split_at(SignedRootMeta::SERIALIZED_SIZE);
+    let meta_bytes: &[u8; SignedRootMeta::SERIALIZED_SIZE] =
+        meta_bytes.try_into().map_err(|_| SignError::InvalidSignature)?;
+    let meta = SignedRootMeta::unpack(meta_bytes)?;
+    let sig = HybridSignature::from_bytes(sig_bytes)?;
+    Ok((meta, sig))
+}
+
+/// Verify a stored `merkle_sig` against its dataset's `merkle_root` attribute,
+/// using nothing but what was read from the file plus the trusted public keys.
+///
+/// Rebuilds the v1 canonical payload from `attr` (root, companion hash,
+/// algorithm, leaf format, grid hash) and `meta` (version, timestamp), after
+/// requiring `meta.alg_id` to equal `attr.algorithm`, and applies the
+/// strict-AND hybrid check. This is the single entry point a reader should
+/// use to answer "is the file I just opened the one the key-holder signed?".
+///
+/// # Errors
+///
+/// - [`SignError::AlgorithmMismatch`] if the two attributes disagree on the
+///   hash algorithm.
+/// - [`SignError::InvalidSignature`] if either signature component fails.
+#[cfg(all(feature = "ed25519", feature = "mldsa"))]
+pub fn verify_sig_attr(
+    attr: &clawhdf5_format::merkle::MerkleAttr,
+    meta: &SignedRootMeta,
+    sig: &HybridSignature,
+    ed_pub: &VerifyingKey,
+    ml_pub: &mldsa::MlDsaVerifyingKey,
+) -> Result<(), SignError> {
+    if meta.alg_id != attr.algorithm {
+        return Err(SignError::AlgorithmMismatch {
+            attribute: attr.algorithm.to_id(),
+            signature: meta.alg_id.to_id(),
+        });
+    }
+    let payload = canonical_payload(
+        &attr.root,
+        &attr.companion_hash,
+        meta.version,
+        meta.timestamp,
+        attr.algorithm,
+        attr.leaf_format,
+        &attr.grid_hash,
+    );
+    verify_sig(&payload, sig, ed_pub, ml_pub)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,7 +698,7 @@ pub fn read_sig_attr(
 mod ed25519_impl {
     use super::*;
     use ed25519_dalek::{
-        Signature as DalekSignature, Signer, SigningKey as DalekSigningKey, Verifier,
+        Signature as DalekSignature, Signer, SigningKey as DalekSigningKey,
         VerifyingKey as DalekVerifyingKey,
     };
 
@@ -606,9 +751,21 @@ mod ed25519_impl {
 
     impl VerifyingKey {
         /// Create a verifying key from raw bytes.
+        ///
+        /// # Errors
+        ///
+        /// [`SignError::InvalidKey`] if the bytes do not decode to a curve
+        /// point; [`SignError::WeakKey`] if they decode to a small-order point.
+        /// The verifier's public key is trusted out-of-band by design (S2-D2
+        /// trust assumption 2), so a weak key here is a configuration error,
+        /// but a weak key would validate a signature over almost any message,
+        /// and refusing it costs nothing (2026-10 red-team hardening).
         pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, SignError> {
             let key = DalekVerifyingKey::from_bytes(bytes)
                 .map_err(|e| SignError::InvalidKey(e.to_string()))?;
+            if key.is_weak() {
+                return Err(SignError::WeakKey);
+            }
             Ok(Self(key))
         }
 
@@ -618,10 +775,16 @@ mod ed25519_impl {
         }
 
         /// Verify a signature over a Merkle root.
+        ///
+        /// Uses `ed25519_dalek`'s strict check: a non-canonical `R`, a small-
+        /// order `R`, or a small-order public key is rejected in addition to
+        /// the ordinary equation check. Honest signatures never trip any of
+        /// those, so this costs nothing and removes the only malleability the
+        /// lenient check leaves open (2026-10 red-team hardening).
         pub fn verify(&self, root: &MerkleRoot, signature: &Signature) -> Result<(), SignError> {
             let sig = DalekSignature::from_bytes(signature);
             self.0
-                .verify(root, &sig)
+                .verify_strict(root, &sig)
                 .map_err(|_| SignError::InvalidSignature)
         }
 
@@ -636,7 +799,7 @@ mod ed25519_impl {
         ) -> Result<(), SignError> {
             let sig = DalekSignature::from_bytes(signature);
             self.0
-                .verify(payload, &sig)
+                .verify_strict(payload, &sig)
                 .map_err(|_| SignError::InvalidSignature)
         }
     }
@@ -1702,10 +1865,15 @@ mod tests {
         let hybrid_sig = sign_root(&payload, &ed_key, &ml_key).unwrap();
 
         // Write a file with the signature attached to a dataset.
+        let meta = SignedRootMeta {
+            alg_id: HashAlg::Blake3,
+            version: 1,
+            timestamp: 1_700_000_000,
+        };
         let mut fw = FileWriter::new();
         let ds = fw.create_dataset("data");
         ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
-        write_sig_attr(ds, &hybrid_sig);
+        write_sig_attr(ds, &meta, &hybrid_sig);
         let file_bytes = fw.finish().expect("file should build");
 
         // Reopen the file from scratch and read the attribute back.
@@ -1721,8 +1889,10 @@ mod tests {
         .expect("dataset header parse failed");
         let attrs = extract_attributes(&data_hdr, sb.length_size).expect("extract attrs failed");
 
-        let recovered = read_sig_attr(&attrs).expect("merkle_sig attribute not found");
+        let (recovered_meta, recovered) =
+            read_sig_attr(&attrs).expect("merkle_sig attribute not found");
         assert_eq!(recovered, hybrid_sig);
+        assert_eq!(recovered_meta, meta);
 
         // The recovered signature must still verify against the original payload.
         let ed_pub = ed_key.verifying_key();

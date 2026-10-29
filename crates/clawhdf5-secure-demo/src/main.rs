@@ -46,7 +46,8 @@ use clawhdf5_format::superblock::Superblock;
 use clawhdf5_format::type_builders::AttrValue;
 use clawhdf5_sign::mldsa::{MlDsaSigningKey, MlDsaVerifyingKey};
 use clawhdf5_sign::{
-    HybridSignature, SigningKey, VerifyingKey, canonical_payload, read_sig_attr, sign_root,
+    HybridSignature, SignedRootMeta, SigningKey, VerifyingKey, canonical_payload, read_sig_attr,
+    sign_root, verify_sig_attr,
     verify_sig,
 };
 
@@ -97,6 +98,10 @@ struct WrittenFile {
 struct ReopenedFile {
     attr: MerkleAttr,
     companion_nodes: Vec<u8>,
+    /// `alg_id`/`version`/`timestamp` as read back from `merkle_sig` — the
+    /// fields that, together with `attr`, let the signature be verified
+    /// from the file alone.
+    meta: SignedRootMeta,
     sig: HybridSignature,
     ciphertext: Vec<u8>,
 }
@@ -214,6 +219,11 @@ fn stage1_build_and_write(
         &attr.grid_hash,
     );
     let sig = sign_root(&payload, ed_key, ml_key).expect("hybrid signing should succeed");
+    let meta = SignedRootMeta {
+        alg_id: attr.algorithm,
+        version,
+        timestamp,
+    };
 
     let mut all_ciphertext = Vec::with_capacity(CIPHERTEXT_LEN * NUM_CHUNKS);
     for ct in &ciphertexts {
@@ -224,7 +234,7 @@ fn stage1_build_and_write(
     ds.with_u8_data(&all_ciphertext);
     ds.set_attr(MERKLE_NODES_ATTR_NAME, AttrValue::Bytes(companion_nodes));
     ds.set_attr(MERKLE_ATTR_NAME, AttrValue::Bytes(attr.pack().to_vec()));
-    clawhdf5_sign::write_sig_attr(ds, &sig);
+    clawhdf5_sign::write_sig_attr(ds, &meta, &sig);
 
     let bytes = fw.finish().expect("file should build");
     std::fs::write(path, &bytes).expect("write file");
@@ -232,7 +242,8 @@ fn stage1_build_and_write(
     println!(
         "  {NUM_CHUNKS} chunks encrypted (ChaCha20-Poly1305), Merkle root computed over ciphertext (EtM),"
     );
-    println!("  hybrid Ed25519+ML-DSA-65 signature computed, merkle_root+merkle_nodes+merkle_sig written as real HDF5 attributes.");
+    println!("  hybrid Ed25519+ML-DSA-65 signature computed, merkle_root+merkle_nodes+merkle_sig written as real HDF5 attributes");
+    println!("  (merkle_sig carries alg_id/version/timestamp, so the file is verifiable on its own).");
 
     WrittenFile {
         root,
@@ -314,7 +325,7 @@ fn reopen_from_disk(path: &Path) -> ReopenedFile {
         .expect("merkle_nodes attribute present");
     let companion_nodes = nodes_msg.raw_data.clone();
 
-    let sig = read_sig_attr(&attrs).expect("merkle_sig attribute present and well-formed");
+    let (meta, sig) = read_sig_attr(&attrs).expect("merkle_sig attribute present and well-formed");
 
     // The dataset content itself: plain contiguous u8 data, read via the
     // high-level facade (only the attribute decoder lacks an opaque/Bytes
@@ -326,6 +337,7 @@ fn reopen_from_disk(path: &Path) -> ReopenedFile {
     ReopenedFile {
         attr,
         companion_nodes,
+        meta,
         sig,
         ciphertext,
     }
@@ -346,20 +358,18 @@ fn stage3_reopen_and_verify(
     assert_eq!(reopened.attr.root, written.root);
     assert_eq!(reopened.attr.companion_hash, written.companion_hash);
     assert_eq!(reopened.sig, written.sig);
+    assert_eq!(reopened.meta.version, written.version);
+    assert_eq!(reopened.meta.timestamp, written.timestamp);
     println!("  merkle_root, merkle_nodes, and merkle_sig read back out of the reopened file bytes.");
 
-    let payload = canonical_payload(
-        &reopened.attr.root,
-        &reopened.attr.companion_hash,
-        written.version,
-        written.timestamp,
-        reopened.attr.algorithm,
-        reopened.attr.leaf_format,
-        &reopened.attr.grid_hash,
-    );
-    verify_sig(&payload, &reopened.sig, ed_pub, ml_pub)
+    // Nothing from Stage 1's memory feeds this check: the attribute, the
+    // version, the timestamp, and the signature all came out of the file. An
+    // earlier version of this stage re-used `written.version`/`written.timestamp`
+    // here, which made the claim below true only for the process that wrote
+    // the file (2026-10 red-team finding).
+    verify_sig_attr(&reopened.attr, &reopened.meta, &reopened.sig, ed_pub, ml_pub)
         .expect("the real hybrid signature read back from the file must verify");
-    println!("  real Ed25519+ML-DSA-65 signature verifies against the payload reconstructed from the file.");
+    println!("  real Ed25519+ML-DSA-65 signature verifies against the payload reconstructed from the file alone.");
 
     let dataset = Dataset::from_owned(
         reopened.attr.clone(),
@@ -635,7 +645,13 @@ fn stage6_rollback(
         ed_pub,
         ml_pub,
     };
-    let restored_version = restore_to_version(&journal, RestoreTarget::LastKnownGood, &verifier, |record| {
+    // The verifier observed `reopened.meta.version` verify in Stage 3, so it
+    // refuses to be steered below it by a journal that lost its newest records.
+    let restored_version = restore_to_version(
+        &journal,
+        RestoreTarget::LastKnownGoodAtLeast(reopened.meta.version),
+        &verifier,
+        |record| {
         std::fs::copy(&snapshot_path, live_path).map_err(|_e| RestoreError::DatasetVerificationFailed {
             version: record.version,
             source: None,
@@ -647,12 +663,28 @@ fn stage6_rollback(
             ciphertext_chunks(&restored.ciphertext),
         );
         verify_restored_dataset(record, &restored_dataset)
-    })
+    },
+    )
     .expect("restore_to_version should succeed against the real signature and the real snapshot");
     assert_eq!(restored_version, written.version);
     println!(
         "  restore_to_version: signature gate (real Ed25519+ML-DSA-65) + dataset gate both passed; live file restored."
     );
+    // A journal stripped of its records must not become a rollback target
+    // either. (With only one journaled version here this trips the
+    // no-verifying-record gate; the floor itself -- an older record left
+    // behind after the newest is deleted -- is exercised by the
+    // `truncated_journal_rolls_back_stateless_target_but_not_floored_one`
+    // unit test in clawhdf5-format.)
+    let stripped = ProvenanceJournal::new();
+    let err = restore_to_version(
+        &stripped,
+        RestoreTarget::LastKnownGoodAtLeast(reopened.meta.version),
+        &verifier,
+        |_| Ok(()),
+    )
+    .expect_err("an emptied journal must not be an acceptable rollback target");
+    println!("  a journal stripped of its records is refused as a rollback target ({err}).");
 
     let final_dataset_bytes = std::fs::read(live_path).expect("read restored live file");
     let final_reopened = reopen_from_disk(live_path);

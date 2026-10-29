@@ -32,7 +32,25 @@ pub enum RestoreTarget {
     Version(u64),
     /// Restore the highest version whose signature verifies — the default
     /// "last known-good signed version".
+    ///
+    /// **Stateless.** The journal is an unsigned attribute, so an attacker
+    /// with file access can delete its newest records: the highest verifying
+    /// record is then an older, validly signed state, and this target restores
+    /// it without complaint. That is threat T4 (rollback) routed through
+    /// recovery. A verifier that remembers what it has seen should use
+    /// [`LastKnownGoodAtLeast`](Self::LastKnownGoodAtLeast) instead.
     LastKnownGood,
+    /// Restore the highest version whose signature verifies, **provided** it
+    /// is at least `floor` — the highest version this verifier has previously
+    /// observed for the file (see `merkle::VersionObservationStore`).
+    ///
+    /// If the journal's best verifying record is below the floor, the journal
+    /// has lost records this verifier knows existed (truncation or corruption
+    /// of the newest entries) and the restore is refused with
+    /// [`RestoreError::JournalTruncated`] rather than silently rolling the
+    /// dataset back past a state that was once verified good (2026-10
+    /// red-team finding).
+    LastKnownGoodAtLeast(u64),
 }
 
 /// Injected verifier for a record's hybrid signature over its signed root.
@@ -58,6 +76,17 @@ pub enum RestoreError {
     /// No version in the journal has a signature that verifies, so there is no
     /// known-good state to fall back to.
     NoKnownGoodVersion,
+    /// The highest verifying journal record is older than a version this
+    /// verifier has already observed. The journal's newest records are missing
+    /// or no longer verify — a rollback attack via journal truncation, or
+    /// corruption of exactly the records that matter — so recovery refuses to
+    /// pick an older state automatically.
+    JournalTruncated {
+        /// The floor the caller supplied (its highest observed version).
+        floor: u64,
+        /// The highest verifying version the journal still holds.
+        found: u64,
+    },
     /// The selected record's hybrid signature did not verify.
     SignatureInvalid {
         /// The version whose signature failed.
@@ -91,6 +120,13 @@ impl core::fmt::Display for RestoreError {
             RestoreError::NoKnownGoodVersion => {
                 write!(f, "no journaled version has a verifying signature")
             }
+            RestoreError::JournalTruncated { floor, found } => {
+                write!(
+                    f,
+                    "journal's best verifying version {found} is below the previously observed \
+                     version {floor}: newest records are missing or corrupt (possible rollback)"
+                )
+            }
             RestoreError::SignatureInvalid { version } => {
                 write!(f, "hybrid signature for version {version} did not verify")
             }
@@ -121,7 +157,8 @@ impl std::error::Error for RestoreError {}
 ///
 /// For [`RestoreTarget::Version`], the record must exist and its signature must
 /// verify. For [`RestoreTarget::LastKnownGood`], returns the highest-version
-/// record whose signature verifies.
+/// record whose signature verifies. For [`RestoreTarget::LastKnownGoodAtLeast`],
+/// the same, but refused if that record is older than the supplied floor.
 ///
 /// # Errors
 ///
@@ -152,6 +189,21 @@ pub fn select_restore_record<'j, V: SignatureVerifier + ?Sized>(
                 .rev()
                 .find(|r| verifier.verify(r))
                 .ok_or(RestoreError::NoKnownGoodVersion)
+        }
+        RestoreTarget::LastKnownGoodAtLeast(floor) => {
+            let best = journal
+                .records()
+                .iter()
+                .rev()
+                .find(|r| verifier.verify(r))
+                .ok_or(RestoreError::NoKnownGoodVersion)?;
+            if best.version < floor {
+                return Err(RestoreError::JournalTruncated {
+                    floor,
+                    found: best.version,
+                });
+            }
+            Ok(best)
         }
     }
 }
@@ -384,6 +436,84 @@ mod tests {
         .unwrap();
         assert_eq!(v, 2);
         assert_eq!(applied_version, Some(2));
+    }
+
+
+    /// 2026-10 red-team regression: journal truncation as a rollback attack.
+    ///
+    /// The provenance journal is an unsigned attribute. Deleting its newest
+    /// record leaves an older, validly signed record as "last known good", and
+    /// the stateless target restores it. A verifier that has observed the
+    /// newer version must refuse: the floor-checked target does.
+    #[test]
+    fn truncated_journal_rolls_back_stateless_target_but_not_floored_one() {
+        let (attr1, _) = dataset_for(&[b"v1-chunk".to_vec()]);
+        let (attr2, _) = dataset_for(&[b"v2-chunk".to_vec()]);
+        let verifier = AllowList(vec![1, 2]);
+
+        let mut full = ProvenanceJournal::new();
+        full.append(record(1, attr1.root)).unwrap();
+        full.append(record(2, attr2.root)).unwrap();
+
+        // Honest journal: both targets pick version 2.
+        assert_eq!(
+            select_restore_record(&full, RestoreTarget::LastKnownGood, &verifier)
+                .unwrap()
+                .version,
+            2
+        );
+        assert_eq!(
+            select_restore_record(&full, RestoreTarget::LastKnownGoodAtLeast(2), &verifier)
+                .unwrap()
+                .version,
+            2
+        );
+
+        // Attacker strips the newest record (re-serialize without it).
+        let mut truncated = ProvenanceJournal::new();
+        truncated.append(record(1, attr1.root)).unwrap();
+        let truncated = ProvenanceJournal::unpack(&truncated.pack()).unwrap();
+
+        // The stateless target happily rolls back to version 1 ...
+        assert_eq!(
+            select_restore_record(&truncated, RestoreTarget::LastKnownGood, &verifier)
+                .unwrap()
+                .version,
+            1
+        );
+        // ... and the floored target refuses, naming both versions.
+        assert!(matches!(
+            select_restore_record(&truncated, RestoreTarget::LastKnownGoodAtLeast(2), &verifier),
+            Err(RestoreError::JournalTruncated { floor: 2, found: 1 })
+        ));
+        // A floor at or below the best record is satisfied.
+        assert_eq!(
+            select_restore_record(&truncated, RestoreTarget::LastKnownGoodAtLeast(1), &verifier)
+                .unwrap()
+                .version,
+            1
+        );
+        // Corrupting (rather than deleting) the newest record's signature is
+        // the same condition from the verifier's point of view.
+        let only_v1_verifies = AllowList(vec![1]);
+        assert!(matches!(
+            select_restore_record(&full, RestoreTarget::LastKnownGoodAtLeast(2), &only_v1_verifies),
+            Err(RestoreError::JournalTruncated { floor: 2, found: 1 })
+        ));
+        // restore_to_version never invokes `apply` when the gate refuses.
+        let mut applied = false;
+        let err = restore_to_version(
+            &truncated,
+            RestoreTarget::LastKnownGoodAtLeast(2),
+            &verifier,
+            |_| {
+                applied = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, RestoreError::JournalTruncated { .. }));
+        assert!(!applied);
     }
 }
 
