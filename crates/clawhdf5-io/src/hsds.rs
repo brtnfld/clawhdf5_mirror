@@ -199,8 +199,8 @@ impl HsdsClient {
     ///
     /// The domain is specified as a path like `"/home/user/myfile.h5"`.
     pub async fn get_domain(&self, domain: &str) -> Result<DomainInfo, HsdsError> {
-        let url = format!("{}/?host={}", self.base_url, domain);
-        let resp = self.client.get(&url).send().await?;
+        let url = self.endpoint(&[], domain)?;
+        let resp = self.client.get(url).send().await?;
         check_status(&resp)?;
         let body: DomainInfo = resp.json().await?;
         Ok(body)
@@ -212,11 +212,8 @@ impl HsdsClient {
         domain: &str,
         group_id: &str,
     ) -> Result<Vec<LinkInfo>, HsdsError> {
-        let url = format!(
-            "{}/groups/{}/links?host={}",
-            self.base_url, group_id, domain
-        );
-        let resp = self.client.get(&url).send().await?;
+        let url = self.endpoint(&["groups", group_id, "links"], domain)?;
+        let resp = self.client.get(url).send().await?;
         check_status(&resp)?;
         let body: LinksResponse = resp.json().await?;
         Ok(body.links)
@@ -228,8 +225,8 @@ impl HsdsClient {
         domain: &str,
         dataset_id: &str,
     ) -> Result<DatasetInfoHsds, HsdsError> {
-        let url = format!("{}/datasets/{}?host={}", self.base_url, dataset_id, domain);
-        let resp = self.client.get(&url).send().await?;
+        let url = self.endpoint(&["datasets", dataset_id], domain)?;
+        let resp = self.client.get(url).send().await?;
         check_status(&resp)?;
         let body: DatasetInfoHsds = resp.json().await?;
         Ok(body)
@@ -245,11 +242,8 @@ impl HsdsClient {
         domain: &str,
         dataset_id: &str,
     ) -> Result<Vec<f64>, HsdsError> {
-        let url = format!(
-            "{}/datasets/{}/value?host={}",
-            self.base_url, dataset_id, domain
-        );
-        let resp = self.client.get(&url).send().await?;
+        let url = self.endpoint(&["datasets", dataset_id, "value"], domain)?;
+        let resp = self.client.get(url).send().await?;
         check_status(&resp)?;
         let body: ValueResponse = resp.json().await?;
         flatten_to_f64(&body.value)
@@ -258,6 +252,35 @@ impl HsdsClient {
     /// Returns the base URL this client is configured for.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Build `base_url/segment/.../segment?host=domain` with every component
+    /// percent-encoded.
+    ///
+    /// The request URLs used to be assembled with `format!`, so a domain
+    /// containing `&` or `#` injected extra query parameters (`&bucket=...`)
+    /// and an object id containing `/` or `?` rewrote the request path.
+    /// Domains typically come from the caller's own input and ids from the
+    /// server's link responses; neither should be able to change which API
+    /// endpoint is called (2026-10 red-team finding). Each id is one path
+    /// segment, and the domain is one query value.
+    fn endpoint(&self, segments: &[&str], domain: &str) -> Result<reqwest::Url, HsdsError> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|e| HsdsError::DataError(format!("invalid HSDS base URL: {e}")))?;
+        {
+            let mut path = url.path_segments_mut().map_err(|()| {
+                HsdsError::DataError("HSDS base URL cannot carry a path".into())
+            })?;
+            path.pop_if_empty();
+            if segments.is_empty() {
+                // The domain endpoint is the server root, `/?host=...`.
+                path.push("");
+            } else {
+                path.extend(segments);
+            }
+        }
+        url.query_pairs_mut().append_pair("host", domain);
+        Ok(url)
     }
 }
 
@@ -363,6 +386,37 @@ pub fn map_hsds_shape(shape_info: &ShapeInfo) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10 red-team regression: request components are encoded, so a
+    /// domain or id cannot add query parameters or change the endpoint.
+    #[test]
+    fn endpoint_encodes_domain_and_ids() {
+        let c = HsdsClient::new("http://localhost:5101/");
+        assert_eq!(
+            c.endpoint(&[], "/home/user/f.h5").unwrap().as_str(),
+            "http://localhost:5101/?host=%2Fhome%2Fuser%2Ff.h5"
+        );
+        assert_eq!(
+            c.endpoint(&["datasets", "d-123", "value"], "/a.h5").unwrap().as_str(),
+            "http://localhost:5101/datasets/d-123/value?host=%2Fa.h5"
+        );
+        // Query injection through the domain.
+        let u = c.endpoint(&["datasets", "d-1"], "/a.h5&bucket=other#x").unwrap();
+        let pairs: Vec<(String, String)> = u.query_pairs().into_owned().collect();
+        assert_eq!(pairs, vec![("host".into(), "/a.h5&bucket=other#x".into())]);
+        assert!(u.fragment().is_none());
+        // Path rewriting through an id.
+        let u = c.endpoint(&["datasets", "../groups/g-9?host=evil"], "/a.h5").unwrap();
+        let segs: Vec<&str> = u.path_segments().unwrap().collect();
+        assert_eq!(segs, vec!["datasets", "..%2Fgroups%2Fg-9%3Fhost=evil"]);
+        assert_eq!(u.query_pairs().count(), 1);
+        // A base URL with a path prefix keeps it.
+        let c = HsdsClient::new("https://example.org/hsds");
+        assert_eq!(
+            c.endpoint(&["groups", "g-1", "links"], "/f").unwrap().as_str(),
+            "https://example.org/hsds/groups/g-1/links?host=%2Ff"
+        );
+    }
 
     // --- Unit tests for flatten_to_f64 ---
 

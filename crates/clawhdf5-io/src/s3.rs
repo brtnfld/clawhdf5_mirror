@@ -323,6 +323,22 @@ pub struct FetchedProof {
 /// span would extend past the companion dataset's recorded size (e.g. a
 /// truncated/corrupted companion object); [`io::ErrorKind::UnexpectedEof`]
 /// on a short read.
+///
+/// # Cost: O(N) bytes, not O(log N)
+///
+/// The proof needs one node per level, but this issues a single range-GET
+/// covering every node from the lowest wanted index to the highest. In the
+/// level-order companion the lowest is always a child of the root (index 1
+/// or 2) and the highest is the leaf itself, so the span covers between half
+/// and all of the companion. Measured (2026-10 red-team review), for the 672
+/// bytes a 2^20-leaf proof needs: 33,554,400 bytes for leaf 0 and 67,108,800
+/// bytes for the last leaf -- 50,000x to 100,000x the proof itself. The plan
+/// (P2.5) asked for exactly one covering range request on the assumption that
+/// the slice is small; with this layout it is not. Do not report
+/// `bytes_transferred` from this function as an O(log N) result. Reaching
+/// O(log N) bytes needs either one small request per level (more round
+/// trips, ideally issued concurrently) or a companion layout that keeps each
+/// proof path contiguous -- a measurement-protocol decision, not made here.
 pub async fn fetch_chunk_proof<R: AsyncHDF5Read>(
     reader: &R,
     layout: ContiguousLayout,
