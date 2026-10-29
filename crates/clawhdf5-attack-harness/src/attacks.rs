@@ -491,6 +491,10 @@ pub fn t6a_root_attribute_stripped(ds: &HarnessDataset) -> AttackResult {
     let mut corrupted = attr.pack();
     corrupted.fill(0);
 
+    // Honest arm: the untampered packed attribute must round-trip, so a parser
+    // that rejected every input could not score a detection.
+    let accepts_honest = MerkleAttr::unpack(&attr.pack()).is_ok_and(|a| a.pack() == attr.pack());
+
     let start_time = Instant::now();
     let result = MerkleAttr::unpack(&corrupted);
     let latency = start_time.elapsed();
@@ -499,7 +503,7 @@ pub fn t6a_root_attribute_stripped(ds: &HarnessDataset) -> AttackResult {
         threat_class: "T6",
         attack_id: "T6a",
         dataset: ds.label,
-        detected: result.is_err(),
+        detected: accepts_honest && result.is_err(),
         verifier_fn: "MerkleAttr::unpack",
         latency,
         root_cause: None,
@@ -820,6 +824,12 @@ pub fn t3_provenance_forgery() -> AttackResult {
         })
         .unwrap();
 
+    // Honest arm: the untampered v1 record in the same journal must restore.
+    let accepts_honest = matches!(
+        select_restore_record(&journal, RestoreTarget::Version(1), &verifier),
+        Ok(r) if r.version == 1
+    );
+
     let start_time = Instant::now();
     let result = select_restore_record(&journal, RestoreTarget::Version(2), &verifier);
     let latency = start_time.elapsed();
@@ -828,7 +838,8 @@ pub fn t3_provenance_forgery() -> AttackResult {
         threat_class: "T3",
         attack_id: "T3",
         dataset: "n/a",
-        detected: matches!(result, Err(RestoreError::SignatureInvalid { version: 2 })),
+        detected: accepts_honest
+            && matches!(result, Err(RestoreError::SignatureInvalid { version: 2 })),
         verifier_fn: "select_restore_record",
         latency,
         root_cause: None,
@@ -842,6 +853,9 @@ pub fn t4a_whole_file_rollback() -> AttackResult {
     let mut store = VersionObservationStore::new();
     // The verifier has previously opened this file at version 2...
     store.observe("live.h5", 2).unwrap();
+    // Honest arm: reopening the same version must still be accepted, so a
+    // store that refused every repeat observation could not score a detection.
+    let accepts_honest = store.observe("live.h5", 2).is_ok();
 
     let start_time = Instant::now();
     // ...raw storage-level substitution restores the version-1 bytes (data,
@@ -854,13 +868,14 @@ pub fn t4a_whole_file_rollback() -> AttackResult {
         threat_class: "T4",
         attack_id: "T4a",
         dataset: "n/a",
-        detected: matches!(
-            result,
-            Err(MerkleError::VersionRollback {
-                observed: 1,
-                highest_seen: 2
-            })
-        ),
+        detected: accepts_honest
+            && matches!(
+                result,
+                Err(MerkleError::VersionRollback {
+                    observed: 1,
+                    highest_seen: 2
+                })
+            ),
         verifier_fn: "VersionObservationStore::observe",
         latency,
         root_cause: None,
@@ -914,7 +929,7 @@ pub fn t4b_selective_chunk_rollback() -> AttackResult {
     }
     let attr = MerkleAttr::from_tree_with_companion(&tree, companion_hash(&nodes)).with_leaf_format(LeafFormat::Bound);
     let grid = ChunkGridParams::new(vec![N], vec![1], 1, LayoutClass::Chunked, HashAlg::Blake3);
-    let sel = Selection::slice(&[1..N]); // chunks 1..N-1, containing TARGET
+    let sel = range_1d(1..N); // chunks 1..N-1, containing TARGET
     let construction = ProofConstruction::CanonicalPruned;
     let proof = extract_subset_with(&tree, &grid, &sel, LeafOrder::RowMajor, construction).unwrap();
 
@@ -1034,8 +1049,10 @@ pub fn t5_post_quantum_forgery() -> AttackResult {
         &[0u8; 32],
     );
     let genuine_sig = sign_root(&honest_payload, &ed_key, &ml_key).unwrap();
-    // Sanity: the genuine signature verifies before we attack anything.
-    debug_assert!(verify_sig(&honest_payload, &genuine_sig, &ed_pub, &ml_pub).is_ok());
+    // Honest arm: the genuine signature must verify. This was a debug_assert!,
+    // which the release build the harness runs as compiles out, so a verify_sig
+    // that rejected everything would have scored a detection.
+    let accepts_honest = verify_sig(&honest_payload, &genuine_sig, &ed_pub, &ml_pub).is_ok();
 
     let start_time = Instant::now();
     // The adversary has recovered ed_key (simulated CRQC break), tampers the
@@ -1064,7 +1081,7 @@ pub fn t5_post_quantum_forgery() -> AttackResult {
         threat_class: "T5",
         attack_id: "T5",
         dataset: "n/a",
-        detected: result.is_err(),
+        detected: accepts_honest && result.is_err(),
         verifier_fn: "clawhdf5_sign::verify_sig",
         latency,
         root_cause: None,
