@@ -564,13 +564,42 @@ fn parse_entries(
 }
 
 /// Replay WAL entries into a MemoryCache.
-pub fn replay_into_cache(entries: &[WalEntry], cache: &mut crate::cache::MemoryCache) {
-    for entry in entries {
+///
+/// Embeddings are normalized exactly as `HDF5Memory::save` does: an empty
+/// (text-only) embedding becomes the store's zero vector, so the replayed
+/// cache matches what a flush writes and a reload reads.
+///
+/// # Errors
+///
+/// [`MemoryError::Schema`] if a `Save` entry's embedding is neither empty nor
+/// the cache's dimension. The sidecar is file data (and a version-1 sidecar
+/// is unauthenticated), and replaying a mismatched vector would panic every
+/// later search and make the next flush unreadable (2026-10 red-team
+/// finding). Every entry is checked before any is applied.
+pub fn replay_into_cache(
+    entries: &[WalEntry],
+    cache: &mut crate::cache::MemoryCache,
+) -> Result<(), MemoryError> {
+    let dim = cache.embedding_dim;
+    let mut embeddings = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        embeddings.push(if entry.entry_type == WalEntryType::Save {
+            crate::normalize_embedding(entry.embedding.clone(), dim).map_err(|_| {
+                MemoryError::Schema(format!(
+                    "WAL entry {i} has a {}-dimensional embedding; the store uses {dim}",
+                    entry.embedding.len()
+                ))
+            })?
+        } else {
+            Vec::new()
+        });
+    }
+    for (entry, embedding) in entries.iter().zip(embeddings) {
         match entry.entry_type {
             WalEntryType::Save => {
                 cache.push(
                     entry.chunk.clone(),
-                    entry.embedding.clone(),
+                    embedding,
                     entry.source_channel.clone(),
                     entry.timestamp,
                     entry.session_id.clone(),
@@ -585,6 +614,7 @@ pub fn replay_into_cache(entries: &[WalEntry], cache: &mut crate::cache::MemoryC
             WalEntryType::ActivationUpdate => {}
         }
     }
+    Ok(())
 }
 
 // --- Binary helpers ---
@@ -923,7 +953,7 @@ mod tests {
 
         // Replay into a fresh cache (simulates what open() does)
         let mut cache = crate::cache::MemoryCache::new(4);
-        super::replay_into_cache(&entries, &mut cache);
+        super::replay_into_cache(&entries, &mut cache).unwrap();
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.chunks[0], "replay-a");
         assert_eq!(cache.chunks[1], "replay-b");

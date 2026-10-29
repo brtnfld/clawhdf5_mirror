@@ -26,12 +26,24 @@ pub fn blas_cosine_batch(
     let dim = query.len();
     let n = vectors.len();
 
-    // Build a mapping of active (non-tombstoned) indices and a flat matrix
+    // Build a mapping of active (non-tombstoned) indices and a flat matrix.
+    //
+    // Only vectors of exactly `dim` elements may enter the matrix. sgemm
+    // below reads `active_n * dim` elements from `flat`, and this loop used to
+    // append every vector whatever its length: one stored vector shorter than
+    // the query left `flat` short and sgemm read uninitialized memory past its
+    // end -- undefined behavior from a safe pub fn, despite the SAFETY comment
+    // claiming the lengths were checked (2026-10 red-team finding). A
+    // mismatched vector cannot be compared, so it is skipped, matching the
+    // scalar and SIMD paths in vector_search.
     let mut active_indices: Vec<usize> = Vec::with_capacity(n);
-    let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
+    let mut flat: Vec<f32> = Vec::with_capacity(n.saturating_mul(dim));
 
     for i in 0..n {
         if i < tombstones.len() && tombstones[i] != 0 {
+            continue;
+        }
+        if vectors[i].len() != dim {
             continue;
         }
         active_indices.push(i);
@@ -40,6 +52,10 @@ pub fn blas_cosine_batch(
 
     let active_n = active_indices.len();
     if active_n == 0 {
+        return Vec::new();
+    }
+    // The invariant sgemm's reads depend on, checked rather than assumed.
+    if Some(flat.len()) != active_n.checked_mul(dim) || norms.len() < n {
         return Vec::new();
     }
 
@@ -98,8 +114,18 @@ pub fn blas_cosine_batch_flat(
     if query_norm == 0.0 || vectors_flat.is_empty() {
         return Vec::new();
     }
+    // sgemm reads `dim` elements of `query` and `n * dim` of the matrix. A
+    // `dim` that disagrees with the query read past the query's end
+    // (undefined behavior), and `dim == 0` divided by zero below (2026-10
+    // red-team finding).
+    if dim == 0 || query.len() != dim {
+        return Vec::new();
+    }
 
     let n = vectors_flat.len() / dim;
+    if norms.len() < n {
+        return Vec::new();
+    }
 
     // If no tombstones, we can use the flat buffer directly
     let all_active = tombstones.iter().all(|&t| t == 0);
@@ -610,5 +636,36 @@ mod tests {
             "BLAS 10K took {}ms, expected < 500ms",
             elapsed.as_millis()
         );
+    }
+}
+
+#[cfg(test)]
+mod redteam_2026_10 {
+    use super::*;
+
+    /// A stored vector shorter than the query used to leave the packed
+    /// matrix short while sgemm read `active_n * dim` elements: undefined
+    /// behavior. Mismatched vectors are now skipped and the rest still score.
+    #[test]
+    fn mismatched_vector_lengths_are_skipped_not_read_past() {
+        let query = vec![1.0f32, 0.0, 0.0, 0.0];
+        let vectors = vec![vec![1.0, 0.0, 0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
+        let norms: Vec<f32> = vectors.iter().map(|v| clawhdf5_accel::vector_norm(v)).collect();
+        let results = blas_cosine_batch(&query, &vectors, &norms, &[], 10);
+        let ids: Vec<usize> = results.iter().map(|r| r.0).collect();
+        assert!(ids.contains(&0) && ids.contains(&2));
+        assert!(!ids.contains(&1), "the 2-element vector cannot be scored against a 4-element query");
+        assert!((results[0].1 - 1.0).abs() < 1e-6);
+    }
+
+    /// A `dim` that disagrees with the query read past the query's end; zero
+    /// divided by zero.
+    #[test]
+    fn flat_rejects_dim_that_disagrees_with_query() {
+        let flat = vec![1.0f32; 16];
+        let norms = vec![2.0f32; 4];
+        assert!(blas_cosine_batch_flat(&[1.0, 0.0], &flat, &norms, &[], 4, 10).is_empty());
+        assert!(blas_cosine_batch_flat(&[1.0, 0.0, 0.0, 0.0], &flat, &norms, &[], 0, 10).is_empty());
+        assert_eq!(blas_cosine_batch_flat(&[1.0, 0.0, 0.0, 0.0], &flat, &norms, &[], 4, 10).len(), 4);
     }
 }

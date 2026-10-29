@@ -213,6 +213,21 @@ pub trait AgentMemory {
     fn get_session_summary(&self, session_id: &str) -> Result<Option<String>>;
 }
 
+/// See [`HDF5Memory::normalize_embedding`]: empty becomes the zero vector of
+/// `dim`, the right length passes through, anything else is an error.
+pub(crate) fn normalize_embedding(embedding: Vec<f32>, dim: usize) -> Result<Vec<f32>> {
+    if embedding.len() == dim {
+        Ok(embedding)
+    } else if embedding.is_empty() {
+        Ok(vec![0.0f32; dim])
+    } else {
+        Err(MemoryError::Schema(format!(
+            "embedding has {} dimensions; this store uses {dim}",
+            embedding.len()
+        )))
+    }
+}
+
 // --- HDF5Memory ---
 
 pub struct HDF5Memory {
@@ -300,6 +315,29 @@ impl HDF5Memory {
         Self::open_inner(path, true)
     }
 
+    /// Bring an embedding to the store's dimension, or reject it.
+    ///
+    /// An empty embedding is a text-only memory (the OpenClaw backend writes
+    /// these and supplies vectors externally). The file format has no "no
+    /// embedding" state: `/memory/embeddings` is an `[n, dim]` matrix, so an
+    /// empty row reaches disk as zeros and reloads as a zero vector. It is
+    /// normalized to that zero vector here, so memory and disk agree. Before
+    /// this (2026-10 red-team finding), the content root was computed over the
+    /// empty row on write and over the zeros on read, so a text-only store
+    /// failed to reopen with a false "content tampering" error after its first
+    /// flush -- and `hybrid_search` flushes, so one search was enough. That
+    /// affected every OpenClaw store since the P2.4 integrity wiring. Zero
+    /// vectors score 0 in both the linear and HNSW vector stages; BM25 still
+    /// ranks them.
+    ///
+    /// Any other length is rejected. A mismatched vector used to be accepted:
+    /// it panicked every later search (the SIMD kernels assert equal lengths,
+    /// and through the Android C ABI or the Node binding a panic aborts the
+    /// host process), and on flush it made the stored matrix inconsistent.
+    fn normalize_embedding(&self, embedding: Vec<f32>) -> Result<Vec<f32>> {
+        normalize_embedding(embedding, self.config.embedding_dim)
+    }
+
     fn open_inner(path: &Path, strict: bool) -> Result<Self> {
         let (config, mut cache, sessions, knowledge) = if strict {
             storage::read_from_disk_strict(path)?
@@ -319,7 +357,7 @@ impl HDF5Memory {
             } else {
                 wal::WalFile::read_entries(&wal_path)?
             };
-            wal::replay_into_cache(&entries, &mut cache);
+            wal::replay_into_cache(&entries, &mut cache)?;
             Some(if strict {
                 wal::WalFile::open_strict(&wal_path)?
             } else {
@@ -538,7 +576,8 @@ impl HDF5Memory {
     /// Upsert: if an active entry with the same tags (key) exists, update it in-place.
     /// Otherwise append a new entry. Use this for key-based memory stores where
     /// the same key should not create duplicates.
-    pub fn save_or_update(&mut self, entry: MemoryEntry) -> Result<usize> {
+    pub fn save_or_update(&mut self, mut entry: MemoryEntry) -> Result<usize> {
+        entry.embedding = self.normalize_embedding(entry.embedding)?;
         if let Some(existing_idx) = self.cache.find_by_tags(&entry.tags) {
             if let Some(ref mut w) = self.wal {
                 let wal_entry = wal::WalEntry {
@@ -581,7 +620,8 @@ impl HDF5Memory {
 }
 
 impl AgentMemory for HDF5Memory {
-    fn save(&mut self, entry: MemoryEntry) -> Result<usize> {
+    fn save(&mut self, mut entry: MemoryEntry) -> Result<usize> {
+        entry.embedding = self.normalize_embedding(entry.embedding)?;
         if let Some(ref mut w) = self.wal {
             let wal_entry = wal::WalEntry {
                 entry_type: wal::WalEntryType::Save,
@@ -617,7 +657,11 @@ impl AgentMemory for HDF5Memory {
         Ok(idx)
     }
 
-    fn save_batch(&mut self, entries: Vec<MemoryEntry>) -> Result<Vec<usize>> {
+    fn save_batch(&mut self, mut entries: Vec<MemoryEntry>) -> Result<Vec<usize>> {
+        // All-or-nothing: normalize every entry before caching any of them.
+        for entry in &mut entries {
+            entry.embedding = self.normalize_embedding(std::mem::take(&mut entry.embedding))?;
+        }
         let mut indices = Vec::with_capacity(entries.len());
         for entry in entries {
             let idx = self.cache.push(
@@ -1498,10 +1542,14 @@ impl HDF5Memory {
         })?;
         let view = memory_strategy::CacheStoreView::new(&self.cache, &self.knowledge);
         let output = strat.evaluate(&exchange, &view);
+        let mut normalized = Vec::with_capacity(output.entries.len());
         for e in &output.entries {
+            normalized.push(self.normalize_embedding(e.embedding.clone())?);
+        }
+        for (e, embedding) in output.entries.iter().zip(normalized) {
             self.cache.push(
                 e.chunk.clone(),
-                e.embedding.clone(),
+                embedding,
                 e.source_channel.clone(),
                 e.timestamp,
                 e.session_id.clone(),
@@ -1601,7 +1649,14 @@ impl HDF5Memory {
                 .text
                 .clone()
                 .unwrap_or_else(|| String::from_utf8_lossy(&entry.value).into_owned());
-            let embedding = entry.embedding.clone().unwrap_or_else(|| vec![0.0f32; dim]);
+            // The entry has already been taken out of the ephemeral store, so
+            // an error here would lose it. A wrong-dimension embedding gets
+            // the same zero-vector fallback as a missing one; the text is kept
+            // and stays searchable through BM25.
+            let embedding = match entry.embedding.clone() {
+                Some(e) if e.len() == dim => e,
+                _ => vec![0.0f32; dim],
+            };
 
             self.cache.push(
                 chunk,

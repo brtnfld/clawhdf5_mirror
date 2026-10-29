@@ -314,7 +314,7 @@ fn unchained_activation_record_in_v2_wal_fails_closed() {
     let entries = WalFile::read_entries(&wal_path).expect("chained 0x03 is fine");
     assert_eq!(entries.len(), 3);
     let mut cache = MemoryCache::new(DIM);
-    clawhdf5_agent::wal::replay_into_cache(&entries, &mut cache);
+    clawhdf5_agent::wal::replay_into_cache(&entries, &mut cache).unwrap();
     assert_eq!(cache.len(), 2);
 }
 
@@ -372,4 +372,89 @@ fn async_open_strict_rejects_an_unprotected_store() {
             Err(MemoryError::Integrity(_))
         ));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Embedding dimensions (follow-up round)
+// ---------------------------------------------------------------------------
+
+fn entry_with(dim: usize) -> clawhdf5_agent::MemoryEntry {
+    clawhdf5_agent::MemoryEntry {
+        chunk: "alpha text about hashing".into(),
+        embedding: vec![0.5; dim],
+        source_channel: "c".into(),
+        timestamp: 1.0,
+        session_id: "s".into(),
+        tags: String::new(),
+    }
+}
+
+/// Text-only memories (empty embeddings, as the OpenClaw backend writes) used
+/// to make the store unopenable after its first flush: the content root was
+/// computed over the empty row on write and over the zero-filled row on read,
+/// so every reopen reported "content tampering". `hybrid_search` flushes, so
+/// one search was enough. Present since the P2.4 integrity wiring.
+#[test]
+fn openclaw_text_only_store_reopens_after_a_search() {
+    use clawhdf5_agent::openclaw::{ClawhdfBackend, MemoryBackend};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oc.h5");
+    {
+        let mut b = ClawhdfBackend::create(&path, DIM).unwrap();
+        b.write("memory/a.md", "alpha text about hashing").unwrap();
+        assert_eq!(b.search("hashing", &[], 5).len(), 1);
+    }
+    let mut b = ClawhdfBackend::open_strict(&path).expect("a text-only store must reopen");
+    assert_eq!(b.search("hashing", &[], 5).len(), 1);
+    assert_eq!(b.stats().total_embeddings, 0, "a text-only memory has no embedding");
+}
+
+/// A wrong-dimension embedding used to be accepted: every later search then
+/// panicked in the SIMD kernel's length assertion (a process abort through
+/// the C ABI or the Node binding), and the next flush made the store
+/// unopenable. It must be rejected up front, with the store left intact.
+#[test]
+fn wrong_dimension_embedding_is_rejected_and_search_never_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dim.h5");
+    let mut cfg = config(path.clone(), DIM);
+    cfg.wal_enabled = false;
+    let mut m = HDF5Memory::create(cfg).unwrap();
+    m.save(entry_with(DIM)).unwrap();
+    assert!(matches!(m.save(entry_with(DIM - 1)), Err(MemoryError::Schema(_))));
+    assert!(matches!(m.save_batch(vec![entry_with(DIM), entry_with(DIM + 1)]), Err(MemoryError::Schema(_))));
+    assert_eq!(m.count(), 1, "a rejected batch caches nothing");
+    // Queries of the wrong dimension no longer reach the kernel assertion.
+    for q in [vec![0.5f32; DIM - 1], vec![0.5f32; DIM + 3], vec![]] {
+        let _ = m.hybrid_search(&q, "hashing", 0.7, 0.3, 5);
+    }
+    drop(m);
+    HDF5Memory::open_strict(&path).expect("the store is still intact");
+}
+
+/// WAL replay applies the same rule: a wrong-dimension entry in the sidecar
+/// is refused, an empty one becomes the zero vector.
+#[test]
+fn wal_replay_normalizes_or_rejects_embedding_dimensions() {
+    let mut cache = MemoryCache::new(DIM);
+    let mut empty = entry_with(0);
+    empty.embedding.clear();
+    let as_wal = |e: &clawhdf5_agent::MemoryEntry| clawhdf5_agent::wal::WalEntry {
+        entry_type: clawhdf5_agent::wal::WalEntryType::Save,
+        timestamp: e.timestamp,
+        chunk: e.chunk.clone(),
+        embedding: e.embedding.clone(),
+        source_channel: e.source_channel.clone(),
+        session_id: e.session_id.clone(),
+        tags: e.tags.clone(),
+        tombstone_index: None,
+    };
+    clawhdf5_agent::wal::replay_into_cache(&[as_wal(&empty)], &mut cache).unwrap();
+    assert_eq!(cache.embeddings[0], vec![0.0; DIM]);
+    let bad = as_wal(&entry_with(DIM + 2));
+    assert!(matches!(
+        clawhdf5_agent::wal::replay_into_cache(&[bad], &mut cache),
+        Err(MemoryError::Schema(_))
+    ));
+    assert_eq!(cache.len(), 1, "a refused replay applies nothing");
 }

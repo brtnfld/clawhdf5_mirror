@@ -737,7 +737,10 @@ impl MemoryBackend for ClawhdfBackend {
             .embeddings
             .iter()
             .enumerate()
-            .filter(|(i, emb)| cache.tombstones[*i] == 0 && !emb.is_empty())
+            // A text-only memory is stored as the zero vector (the file format
+            // has no "no embedding" state), so "has an embedding" means
+            // "has a non-zero vector" -- which also stays correct after reload.
+            .filter(|(i, emb)| cache.tombstones[*i] == 0 && emb.iter().any(|&x| x != 0.0))
             .count();
 
         let file_size_bytes = std::fs::metadata(&self.hdf5_path)

@@ -16,6 +16,14 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     clawhdf5_accel::cosine_similarity(a, b)
 }
 
+// Dimension mismatches are skipped, not scored. The SIMD kernels in
+// clawhdf5-accel assert equal lengths (that assertion is what keeps their
+// unsafe loads in bounds), so a query whose dimension differed from a stored
+// vector used to panic the whole search; through the Android C ABI or the
+// Node binding a panic aborts the host process (2026-10 red-team finding).
+// A mismatched vector cannot be compared meaningfully, so it simply
+// contributes no vector score; BM25 still ranks it.
+
 /// Compute cosine similarity between `query` and each vector in `vectors`,
 /// skipping tombstoned entries (tombstone != 0).
 ///
@@ -42,6 +50,9 @@ pub fn cosine_similarity_batch(
             if i < tombstones.len() && tombstones[i] != 0 {
                 continue;
             }
+            if vectors[i].len() != query.len() {
+                continue; // dimension mismatch: see module note
+            }
             let vec_norm = clawhdf5_accel::vector_norm(&vectors[i]);
             let score = crate::cosine_similarity_prenorm(query, query_norm, &vectors[i], vec_norm);
             results.push((i, score));
@@ -52,6 +63,9 @@ pub fn cosine_similarity_batch(
     for i in (chunks * 4)..n {
         if i < tombstones.len() && tombstones[i] != 0 {
             continue;
+        }
+        if vectors[i].len() != query.len() {
+            continue; // dimension mismatch: see module note
         }
         let vec_norm = clawhdf5_accel::vector_norm(&vectors[i]);
         let score = crate::cosine_similarity_prenorm(query, query_norm, &vectors[i], vec_norm);
@@ -83,6 +97,9 @@ pub fn cosine_similarity_batch_prenorm(
     for i in 0..n {
         if i < tombstones.len() && tombstones[i] != 0 {
             continue;
+        }
+        if vectors[i].len() != query.len() {
+            continue; // dimension mismatch: see module note
         }
         let vec_norm = norms[i];
         let score = crate::cosine_similarity_prenorm(query, query_norm, &vectors[i], vec_norm);
@@ -190,6 +207,9 @@ pub fn parallel_cosine_batch(
                 if i < tombstones.len() && tombstones[i] != 0 {
                     continue;
                 }
+                if vec.len() != query.len() {
+                    continue; // dimension mismatch: see module note
+                }
                 let vec_norm = clawhdf5_accel::vector_norm(vec);
                 let score = crate::cosine_similarity_prenorm(query, query_norm, vec, vec_norm);
                 local.push((i, score));
@@ -237,6 +257,9 @@ pub fn parallel_cosine_batch_prenorm(
                 let i = base + j;
                 if i < tombstones.len() && tombstones[i] != 0 {
                     continue;
+                }
+                if vec.len() != query.len() {
+                    continue; // dimension mismatch: see module note
                 }
                 let score = crate::cosine_similarity_prenorm(query, query_norm, vec, norms[i]);
                 local.push((i, score));
