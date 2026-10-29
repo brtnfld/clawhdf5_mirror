@@ -176,7 +176,16 @@ impl Dataspace {
                 if self.dimensions.is_empty() {
                     0
                 } else {
-                    self.dimensions.iter().product()
+                    // Saturating: the extents are untrusted file data, and a
+                    // plain `product()` panicked in debug builds and wrapped
+                    // to a small, plausible-looking count in release. Every
+                    // consumer multiplies by the element size with checked
+                    // arithmetic, so a saturated count becomes a clean
+                    // overflow error there (2026-10 red-team finding).
+                    self.dimensions
+                        .iter()
+                        .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+                        .unwrap_or(u64::MAX)
                 }
             }
         }
@@ -186,6 +195,26 @@ impl Dataspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10 red-team regression: crafted extents must saturate, not panic
+    /// (debug) or wrap to a small plausible count (release).
+    #[test]
+    fn num_elements_saturates_on_overflow() {
+        let ds = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 2,
+            dimensions: vec![1 << 40, 1 << 40],
+            max_dimensions: None,
+        };
+        assert_eq!(ds.num_elements(), u64::MAX);
+        let ok = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 2,
+            dimensions: vec![3, 7],
+            max_dimensions: None,
+        };
+        assert_eq!(ok.num_elements(), 21);
+    }
 
     fn build_v1_dataspace(rank: u8, flags: u8, dims: &[u64], max_dims: Option<&[u64]>) -> Vec<u8> {
         let length_size = 8u8;

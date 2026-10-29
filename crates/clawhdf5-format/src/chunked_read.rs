@@ -379,6 +379,83 @@ pub fn generate_implicit_chunks(
     Ok(chunks)
 }
 
+/// HDF5's own ceiling on a single chunk's uncompressed size: chunk sizes are
+/// stored as 32-bit values in the v1 B-tree and the library refuses chunks of
+/// 4 GiB or more.
+const MAX_CHUNK_BYTES: usize = u32::MAX as usize;
+
+/// Validate a chunked read's sizes once, before anything is allocated or
+/// decompressed (2026-10 red-team finding).
+///
+/// Returns `(chunk_total_bytes, total_bytes)`. Dataspace dims, chunk dims, and
+/// the element size are independent untrusted fields; the readers used to
+/// multiply them with plain `*`, which panicked in debug and wrapped in
+/// release, and then allocated the output with `vec![0u8; n]`, which aborts
+/// the process when the allocation fails. Every suffix product is checked
+/// because the readers derive row-major strides from them (a zero extent on
+/// one axis does not stop the strides of the others from overflowing). The
+/// chunk size also bounds what [`decompress_chunk`] may decode, so it is
+/// capped at HDF5's own 4 GiB chunk limit.
+pub(crate) fn checked_read_sizes(
+    dataspace: &Dataspace,
+    chunk_dims: &[usize],
+    elem_size: usize,
+) -> Result<(usize, usize), FormatError> {
+    let overflow = |what: &str| FormatError::Overflow(format!("chunked read: {what}"));
+
+    // Suffix products (the readers' row-major strides), skipping zero extents
+    // so they are checked even when the dataset itself is empty.
+    let mut suffix: usize = 1;
+    for &d in dataspace.dimensions.iter().rev() {
+        let d = usize::try_from(d).map_err(|_| overflow("dataspace extent"))?;
+        if d != 0 {
+            suffix = suffix
+                .checked_mul(d)
+                .ok_or_else(|| overflow("dataspace stride"))?;
+        }
+    }
+    let total_elems = usize::try_from(dataspace.num_elements())
+        .map_err(|_| overflow("dataspace size"))?;
+    if dataspace.num_elements() == u64::MAX {
+        return Err(overflow("dataspace size"));
+    }
+    let total_bytes = total_elems
+        .checked_mul(elem_size)
+        .ok_or_else(|| overflow("dataset byte size"))?;
+
+    let mut chunk_elems: usize = 1;
+    for &c in chunk_dims {
+        if c == 0 {
+            return Err(FormatError::ChunkedReadError(
+                "chunked layout has a zero chunk dimension".into(),
+            ));
+        }
+        chunk_elems = chunk_elems
+            .checked_mul(c)
+            .ok_or_else(|| overflow("chunk size"))?;
+    }
+    let chunk_total_bytes = chunk_elems
+        .checked_mul(elem_size)
+        .ok_or_else(|| overflow("chunk byte size"))?;
+    if chunk_total_bytes > MAX_CHUNK_BYTES {
+        return Err(FormatError::ChunkedReadError(format!(
+            "chunk of {chunk_total_bytes} bytes exceeds HDF5's 4 GiB chunk limit"
+        )));
+    }
+    Ok((chunk_total_bytes, total_bytes))
+}
+
+/// Allocate a zeroed output buffer, reporting failure as an error instead of
+/// aborting. `vec![0u8; n]` calls `handle_alloc_error` on failure, which
+/// terminates the process; a crafted dataspace must not be able to do that.
+pub(crate) fn try_zeroed_vec(len: usize) -> Result<Vec<u8>, FormatError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| FormatError::Overflow(format!("cannot allocate {len}-byte read buffer")))?;
+    v.resize(len, 0);
+    Ok(v)
+}
+
 /// Read a chunked dataset, decompressing chunks as needed.
 pub fn read_chunked_data(
     file_data: &[u8],
@@ -451,6 +528,7 @@ pub fn read_chunked_data(
             rank
         )));
     }
+    let (chunk_total_bytes, total_bytes) = checked_read_sizes(dataspace, &chunk_dims, elem_size)?;
 
     // Collect chunks based on version and index type
     let chunks = match (version, chunk_index_type) {
@@ -460,7 +538,7 @@ pub fn read_chunked_data(
         }
         (4, Some(1)) => {
             // Single chunk — one chunk covering the entire dataset
-            let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+            let chunk_byte_size: usize = chunk_total_bytes;
             let (csize, fmask) = if let Some(fs) = single_filtered_size {
                 (fs as u32, single_filter_mask.unwrap_or(0))
             } else {
@@ -521,9 +599,7 @@ pub fn read_chunked_data(
     };
 
     // Assemble output
-    let total_elements = dataspace.num_elements() as usize;
-    let total_bytes = total_elements * elem_size;
-    let mut output = vec![0u8; total_bytes];
+    let mut output = try_zeroed_vec(total_bytes)?;
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -535,8 +611,6 @@ pub fn read_chunked_data(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
 
     // Fast path: no filters — copy directly from file_data without intermediate alloc
     if pipeline.is_none() {
@@ -699,6 +773,7 @@ pub fn read_chunked_data_cached(
             rank
         )));
     }
+    let (chunk_total_bytes, total_bytes) = checked_read_sizes(dataspace, &chunk_dims, elem_size)?;
 
     // The per-file cache is shared across datasets; bind it to this one so a
     // different dataset's chunk index is never reused for this read.
@@ -709,7 +784,7 @@ pub fn read_chunked_data_cached(
         let chunks = match (version, chunk_index_type) {
             (3, _) => collect_chunk_info(file_data, addr, ndims, offset_size, length_size)?,
             (4, Some(1)) => {
-                let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+                let chunk_byte_size: usize = chunk_total_bytes;
                 let (csize, fmask) = if let Some(fs) = single_filtered_size {
                     (fs as u32, single_filter_mask.unwrap_or(0))
                 } else {
@@ -775,9 +850,7 @@ pub fn read_chunked_data_cached(
     let chunks = cache.all_indexed_chunks().unwrap_or_default();
 
     // Assemble output
-    let total_elements = dataspace.num_elements() as usize;
-    let total_bytes = total_elements * elem_size;
-    let mut output = vec![0u8; total_bytes];
+    let mut output = try_zeroed_vec(total_bytes)?;
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -789,8 +862,6 @@ pub fn read_chunked_data_cached(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
@@ -1072,6 +1143,7 @@ pub fn read_chunked_data_sweep(
             rank
         )));
     }
+    let (chunk_total_bytes, total_bytes) = checked_read_sizes(dataspace, &chunk_dims, elem_size)?;
 
     // The per-file cache is shared across datasets; bind it to this one so a
     // different dataset's chunk index is never reused for this read.
@@ -1082,7 +1154,7 @@ pub fn read_chunked_data_sweep(
         let chunks = match (version, chunk_index_type) {
             (3, _) => collect_chunk_info(file_data, addr, ndims, offset_size, length_size)?,
             (4, Some(1)) => {
-                let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+                let chunk_byte_size: usize = chunk_total_bytes;
                 let (csize, fmask) = if let Some(fs) = single_filtered_size {
                     (fs as u32, single_filter_mask.unwrap_or(0))
                 } else {
@@ -1148,9 +1220,7 @@ pub fn read_chunked_data_sweep(
     let chunks = cache.all_indexed_chunks().unwrap_or_default();
 
     // Assemble output
-    let total_elements = dataspace.num_elements() as usize;
-    let total_bytes = total_elements * elem_size;
-    let mut output = vec![0u8; total_bytes];
+    let mut output = try_zeroed_vec(total_bytes)?;
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -1162,8 +1232,6 @@ pub fn read_chunked_data_sweep(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
@@ -1315,6 +1383,7 @@ pub fn read_chunked_data_indexed(
             rank
         )));
     }
+    let (chunk_total_bytes, total_bytes) = checked_read_sizes(dataspace, &chunk_dims, elem_size)?;
 
     // The per-file cache is shared across datasets; bind it to this one so a
     // different dataset's chunk index is never reused for this read.
@@ -1325,7 +1394,7 @@ pub fn read_chunked_data_indexed(
         let chunks = match (version, chunk_index_type) {
             (3, _) => collect_chunk_info(file_data, addr, ndims, offset_size, length_size)?,
             (4, Some(1)) => {
-                let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+                let chunk_byte_size: usize = chunk_total_bytes;
                 let (csize, fmask) = if let Some(fs) = single_filtered_size {
                     (fs as u32, single_filter_mask.unwrap_or(0))
                 } else {
@@ -1446,7 +1515,8 @@ pub fn read_chunked_data_indexed(
     }
 
     // Assemble using pre-computed layout
-    let mut output = vec![0u8; output_bytes];
+    debug_assert_eq!(output_bytes, total_bytes);
+    let mut output = try_zeroed_vec(output_bytes)?;
     let data_refs: Vec<&[u8]> = chunk_buffers.iter().map(|b| b.as_slice()).collect();
     cache.with_chunk_layout(|layout| {
         layout.assemble(&data_refs, &mut output);
@@ -1549,6 +1619,43 @@ fn copy_chunk_to_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn simple_space(dims: Vec<u64>) -> Dataspace {
+        Dataspace {
+            space_type: crate::dataspace::DataspaceType::Simple,
+            rank: dims.len() as u8,
+            dimensions: dims,
+            max_dimensions: None,
+        }
+    }
+
+    /// 2026-10 red-team regression: crafted dataspace/chunk extents used to
+    /// overflow plain `*` (debug panic, release wrap) and then abort the
+    /// process in `vec![0u8; n]`. Every case is now a clean error.
+    #[test]
+    fn checked_read_sizes_rejects_overflow_and_oversized_chunks() {
+        // Honest 2-D dataset.
+        let (chunk, total) = checked_read_sizes(&simple_space(vec![10, 6]), &[4, 3], 4).unwrap();
+        assert_eq!((chunk, total), (48, 240));
+        // Dataset product overflows.
+        assert!(checked_read_sizes(&simple_space(vec![1 << 40, 1 << 40]), &[1, 1], 1).is_err());
+        // A zero extent does not excuse overflowing strides on the other axes.
+        assert!(checked_read_sizes(&simple_space(vec![0, 1 << 40, 1 << 40]), &[1, 1, 1], 1).is_err());
+        // Byte size overflows even though the element count fits.
+        assert!(checked_read_sizes(&simple_space(vec![1 << 62]), &[1], 8).is_err());
+        // Zero chunk dimension.
+        assert!(checked_read_sizes(&simple_space(vec![10]), &[0], 4).is_err());
+        // Chunk at or above HDF5's 4 GiB limit.
+        assert!(checked_read_sizes(&simple_space(vec![10]), &[1 << 30], 4).is_err());
+        assert!(checked_read_sizes(&simple_space(vec![10]), &[(1 << 30) - 1], 4).is_ok());
+    }
+
+    #[test]
+    fn try_zeroed_vec_reports_impossible_allocation_as_error() {
+        assert_eq!(try_zeroed_vec(16).unwrap(), vec![0u8; 16]);
+        assert!(try_zeroed_vec(usize::MAX).is_err());
+        assert!(try_zeroed_vec(isize::MAX as usize).is_err());
+    }
 
     fn write_offset(buf: &mut Vec<u8>, val: u64, size: u8) {
         match size {

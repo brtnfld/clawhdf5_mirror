@@ -21,13 +21,23 @@ pub fn decompress_chunk(
     element_size: u32,
 ) -> Result<Vec<u8>, FormatError> {
     let mut data = compressed.to_vec();
+    // No stage may produce more than the chunk's uncompressed size, plus a
+    // little slack for filters (e.g. fletcher32) that a writer placed ahead of
+    // the compressor. Before this bound (2026-10 red-team finding) the deflate
+    // and zstd decoders ran to end-of-stream and LZ4 pre-allocated whatever its
+    // in-band header claimed; the readers clipped the result to the output
+    // buffer only afterwards. A 261 KB deflate chunk declared as 1 KiB decoded
+    // to 256 MiB, and zstd's run-length blocks allow far higher ratios -- so a
+    // crafted file exhausted memory on read. The P2.4 engagement had recorded
+    // this as refuted; the allocation was not in fact bounded.
+    let limit = chunk_size.saturating_add(FILTER_OUTPUT_SLACK);
 
     for filter in pipeline.filters.iter().rev() {
         data = match filter.filter_id {
             FILTER_SHUFFLE => shuffle_decompress(&data, element_size as usize)?,
-            FILTER_DEFLATE => deflate_decompress(&data)?,
-            FILTER_LZ4 => lz4_decompress(&data)?,
-            FILTER_ZSTD => zstd_decompress(&data)?,
+            FILTER_DEFLATE => deflate_decompress(&data, limit)?,
+            FILTER_LZ4 => lz4_decompress(&data, limit)?,
+            FILTER_ZSTD => zstd_decompress(&data, limit)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
             FILTER_PCODEC => pcodec_decompress(&data, element_size as usize)?,
             // `chunk_size` is the expected decompressed size; pass it so these
@@ -37,9 +47,49 @@ pub fn decompress_chunk(
             FILTER_SZIP => crate::filters_szip::szip_decompress(&data, &filter.client_data, chunk_size)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
+        // Catch-all for decoders that cannot be bounded up front (pcodec,
+        // the macOS system-zlib fast path): reject before the next stage or
+        // the caller sees the oversized buffer.
+        if data.len() > limit {
+            return Err(FormatError::DecompressionError(format!(
+                "filter {} produced {} bytes, more than the chunk's {chunk_size}-byte size",
+                filter.filter_id,
+                data.len()
+            )));
+        }
     }
 
     Ok(data)
+}
+
+/// Bytes a decoded stage may exceed the chunk's uncompressed size by: room
+/// for a checksum filter (fletcher32 appends 4 bytes) applied ahead of the
+/// compressor in the forward pipeline.
+const FILTER_OUTPUT_SLACK: usize = 64;
+
+/// Drain `reader` but never accept more than `limit` bytes of output.
+///
+/// Reads at most `limit + 1` bytes so an over-long stream is detected without
+/// buffering it. `read_to_end` reserves with `try_reserve`, so a large-but-
+/// legitimate limit that cannot be satisfied is an I/O error, not an abort.
+#[cfg(any(feature = "deflate", feature = "zstd"))]
+fn read_bounded<R: std::io::Read>(
+    reader: R,
+    limit: usize,
+    name: &str,
+) -> Result<Vec<u8>, FormatError> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| FormatError::DecompressionError(format!("{name}: {e}")))?;
+    if out.len() > limit {
+        return Err(FormatError::DecompressionError(format!(
+            "{name}: decoded output exceeds the chunk's {limit}-byte bound"
+        )));
+    }
+    Ok(out)
 }
 
 /// Apply a filter pipeline to compress a chunk.
@@ -570,9 +620,10 @@ fn nbit_decompress(data: &[u8], cd: &[u32], expected_bytes: usize) -> Result<Vec
 
 /// Decompress zlib-compressed data.
 #[cfg(feature = "deflate")]
-fn deflate_decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn deflate_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, FormatError> {
     // Try system zlib first on macOS (Apple's ARM64-optimized libz is ~1.4x
-    // faster at decompression than zlib-ng on Apple Silicon).
+    // faster at decompression than zlib-ng on Apple Silicon). Its own cap is
+    // a fixed 256 MiB, so `decompress_chunk`'s per-stage check still applies.
     #[cfg(all(target_os = "macos", feature = "system-zlib-decompress"))]
     {
         if let Ok(result) = sysz::decompress(data) {
@@ -581,13 +632,7 @@ fn deflate_decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
         // Fall through to flate2 on error
     }
 
-    use std::io::Read;
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
-    let mut result = Vec::new();
-    decoder
-        .read_to_end(&mut result)
-        .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
-    Ok(result)
+    read_bounded(flate2::read::ZlibDecoder::new(data), limit, "deflate")
 }
 
 /// Direct FFI to Apple's system libz for fast decompression.
@@ -659,7 +704,7 @@ mod sysz {
 }
 
 #[cfg(not(feature = "deflate"))]
-fn deflate_decompress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn deflate_decompress(_data: &[u8], _limit: usize) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_DEFLATE))
 }
 
@@ -683,19 +728,26 @@ fn deflate_compress(_data: &[u8], _level: u32) -> Result<Vec<u8>, FormatError> {
 
 /// Decompress LZ4 data. Format: 4 bytes LE original size + LZ4 block data.
 #[cfg(feature = "lz4")]
-fn lz4_decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn lz4_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, FormatError> {
     if data.len() < 4 {
         return Err(FormatError::DecompressionError(
             "lz4: data too short".into(),
         ));
     }
     let orig_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    // The in-band size is attacker-controlled and lz4_flex allocates it up
+    // front: check it against the chunk bound before decoding anything.
+    if orig_size > limit {
+        return Err(FormatError::DecompressionError(format!(
+            "lz4: header claims {orig_size} bytes, more than the chunk's {limit}-byte bound"
+        )));
+    }
     lz4_flex::block::decompress(&data[4..], orig_size)
         .map_err(|e| FormatError::DecompressionError(format!("lz4: {e}")))
 }
 
 #[cfg(not(feature = "lz4"))]
-fn lz4_decompress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn lz4_decompress(_data: &[u8], _limit: usize) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_LZ4))
 }
 
@@ -716,12 +768,14 @@ fn lz4_compress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
 
 /// Decompress zstd data.
 #[cfg(feature = "zstd")]
-fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
-    zstd::decode_all(data).map_err(|e| FormatError::DecompressionError(format!("zstd: {e}")))
+fn zstd_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, FormatError> {
+    let decoder = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| FormatError::DecompressionError(format!("zstd: {e}")))?;
+    read_bounded(decoder, limit, "zstd")
 }
 
 #[cfg(not(feature = "zstd"))]
-fn zstd_decompress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn zstd_decompress(_data: &[u8], _limit: usize) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_ZSTD))
 }
 
@@ -1021,7 +1075,7 @@ mod tests {
     fn deflate_compress_decompress_roundtrip() {
         let data: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
         let compressed = deflate_compress(&data, 6).unwrap();
-        let decompressed = deflate_decompress(&compressed).unwrap();
+        let decompressed = deflate_decompress(&compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -1034,7 +1088,7 @@ mod tests {
         let compressed: Vec<u8> = vec![
             120, 156, 99, 96, 100, 98, 102, 97, 101, 99, 231, 224, 4, 0, 0, 175, 0, 46,
         ];
-        let decompressed = deflate_decompress(&compressed).unwrap();
+        let decompressed = deflate_decompress(&compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
@@ -1045,7 +1099,7 @@ mod tests {
         let data = vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let compressed = deflate_compress(&data, 6).unwrap();
         assert!(!compressed.is_empty());
-        let decompressed = deflate_decompress(&compressed).unwrap();
+        let decompressed = deflate_decompress(&compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -1246,7 +1300,7 @@ mod tests {
     fn lz4_compress_decompress_roundtrip() {
         let data: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
         let compressed = lz4_compress(&data).unwrap();
-        let decompressed = lz4_decompress(&compressed).unwrap();
+        let decompressed = lz4_decompress(&compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -1301,7 +1355,7 @@ mod tests {
     fn zstd_compress_decompress_roundtrip() {
         let data: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
         let compressed = zstd_compress(&data, 3).unwrap();
-        let decompressed = zstd_decompress(&compressed).unwrap();
+        let decompressed = zstd_decompress(&compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 

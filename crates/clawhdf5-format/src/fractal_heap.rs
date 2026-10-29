@@ -263,7 +263,11 @@ impl FractalHeapHeader {
             } else {
                 (1u64 << length_bits) - 1
             };
-            (combined >> offset_bits) & length_mask
+            // `offset_bits` is the file's own max_heap_size (a u16); a value of
+            // 64 or more with payload bits left over used to shift a u64 by >= 64
+            // (a debug panic, and a silently wrong shift in release). Every bit
+            // of `combined` belongs to the offset then, so the length is zero.
+            combined.checked_shr(offset_bits).unwrap_or(0) & length_mask
         };
 
         Ok((heap_offset, length_val))
@@ -664,6 +668,24 @@ mod tests {
         let (off, len) = hdr.decode_managed_id(&id).unwrap();
         assert_eq!(off, 0);
         assert_eq!(len, 13);
+    }
+
+    /// 2026-10 red-team regression: `max_heap_size` is the file's own u16, and
+    /// a value of 64 or more with payload bits left over shifted a u64 by at
+    /// least 64 (debug panic). Every bit then belongs to the offset.
+    #[test]
+    fn decode_managed_id_with_wide_offset_field_does_not_panic() {
+        let (file_data, _) = build_simple_heap(8, 8);
+        let mut hdr = FractalHeapHeader::parse(&file_data, 0, 8, 8).unwrap();
+        for wide in [64u16, 65, 100, u16::MAX] {
+            hdr.max_heap_size = wide;
+            // 16 payload bytes = 128 bits, so length bits remain for 64..128.
+            let mut id = vec![0xFFu8; 17];
+            id[0] = 0x00;
+            let (off, len) = hdr.decode_managed_id(&id).unwrap();
+            assert_eq!(off, u64::MAX, "max_heap_size={wide}");
+            assert_eq!(len, 0, "max_heap_size={wide}");
+        }
     }
 
     #[test]

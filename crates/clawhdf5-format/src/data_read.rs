@@ -47,13 +47,18 @@ pub fn read_raw_data_zerocopy<'a>(
                     actual: sz,
                 });
             }
-            if addr + sz > file_data.len() {
+            // checked_add: a crafted layout address near usize::MAX would
+            // otherwise wrap past this bound and panic the slice.
+            let end = addr
+                .checked_add(sz)
+                .ok_or_else(|| FormatError::Overflow("contiguous address + size".into()))?;
+            if end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: addr + sz,
+                    expected: end,
                     available: file_data.len(),
                 });
             }
-            Ok(Some(&file_data[addr..addr + sz]))
+            Ok(Some(&file_data[addr..end]))
         }
         _ => Ok(None),
     }
@@ -169,13 +174,16 @@ fn read_raw_data_full_impl(
                     actual: sz,
                 });
             }
-            if addr + sz > file_data.len() {
+            let end = addr
+                .checked_add(sz)
+                .ok_or_else(|| FormatError::Overflow("contiguous address + size".into()))?;
+            if end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: addr + sz,
+                    expected: end,
                     available: file_data.len(),
                 });
             }
-            Ok(file_data[addr..addr + sz].to_vec())
+            Ok(file_data[addr..end].to_vec())
         }
         DataLayout::Chunked { .. } => read_chunked_data(
             file_data,
@@ -470,8 +478,13 @@ fn read_virtual_data(
     use crate::selection::Selection;
 
     let elem_size = datatype.type_size() as usize;
-    let total_elems = dataspace.num_elements() as usize;
-    let mut out = vec![0u8; total_elems.saturating_mul(elem_size)];
+    let total_elems = usize::try_from(dataspace.num_elements())
+        .map_err(|_| FormatError::Overflow("virtual dataset size".into()))?;
+    let total_bytes = total_elems
+        .checked_mul(elem_size)
+        .ok_or_else(|| FormatError::Overflow("virtual dataset byte size".into()))?;
+    // Fallible: a crafted virtual dataspace must not abort the process.
+    let mut out = crate::chunked_read::try_zeroed_vec(total_bytes)?;
 
     let virtual_dims = &dataspace.dimensions;
 

@@ -513,15 +513,15 @@ impl<'f> Dataset<'f> {
     ///
     /// Returns `None` if the layout is not contiguous (compact/chunked).
     ///
-    /// # Safety invariant
-    ///
-    /// T must have no padding bytes (e.g., f64, f32, i64, i32, u64, u32).
-    /// Types with padding may expose uninitialized memory. The bound
-    /// `T: Copy + 'static` is necessary but not sufficient — callers must
-    /// ensure T is a plain primitive numeric type with no internal padding.
-    /// Adding a `bytemuck::NoUninit` bound would enforce this statically
-    /// but is not done here to avoid a new dependency.
-    pub fn read_as_slice<T: Copy + 'static>(&self) -> Result<Option<&'f [T]>, Error> {
+    /// `T` is restricted to plain integer and float primitives
+    /// ([`ZeroCopyElement`]), for which every bit pattern is a valid value.
+    /// The bound used to be `T: Copy + 'static`, which made this a safe
+    /// function that could manufacture `bool`, `char`, enum, or `&'static str`
+    /// values out of arbitrary file bytes: undefined behavior (and, for
+    /// references, attacker-chosen pointers) reachable from safe code with a
+    /// crafted file (2026-10 red-team finding). No byte-order or datatype
+    /// check is made here; use the typed `read_*_zerocopy` methods for that.
+    pub fn read_as_slice<T: ZeroCopyElement>(&self) -> Result<Option<&'f [T]>, Error> {
         let raw = match self.read_raw_ref()? {
             Some(s) => s,
             None => return Ok(None),
@@ -546,7 +546,9 @@ impl<'f> Dataset<'f> {
             )));
         }
         let count = raw.len() / t_size;
-        // SAFETY: We verified alignment and size. T: Copy ensures no drop.
+        // SAFETY: alignment and length were checked above, and `T:
+        // ZeroCopyElement` is sealed to primitives with no padding and no
+        // invalid bit patterns, so any initialized bytes are a valid `[T]`.
         let typed = unsafe { core::slice::from_raw_parts(ptr as *const T, count) };
         Ok(Some(typed))
     }
@@ -763,6 +765,44 @@ impl<'f> Dataset<'f> {
 // ---------------------------------------------------------------------------
 
 /// Check that a pointer is properly aligned for type `T`.
+/// Element types [`Dataset::read_as_slice`] may reinterpret file bytes as.
+///
+/// Sealed: implemented only for fixed-width integer and float primitives,
+/// which have no padding and for which every bit pattern is a valid value.
+///
+/// Types with invalid bit patterns are refused at compile time:
+///
+/// ```compile_fail
+/// fn reinterpret_as_bool<'f>(ds: &clawhdf5::Dataset<'f>) {
+///     let _ = ds.read_as_slice::<bool>();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn reinterpret_as_str<'f>(ds: &clawhdf5::Dataset<'f>) {
+///     let _ = ds.read_as_slice::<&'static str>();
+/// }
+/// ```
+///
+/// ```
+/// fn reinterpret_as_f64<'f>(ds: &clawhdf5::Dataset<'f>) {
+///     let _ = ds.read_as_slice::<f64>();
+/// }
+/// ```
+pub trait ZeroCopyElement: Copy + sealed::Sealed + 'static {}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! zero_copy_element {
+    ($($t:ty),*) => {$(
+        impl sealed::Sealed for $t {}
+        impl ZeroCopyElement for $t {}
+    )*};
+}
+zero_copy_element!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+
 fn check_alignment<T>(ptr: *const u8) -> Result<(), Error> {
     let align = std::mem::align_of::<T>();
     let addr = ptr as usize;

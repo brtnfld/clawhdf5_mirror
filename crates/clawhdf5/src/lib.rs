@@ -36,7 +36,7 @@ pub use error::Error;
 pub use lazy::{LazyDataset, LazyFile, LazyGroup};
 #[cfg(feature = "mmap")]
 pub use mmap_file::{MmapDataset, MmapFile, MmapGroup};
-pub use reader::{Dataset, File, Group};
+pub use reader::{Dataset, File, Group, ZeroCopyElement};
 pub use types::{AttrValue, DType};
 pub use writer::FileBuilder;
 #[cfg(feature = "parallel")]
@@ -566,20 +566,24 @@ mod tests {
 
     #[test]
     fn read_as_slice_alignment_rejection() {
-        // read_as_slice should reject zero-sized types
+        // A byte length that is not a multiple of the element size is
+        // rejected at runtime. (Zero-sized and invalid-bit-pattern element
+        // types such as `()`, `bool`, or `&str` are rejected at compile time
+        // by the sealed `ZeroCopyElement` bound -- see its doctests -- so the
+        // old `read_as_slice::<()>()` case can no longer be written.)
         let dir = std::env::temp_dir();
         let path = dir.join("purehdf5_test_align_reject.h5");
 
         let mut b = FileBuilder::new();
         b.create_dataset("data")
-            .with_f64_data(&[1.0])
-            .with_shape(&[1]);
+            .with_u8_data(&[1, 2, 3])
+            .with_shape(&[3]);
         b.write(&path).unwrap();
 
         let file = File::open(&path).unwrap();
         let ds = file.dataset("data").unwrap();
 
-        let err = ds.read_as_slice::<()>().unwrap_err();
+        let err = ds.read_as_slice::<u16>().unwrap_err();
         assert!(matches!(err, Error::AlignmentError(_)));
 
         std::fs::remove_file(&path).ok();
